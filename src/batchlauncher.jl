@@ -810,11 +810,11 @@ end
 
 A region store's queue in one round trip. `wants`: submission name → `(; region, parent, chunks, age)`.
 `claims`: chunk → `(; owner, age)` with `age` in seconds since the claim was last refreshed. `done`:
-chunks whose run returned.
+chunks whose run returned. `stage`: what the hub's driver last said it is doing for the region.
 """
 function read_queue(runner, host::AbstractString, root::AbstractString)
     q = _queue_dir(root)
-    sc = "d=$(_shq(q)); [ -d \"\$d\" ] || exit 0; now=\$(date +%s); for f in \"\$d\"/*.want \"\$d\"/*.claim \"\$d\"/*.done; do " *
+    sc = "d=$(_shq(q)); [ -d \"\$d\" ] || exit 0; now=\$(date +%s); for f in \"\$d\"/*.want \"\$d\"/*.claim \"\$d\"/*.done \"\$d\"/stage; do " *
          "[ -f \"\$f\" ] || continue; m=\$(stat -c %Y \"\$f\" 2>/dev/null || stat -f %m \"\$f\"); " *
          "printf '%s\\t%s\\t' \"\${f##*/}\" \$((now - m)); tr '\\n' ';' < \"\$f\"; echo; done"
     ok, out = runner(String(host), sc)
@@ -826,6 +826,7 @@ function parse_queue(txt::AbstractString)
     wants = Dict{String,NamedTuple{(:region, :parent, :chunks, :age),Tuple{String,String,Vector{String},Int}}}()
     claims = Dict{String,NamedTuple{(:owner, :age),Tuple{String,Int}}}()
     done = Set{String}()
+    stage = ""
     for line in eachsplit(txt, '\n'; keepempty = false)
         parts = split(line, '\t'; limit = 3)
         length(parts) == 3 || continue
@@ -841,9 +842,11 @@ function parse_queue(txt::AbstractString)
             claims[f[1:end-6]] = (owner = String(strip(replace(body, ';' => ' '))), age = age)
         elseif endswith(f, ".done")
             push!(done, f[1:end-5])
+        elseif f == "stage"
+            stage = String(strip(replace(body, ';' => ' ')))
         end
     end
-    return (; wants, claims, done)
+    return (; wants, claims, done, stage)
 end
 
 # A submission is running while a chunk of it has a fresh claim, pending while it has a chunk not yet
@@ -856,10 +859,18 @@ function queue_state(q, name::AbstractString)
     return :pending
 end
 
+# What the hub's driver last said about each region queue, from the most recent `poll`: the card shows
+# it, so the minutes between a Submit and the first unit say what they are spent on.
+const _STAGES = Dict{Tuple{String,String},String}()
+const _STAGES_LOCK = ReentrantLock()
+region_stage(host::AbstractString, root::AbstractString) =
+    lock(_STAGES_LOCK) do; get(_STAGES, (String(host), String(root)), ""); end
+
 function poll(l::RegionLauncher, root::AbstractString, names)
     out = Dict{String,Symbol}(String(n) => :unknown for n in names)
     isempty(out) && return out
     q = try; read_queue(l.runner, l.host, l.root); catch; return out; end
+    lock(_STAGES_LOCK) do; _STAGES[(l.host, l.root)] = q.stage; end
     for n in keys(out); out[n] = queue_state(q, n); end
     return out
 end

@@ -63,6 +63,9 @@ function _task_worker(r, parent::AbstractString, slot::Int)
     return w
 end
 
+_running_stage(s::_RegionSweeper) =
+    (n = count(w -> w.busy, s.workers); "$n task worker$(n == 1 ? "" : "s") running on $(s.host)")
+
 _stop_task_worker!(w::_TaskWorker) =
     (try; ReportEngine.shutdown!(w.kernel; kill_remote = true, wait = false); catch; end; nothing)
 
@@ -92,7 +95,8 @@ function _drive_region_sweeps!(h)
         active = lock(_SWEEPERS_LOCK) do
             name in _SWEEP_QUEUED || any(s -> s.region == name && !isempty(s.workers), values(_SWEEPERS))
         end
-        now - get(_SWEEP_POLLED, name, 0.0) < (active ? 10.0 : 30.0) && continue
+        every = now < _SWEEP_FAST_UNTIL[] ? 5.0 : active ? 10.0 : 30.0
+        now - get(_SWEEP_POLLED, name, 0.0) < every && continue
         store = String(get(e, "root_remote", ""))
         _region_work!(name, :sweep) do
             t0 = time()
@@ -105,7 +109,25 @@ function _drive_region_sweeps!(h)
     return nothing
 end
 const _SWEEP_POLLED = Dict{String,Float64}()
+# What the driver last wrote to each region's `queue/stage`, for the card to show (`_set_stage!`).
+const _SWEEP_STAGE = Dict{String,String}()
+# Until when every region is looked at each 5 s: set by a card that starts work (`_sweep_kick!`), long
+# enough to cover the card's next poll, which is what writes the submission.
+const _SWEEP_FAST_UNTIL = Ref(0.0)
+_sweep_kick!() = (_SWEEP_FAST_UNTIL[] = time() + 60.0; nothing)
 const _SWEEP_QUEUED = Set{String}()       # regions whose last pass found work queued, under `_SWEEPERS_LOCK`
+
+# Say what the driver is doing for region `r`, in its queue, where the card's poll reads it. Written only
+# when it changes; "" removes it.
+function _set_stage!(r, store::AbstractString, runner, text::AbstractString)
+    BL = ReportEngine.Sweep.BatchLauncher
+    lock(_SWEEPERS_LOCK) do; get(_SWEEP_STAGE, r.name, nothing) == text; end && return nothing
+    f = BL._shq(joinpath(store, "queue", "stage"))
+    ok, _ = runner(r.host, isempty(text) ? "rm -f $f" :
+                           "mkdir -p $(BL._shq(joinpath(store, "queue"))) && printf '%s' $(BL._shq(text)) > $f")
+    ok && lock(_SWEEPERS_LOCK) do; _SWEEP_STAGE[r.name] = String(text); end
+    return nothing
+end
 
 function _drive_region_sweep!(r, store::AbstractString)
     BL = ReportEngine.Sweep.BatchLauncher
@@ -130,7 +152,7 @@ function _drive_region_sweep!(r, store::AbstractString)
         s.idle_since == 0 && (s.idle_since = time())
         time() - s.idle_since > _SWEEP_IDLE_STOP && _stop_sweeper!(s, "nothing queued")
     end
-    isempty(q.wants) && return nothing
+    isempty(q.wants) && return _set_stage!(r, store, runner, "")
     _region_used!(r.name)                       # queued work keeps the node, as a running cell does
     host, job = ReportEngine.region_where(r)
     if r.scheduler !== :none && isempty(job)
@@ -138,7 +160,12 @@ function _drive_region_sweep!(r, store::AbstractString)
         # withdrawn after the work was queued: a release is not undone by work that was waiting on it.
         queued_at = time() - minimum(w.age for w in values(q.wants))
         withdrawn = lock(_PLACING_LOCK) do; get(_WITHDRAWN_AT, r.name, 0.0); end
-        withdrawn > queued_at || _place_in_background!(r.name)
+        if withdrawn > queued_at
+            _set_stage!(r, store, runner, "not asking for a node: the region was released after this was queued")
+        else
+            _place_in_background!(r.name)
+            _set_stage!(r, store, runner, "waiting for a node")
+        end
         return nothing
     end
     for (parent, names) in byparent
@@ -193,6 +220,7 @@ function _feed_sweeper!(s::_RegionSweeper, r, store, q, names, runner)
         for n in finished for f in [n * ".want"; [c * ".done" for c in q.wants[n].chunks]]), ' '))
     busy = any(w -> w.busy, s.workers)
     s.idle_since = isempty(todo) && !busy ? (s.idle_since == 0 ? time() : s.idle_since) : 0.0
+    busy && _set_stage!(r, store, runner, _running_stage(s))
     isempty(todo) && return nothing
     # Start the workers the work can use, then hand each free one the list, each starting at a
     # different chunk so they do not race for the same claims.
@@ -200,6 +228,7 @@ function _feed_sweeper!(s::_RegionSweeper, r, store, q, names, runner)
     for slot in _sweep_slots(r)
         length(s.workers) >= length(todo) && break
         slot in have && continue
+        _set_stage!(r, store, runner, "starting a task worker on $(s.host)")
         try
             push!(s.workers, _task_worker(r, s.parent, slot))
         catch e
@@ -224,5 +253,6 @@ function _feed_sweeper!(s::_RegionSweeper, r, store, q, names, runner)
             ReportEngine._rlog("region[$(r.name)]: $(length(list)) chunk(s) → $(w.kernel.label)")
         end
     end
+    any(w -> w.busy, s.workers) && _set_stage!(r, store, runner, _running_stage(s))
     return nothing
 end

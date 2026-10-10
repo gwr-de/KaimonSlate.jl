@@ -3707,6 +3707,11 @@ end
             w = only(values(q.wants))
             @test (w.region, w.parent, sort(w.chunks)) == ("gpu", "/env", sort(chunks))
             @test BL.poll(l, root, names) == Dict(only(names) => :pending)
+            # What the hub's driver says it is doing rides the same read, for the card.
+            write(joinpath(root, "queue", "stage"), "waiting for a node")
+            BL.poll(l, root, names)
+            @test BL.region_stage("", root) == "waiting for a node"
+            rm(joinpath(root, "queue", "stage"))
             # A task worker takes the first chunk: claimed while it runs, done when it returns.
             @test BS.run_queued_chunks(root, chunks[1:1]; owner = "w0") == 1
             q = BL.read_queue(l.runner, "", root)

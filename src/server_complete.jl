@@ -3580,6 +3580,10 @@ function _do_slate_call(nb::LiveNotebook, channel::AbstractString, args, call_id
     # be a region worker, not the main one. Try the main kernel, then each active region kernel, and use
     # whichever actually has the channel registered: a "no handler here" moves on, a handler that RETURNS
     # or THROWS stops the search (its outcome is the answer).
+    # A sweep card starting work: a region's driver looks at the queues at once rather than at its
+    # next scheduled pass, so the card shows a node being asked for within seconds of the click.
+    (endswith(channel, ":do") && args isa AbstractDict &&
+     get(args, "action", "") in ("submit", "resume", "retry")) && _sweep_kick!()
     kernels = Any[nb.kernel]
     append!(kernels, lock(_REGION_LOCK) do
         Any[k for ((id, _side), k) in _REGION_KERNELS if id == nb.id]

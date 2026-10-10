@@ -3552,7 +3552,9 @@ function handle_action(target::SweepTarget, run::AbstractString, params, keys,
     # push that did not happen leaves the store holding markers this hub just removed — and the next
     # poll pulls them back. Disarming would silently undo itself and the sweep would resubmit, which
     # reads as the reset button starting a run. Failing here says so instead.
-    if !sync_out!(target; dirs = ("jobs",))
+    # Submitting only ADDS a marker, which a pull cannot take back, and the next poll pushes `jobs/`
+    # with the submission it makes. Not waiting for the push here is what lets the card answer at once.
+    if action != "submit" && !sync_out!(target; dirs = ("jobs",))
         error("sweep $(action): the store was not updated (host unreachable?) — " *
               "the cluster still holds this sweep's markers, so retry once it is reachable")
     end
@@ -3643,7 +3645,7 @@ function status_payload(target::SweepTarget, run::AbstractString, params, keys;
         "host" => target_host(target),
         "when" => _w.at, "when_kind" => _w.kind,
         # Where each of its jobs stands with the scheduler, and the prepare a held run waits on.
-        "queue" => _queue_html(BatchLauncher.job_details(jobs)),
+        "queue" => _queue_html(BatchLauncher.job_details(jobs)) * _stage_html(target, p),
         # Only while held: once a job is out, testing is over and the card says nothing about it.
         "prepare" => held ? _prepare_key(target) : "",
         "prepare_machine" => (held && target isa ClusterTarget) ? (isempty(target.machine) ? target.host : target.machine) : "",
@@ -4256,6 +4258,15 @@ _prepare_key(t::ClusterTarget) =
 
 # Each of a run's jobs as the scheduler sees it: how many elements wait or run, why the waiting ones
 # wait and when the scheduler expects them to start, and where the running ones are.
+# A region's queue has no scheduler to report on; the hub's driver says what it is doing instead.
+function _stage_html(t::SweepTarget, p)
+    (t isa ClusterTarget && t.kind === :region && !BatchSweep.is_settled(p)) || return ""
+    st = BatchLauncher.region_stage(t.host, job_root(t))
+    isempty(st) && return ""
+    return "<div style='margin-top:8px;font-size:12px'><span style='opacity:.6;font-family:monospace'>" *
+           _esc(t.region) * "</span> " * _esc(st) * "</div>"
+end
+
 function _queue_html(details::AbstractDict)
     isempty(details) && return ""
     io = IOBuffer()
