@@ -3580,7 +3580,7 @@ function _one_poll(f, key)
         _POLLS[key] = Threads.@spawn f()
     end
     try
-        return fetch(t)
+        return Base.fetch(t)          # this module has a `fetch` of its own, for artifacts
     catch e
         throw(e isa TaskFailedException ? e.task.exception : e)
     end

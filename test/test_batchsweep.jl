@@ -3698,6 +3698,14 @@ end
         end
     end
 
+    @testset "polls of one run asked together share one answer" begin
+        n = Threads.Atomic{Int}(0)
+        slow() = (Threads.atomic_add!(n, 1); sleep(0.3); 42)
+        ts = [Threads.@spawn Sweep._one_poll(slow, ("r", "", true)) for _ in 1:4]
+        @test fetch.(ts) == [42, 42, 42, 42] && n[] == 1
+        @test_throws ErrorException Sweep._one_poll(() -> error("store unreachable"), ("r", "", false))
+    end
+
     @testset "a region's queue is the channel between the card and the task workers" begin
         mktempdir() do root
             sweep, chunks = mksweep(root; nchunk = 2, per = 2)
