@@ -316,6 +316,27 @@ mean(data)
         @test !ReportEngine._rerun_noise(Main, "Replacing docs for `x`")
     end
 
+    @testset "a cell asked to stop ends at its next checkpoint, log record or child task's checkpoint" begin
+        # Julia cannot interrupt a running task from outside, so a stop is asked of the cell: it ends
+        # at `slate_checkpoint()`, at anything it logs (so `@progress` loops), and in tasks it starts.
+        m = Module(:StopMe)
+        Core.eval(m, :(const slate_checkpoint = $(ReportEngine.slate_checkpoint)))
+        loops = ("for i in 1:10^6; slate_checkpoint(); sleep(0.01); end",
+                 "for i in 1:10^6; @info \"step\" i; sleep(0.01); end",
+                 "fetch(Threads.@spawn (for i in 1:10^6; slate_checkpoint(); sleep(0.01); end))")
+        for (k, src) in enumerate(loops)
+            cid = "stop$k"
+            t = Threads.@spawn run_capture(m, src, "cell:" * cid)
+            ok = timedwait(() -> cid in ReportEngine.stoppable_cells(), 5.0) === :ok
+            sleep(0.1)
+            asked = ReportEngine.request_stop!([cid, "not-running"])
+            ended = timedwait(() -> istaskdone(t), 5.0) === :ok
+            r = ended ? fetch(t) : nothing
+            @test ok && asked == 1 && ended && r.exception == "Stopped" && r.backtrace === nothing
+        end
+        @test isempty(ReportEngine.stoppable_cells())
+    end
+
 end
 
 @testset "runnable-notebook format (preamble + @md skin)" begin

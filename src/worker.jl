@@ -1087,45 +1087,32 @@ _interrupted_wire() = (stdout = "", mime = Tuple{String,Vector{UInt8}}[], echart
                        backtrace = nothing, duration_ms = 0.0, trace = Any[], stderr = "",
                        overflow = NamedTuple[], animations = Any[])
 
-# Interrupt every running batch cell (a stop button). `schedule(t, InterruptException(); error=true)`
-# delivers the throw at the task's next safepoint/yield — like every notebook's interrupt, a pure
-# tight CPU loop with no allocation/yield can't be preempted (fall back to a worker restart for that).
-# Each interrupted cell's `run_capture` catches the exception and returns an error wire, which streams
-# back via `slate_celldone` — so the cell shows "interrupted" and the WARM NAMESPACE is preserved.
+# Stop every running cell (the stop button). Julia cannot interrupt a task running on another thread,
+# so each cell is asked to stop (`request_stop!`: it ends at its next checkpoint, progress report or log
+# record) and is interrupted if it is waiting (`interrupt_when_parked!`). An interrupted cell's
+# `run_capture` catches the exception and returns an error wire, and the WARM NAMESPACE is preserved.
+# Returns how many cells were asked.
 function __slate_cancel(; run_id::String = "")
     _BATCH_CANCEL[] = true             # short-circuit any cell that hasn't started yet (evalfn checks this)
-    n = 0
-    lock(_CANCEL_LOCK) do
-        for (id, t) in collect(_RUNNING_TASKS)
-            try
-                istaskdone(t) || (schedule(t, InterruptException(); error = true); n += 1)
-            catch
-            end
-        end
-    end
-    @info "slate cancel: interrupted cells" count = n
-    return n
+    return _stop_cells!(nothing)
 end
 
-"Interrupt ONLY the named cells' in-flight evaluator tasks — superseded-edit preemption. An
-edited/deleted cell's old-source run can only be discarded on completion (the server's src_hash
-version guard), so stop burning worker time on it. Unknown/finished ids are no-ops; unlike
-`__slate_cancel` this never touches `_BATCH_CANCEL` (unstarted siblings still run). Returns the
-number interrupted. (`ids` is a KEYWORD arg — see `__slate_macroexpand`'s raw-Dict caveat.)"
-function __slate_cancel_cells(; ids::Vector = Any[])
-    n = 0
-    lock(_CANCEL_LOCK) do
-        for raw in ids
-            t = get(_RUNNING_TASKS, String(raw), nothing)
-            t === nothing && continue
-            try
-                istaskdone(t) || (schedule(t, InterruptException(); error = true); n += 1)
-            catch
-            end
-        end
+"Stop ONLY the named cells: superseded-edit preemption. An edited/deleted cell's old-source run can only
+be discarded on completion (the server's src_hash version guard), so stop burning worker time on it.
+Unknown/finished ids are no-ops; unlike `__slate_cancel` this never touches `_BATCH_CANCEL` (unstarted
+siblings still run). Returns the number asked. (`ids` is a KEYWORD arg — see `__slate_macroexpand`'s
+raw-Dict caveat.)"
+__slate_cancel_cells(; ids::Vector = Any[]) = _stop_cells!(String[String(i) for i in ids])
+
+# `ids` nothing: every running cell.
+function _stop_cells!(ids)
+    running = lock(_CANCEL_LOCK) do
+        [(id, t) for (id, t) in _RUNNING_TASKS if !istaskdone(t) && (ids === nothing || id in ids)]
     end
-    n > 0 && @info "slate cancel: preempted superseded cells" count = n
-    return n
+    n = request_stop!(first.(running))
+    foreach(r -> interrupt_when_parked!(r[2]), running)
+    @info "slate cancel: asked cells to stop" count = n cells = join(first.(running), ",")
+    return max(n, length(running))
 end
 
 # `cells` is a Vector{Dict} (id/source/deps/reads/writes/opaque/memo fields per cell). NOTE: this

@@ -106,23 +106,57 @@ end
 # Restart a notebook's kernel: kill its worker (a gate worker is a real subprocess;
 # no-op in-process), then re-evaluate from a fresh namespace. The gate kernel
 # respawns a worker on the next `prepare!`.
-# Graceful stop: interrupt the running cells WITHOUT killing any namespace, on every worker that has
-# one running: the main kernel and each region's. The interrupted cells stream back as errors and
-# every already-finished result survives. Falls back to a full restart when no worker acknowledges
-# (in-process kernel, no live worker, nothing running), matching the old stop-button behaviour.
-# `cancel` interrupts one kernel's running cells and returns how many, or -1 for no answer.
-function cancel_run!(nb::LiveNotebook; cancel = k -> k isa ReportEngine.GateKernel ? ReportEngine.cancel_eval(k) : -1)
+# Graceful stop: ask the running cells to stop WITHOUT killing any namespace, on every worker that has
+# one running: the main kernel and each region's. The stopped cells stream back as errors and every
+# already-finished result survives. With nothing running it only keeps the scheduler from starting
+# more. A full restart is the fallback only when cells are running and no worker answered.
+# `cancel(kernel, ids)` asks one kernel's running cells to stop and returns how many, or -1 for no
+# answer.
+function cancel_run!(nb::LiveNotebook; cancel = _cancel_kernel)
     _PARALLEL_CANCEL[nb.id] = true            # stop the parallel scheduler from starting not-yet-run cells
     running = lock(nb.lock) do; _running_kernels(nb); end
-    acked = [(side, cancel(k)) for (side, k, _) in running]
-    if any(a -> a[2] >= 0, acked)
-        n = sum((c for (_, c) in acked if c >= 0); init = 0)
-        missed = [isempty(side) ? "main" : side for (side, c) in acked if c < 0]
-        @info "slate: run cancelled (namespace preserved)" notebook = nb.id interrupted = n unanswered = join(missed, ", ")
+    isempty(running) && return nb
+    acked = [(side, ids, cancel(k, ids)) for (side, k, ids) in running]
+    if any(a -> a[3] >= 0, acked)
+        n = sum((c for (_, _, c) in acked if c >= 0); init = 0)
+        missed = [isempty(side) ? "main" : side for (side, _, c) in acked if c < 0]
+        @info "slate: asked running cells to stop (namespace preserved)" notebook = nb.id cells = n unanswered = join(missed, ", ")
+        # What was asked, and when: a cell still running some seconds later is shown as not stopping.
+        t = time()
+        lock(_STOP_ASKED_LOCK) do
+            for (side, ids, c) in acked
+                c >= 0 && (_STOP_ASKED[(nb.id, side)] = (t, ids))
+            end
+        end
+        try; facts_changed!(); catch; end
         try; _broadcast(nb, "cancelled:$n"); catch; end
         return nb
     end
     return restart_kernel!(nb)
+end
+
+# A worker still starting has nothing running yet: its cells show as stopping, and as still running
+# if they start before the stop can reach them.
+_cancel_kernel(k, ids) = k isa ReportEngine.GateKernel ? (k.conn === nothing ? 0 : ReportEngine.cancel_eval(k)) :
+                         k isa ReportEngine.InProcessKernel ? ReportEngine.request_stop!(ids) : -1
+
+# Stops asked of each worker: (nb id, side) → (when, the cells). Read by the worker's facts while any
+# of those cells still runs.
+const _STOP_ASKED = Dict{Tuple{String,String},Tuple{Float64,Vector{String}}}()
+const _STOP_ASKED_LOCK = ReentrantLock()
+
+# The stop asked of this worker that its cells have not yet honoured: (when, cells still running), or
+# nothing. A record whose cells have all finished is dropped.
+function _stop_pending(nb::LiveNotebook, side::AbstractString)
+    key = (nb.id, String(side))
+    rec = lock(() -> get(_STOP_ASKED, key, nothing), _STOP_ASKED_LOCK)
+    rec === nothing && return nothing
+    still = String[c.id for c in nb.report.cells if c.id in rec[2] && c.state == RUNNING]
+    if isempty(still)
+        lock(() -> (get(_STOP_ASKED, key, nothing) === rec && delete!(_STOP_ASKED, key)), _STOP_ASKED_LOCK)
+        return nothing
+    end
+    return (rec[1], still)
 end
 
 # The kernels running a cell now, as (side, kernel, cell ids): the main kernel ("") and each region

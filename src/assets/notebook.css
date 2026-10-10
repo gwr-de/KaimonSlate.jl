@@ -2353,6 +2353,13 @@ body.dag-open.dag-bottom .page { padding-bottom:calc(var(--dagh, 42vh) + 40px); 
 .cellprogtrack { flex:0 0 160px; height:5px; background:var(--bg3); border-radius:3px; overflow:hidden; }
 .cellprogtrack > span { display:block; height:100%; width:0; background:var(--accent); transition:width .15s ease; }
 .cellprogmsg { color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+/* A stop the running cell has not honoured yet (runstatus.js renderStops). */
+.cellstop { display:flex; align-items:center; gap:8px; padding:4px 10px; font-size:.76rem; color:var(--dim); }
+.cellstop.late { color:var(--gold); }
+.cellstopbtn { font:inherit; padding:1px 8px; border-radius:4px; cursor:pointer; color:var(--text);
+  background:var(--bg3); border:1px solid var(--border); }
+.cellstopbtn:hover { border-color:var(--gold); }
+.cellstopbtn:disabled { opacity:.5; cursor:default; }
 /* Multiply-defined global warning chip on a cell's toolbar. */
 .dupwarn { color:var(--gold); font-size:.72rem; font-family:monospace; margin-left:8px;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:40%; cursor:pointer; }

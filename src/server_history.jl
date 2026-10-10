@@ -1323,6 +1323,9 @@ function _worker_entry(nb::LiveNotebook, side::AbstractString, k)
     # The allocation's clocks, from the one place that computes them — the telemetry relay sends the
     # same fields, and two copies of this arithmetic would drift.
     merge!(d, _region_alloc_facts(String(side)))
+    # A stop asked of this worker that its cells have not honoured yet: when, and which cells.
+    sp = _stop_pending(nb, side)
+    sp === nothing || (d["stopAsked"] = round(sp[1]; digits = 1); d["stopCells"] = sp[2])
     # How well this worker's clock is mapped into ours. Worth showing: it bounds how much any
     # cross-machine timing on this row can be trusted.
     if k isa ReportEngine.GateKernel && k.conn !== nothing

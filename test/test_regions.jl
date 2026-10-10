@@ -423,8 +423,18 @@ end
                     running = lock(nb.lock) do; NS._running_kernels(nb); end
                     @test [(side, ids) for (side, _, ids) in running] == [("", ["a"]), ("gpu", ["g"])]
                     asked = Any[]
-                    NS.cancel_run!(nb; cancel = k -> (push!(asked, k); k === :gpu_kernel ? 1 : -1))
-                    @test length(asked) == 2 && asked[1] isa RE.InProcessKernel && asked[2] === :gpu_kernel
+                    NS.cancel_run!(nb; cancel = (k, ids) -> (push!(asked, (k, ids)); k === :gpu_kernel ? 1 : -1))
+                    @test length(asked) == 2 && asked[1][1] isa RE.InProcessKernel && asked[2] == (:gpu_kernel, ["g"])
+                    # The worker that answered shows the stop as pending until its cell ends; the one that
+                    # did not answer shows none.
+                    @test NS._stop_pending(nb, "gpu")[2] == ["g"] && NS._stop_pending(nb, "") === nothing
+                    rep.cells[2].state = RE.FRESH
+                    @test NS._stop_pending(nb, "gpu") === nothing
+                    @test !haskey(NS._STOP_ASKED, ("stopall", "gpu"))
+                    # With nothing running, a stop asks nothing of any worker (and restarts none).
+                    for c in rep.cells; c.state = RE.FRESH; end
+                    empty!(asked)
+                    @test NS.cancel_run!(nb; cancel = (k, ids) -> (push!(asked, k); 1)) === nb && isempty(asked)
                 finally
                     lock(NS._REGION_LOCK) do; delete!(NS._REGION_KERNELS, ("stopall", "gpu")); end
                 end

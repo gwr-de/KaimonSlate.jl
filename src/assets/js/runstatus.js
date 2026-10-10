@@ -52,9 +52,39 @@
     tick = setInterval(() => {
       if (!active()) { clearInterval(tick); tick = null; }
       sweepCellOutput();
-      renderPill(); renderTimers(); renderChip();
+      renderPill(); renderTimers(); renderChip(); renderStops();
     }, 150);
   }
+
+  // A stop a running cell has not honoured. The hub's worker facts say when Stop asked and which
+  // cells are still running (`stopAsked`, `stopCells`); each such cell shows it, and once the grace is
+  // over offers to restart the worker it runs on, which is the stop that always works.
+  const STOP_GRACE_S = 5;
+  function renderStops() {
+    const M = window.slateModel; if (!M) return;
+    const now = M.hubNow(), seen = new Set();
+    for (const w of M.workerList()) {
+      if (!w.stopAsked || !w.stopCells) continue;
+      const late = now - w.stopAsked >= STOP_GRACE_S;
+      for (const id of w.stopCells) {
+        seen.add(id);
+        const cell = document.querySelector(`.cell[data-cid="${id}"]`); if (!cell) continue;
+        let el = cell.querySelector(':scope > .cellstop');
+        if (!el) { el = document.createElement('div'); el.className = 'cellstop'; cell.insertBefore(el, cell.firstChild); }
+        const key = (late ? 'late:' : 'asked:') + (w.side || '');
+        if (el.dataset.k === key) continue;
+        el.dataset.k = key;
+        el.classList.toggle('late', late);
+        el.innerHTML = late
+          ? `<span>Still running</span><button class="cellstopbtn">Restart ${w.side ? esc(w.side) + ' ' : ''}worker</button>`
+          : '<span>Stopping…</span>';
+        const b = el.querySelector('button');
+        if (b) b.onclick = (ev) => { ev.stopPropagation(); b.disabled = true; api('POST', '/api/restart', { side: w.side || '' }).catch(() => {}); };
+      }
+    }
+    for (const el of document.querySelectorAll('.cell > .cellstop')) if (!seen.has(el.parentElement.dataset.cid)) el.remove();
+  }
+  if (window.slateModel) window.slateModel.subscribe(() => renderStops());
 
   // Schedule a per-cell reveal: if THIS cell is still running after REVEAL_MS, show the run-status.
   function scheduleCellReveal(id) {

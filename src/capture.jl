@@ -438,6 +438,9 @@ _rerun_noise(_module, message) =
     _module === Base.Docs && startswith(string(message), "Replacing docs for")
 
 function _cell_log(parent, sink, level, message, _module, group, id, file, line; kwargs...)
+    # A stopped cell ends at its next log record. Julia's logging macros catch what a logger throws
+    # and log it as an error record, so the stop is thrown again from that record, and reaches the cell.
+    slate_checkpoint()
     if haskey(kwargs, :progress)                                            # a progress record → cell meter
         p = kwargs[:progress]
         # The log `id` keys the bar — each `@withprogress` scope (nested loops, parallel tasks) has
@@ -895,6 +898,76 @@ _ctx_save_asset(name, data; mime = "", dtype = nothing) =
     haskey(task_local_storage(), :slate_assets) ?
         string(_save_asset(name, data; mime = mime, dtype = dtype)) : nothing
 
+# ── Stopping a running cell ──────────────────────────────────────────────────
+# Julia cannot interrupt a task that is running on another thread, so a stop is asked of the cell
+# rather than forced on it. Each running cell has a stop flag, by cell id: Stop sets it, and the cell
+# ends at its next `slate_checkpoint()`, progress report or log record. The flag is a scoped value
+# around the cell's run, so the tasks the cell starts (`@threads`, `@spawn`) see it too.
+const _STOP_FLAG = Base.ScopedValues.ScopedValue{Union{Nothing,Threads.Atomic{Bool}}}(nothing)
+
+"""
+    slate_checkpoint()
+
+Throw `InterruptException` if the running cell has been asked to stop; otherwise do nothing. Call it
+in a long loop that reports no progress, so the cell's Stop can end it. Outside a cell it does nothing.
+"""
+function slate_checkpoint()
+    f = _STOP_FLAG[]
+    f !== nothing && f[] && throw(InterruptException())
+    return nothing
+end
+
+const _CELL_STOPS = Dict{String,Threads.Atomic{Bool}}()
+const _CELL_STOPS_LOCK = ReentrantLock()
+
+"Ask the running cells `ids` to stop. Returns how many of them were running."
+function request_stop!(ids)
+    lock(_CELL_STOPS_LOCK) do
+        n = 0
+        for id in ids
+            f = get(_CELL_STOPS, String(id), nothing)
+            f === nothing || (f[] = true; n += 1)
+        end
+        n
+    end
+end
+
+# An `InterruptException`, also as it reaches the cell through a task it waited on.
+_is_interrupt(e) = e isa InterruptException ||
+    (e isa TaskFailedException && _is_interrupt(e.task.exception)) ||
+    (e isa CompositeException && !isempty(e.exceptions) && all(_is_interrupt, e.exceptions)) ||
+    (e isa LoadError && _is_interrupt(e.error))
+
+"The cells running now (those with a stop flag)."
+stoppable_cells() = lock(() -> collect(keys(_CELL_STOPS)), _CELL_STOPS_LOCK)
+
+# Interrupt task `t` once it is waiting: parked on one wait queue (a sleep, a socket, a long GPU
+# synchronize) for `steady` seconds straight, checked for up to `within`. Never while it runs: an
+# exception scheduled into a running task is queued twice, which aborts the process. Julia gives no
+# way to do this without a race (the task can wake between the check and the interrupt); a long
+# steady wait makes it rare. A task that keeps waking (short waits between compute steps) is left to
+# its stop flag.
+function interrupt_when_parked!(t::Task; steady::Float64 = 0.2, within::Float64 = 10.0)
+    return Threads.@spawn begin
+        t0 = time()
+        while !istaskdone(t) && time() - t0 < within
+            q = t.queue
+            if q !== nothing
+                t1 = time()
+                while t.queue === q && !istaskdone(t) && time() - t1 < steady
+                    Libc.systemsleep(0.001)
+                end
+                if t.queue === q && !istaskdone(t)
+                    try; schedule(t, InterruptException(); error = true); catch; end
+                    return true
+                end
+            end
+            Libc.systemsleep(0.005)
+        end
+        false
+    end
+end
+
 function run_capture(mod::Module, source::AbstractString, filename::AbstractString = "string";
                      capture::OutputCapture = RedirectCapture(), slate_ctx = nothing)
     chunks = Tuple{String,Vector{UInt8}}[]
@@ -948,6 +1021,8 @@ function run_capture(mod::Module, source::AbstractString, filename::AbstractStri
     # BEFORE the buffers are consumed, so the last thing the page sees is the real result, never a
     # half-sampled frame that arrived after it.
     outwatch = _start_cellout(capture, _cellout_sink(mod), cid)
+    stop = Threads.Atomic{Bool}(false)
+    lock(() -> (_CELL_STOPS[cid] = stop), _CELL_STOPS_LOCK)
     t0 = time_ns()
     try
         # ConsoleLogger on the captured stderr (`_logio`), so @warn/@info/@error land in this cell's
@@ -955,12 +1030,15 @@ function run_capture(mod::Module, source::AbstractString, filename::AbstractStri
         # spans. Wrapped so ProgressLogging `@progress` records drive the cell meter instead of printing.
         _logger = _CellLogger(Logging.ConsoleLogger(_logio(capture)), _progress_sink(mod))
         Logging.with_logger(_logger) do
-            value = _profiled(() -> _eval_cell_source(mod, source, filename), cid; mod = mod)   # profile.jl: when armed
+            Base.ScopedValues.with(_STOP_FLAG => stop) do
+                value = _profiled(() -> _eval_cell_source(mod, source, filename), cid; mod = mod)   # profile.jl: when armed
+            end
         end
     catch e
         err = e
         btrace = catch_backtrace()
     finally
+        lock(() -> (get(_CELL_STOPS, cid, nothing) === stop && delete!(_CELL_STOPS, cid)), _CELL_STOPS_LOCK)
         _stop_cellout(outwatch)
         raw_out, raw_err = _finish_capture!(capture)
         slate_ctx === nothing || delete!(task_local_storage(), :slate_ctx)   # never outlive this eval
@@ -1087,6 +1165,10 @@ function run_capture(mod::Module, source::AbstractString, filename::AbstractStri
     # REAL error: UndefVarError, DomainError, …). Parse errors arrive as `ParseError` directly.
     realerr = err isa LoadError ? err.error : err
     exc = realerr === nothing ? nothing : sprint(showerror, realerr)
+    # Ended by its stop: that is the whole story, and a trace through the logger or a child task says
+    # nothing more.
+    stopped = stop[] && _is_interrupt(realerr)
+    stopped && (exc = "Stopped"; btrace = nothing)
     # Trim our eval machinery (the `Core.eval`/`_eval_cell_source` + capture/gate frames below it)
     # from the backtrace — user/package frames sit above it — so the trace shows where the error
     # actually is. `Core.eval` appears as `:eval` in boot.jl.

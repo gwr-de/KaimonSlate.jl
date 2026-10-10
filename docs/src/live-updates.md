@@ -116,6 +116,26 @@ end
 
 ![A cell mid-run with its progress bar filled part way, labelled "reducing 23/40 · 57%", and the cell badged RUNNING](./assets/progress-bar.png)
 
+## Stopping a running cell — `slate_checkpoint`
+
+Stop ends a running cell at its next progress report, at anything it logs, or at a
+`slate_checkpoint()` call, and the cell shows `Stopped`. A cell that is waiting (a `sleep`, a socket,
+a long GPU synchronize) is interrupted where it waits. The rest of the namespace and every finished
+result stay as they were. Tasks the cell starts (`@threads`, `@spawn`) see the same stop.
+
+Julia cannot interrupt code that is computing on another thread, so a loop that reports nothing runs
+on until it finishes. Give such a loop a checkpoint:
+
+```julia
+for i in 1:n
+    slate_checkpoint()
+    heavy(i)
+end
+```
+
+A cell that has not stopped a few seconds after Stop says `Still running`, with a button that restarts
+its worker (main or region).
+
 ## Printed output, while it is printed
 
 Anything a cell prints appears **as it runs**, with no API to call — `println`, a logger, or a

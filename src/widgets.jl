@@ -1874,7 +1874,10 @@ function _populate_notebook_ns!(m::Module; echart, EChart, slate_table, SlateTab
     Core.eval(m, :(const slate_render_fence = $_slate_render_fence))   # ```lang fence → the claiming extension's value
     Core.eval(m, :(const slate_query = $slate_query))
     Core.eval(m, :(const slate_refresh = $slate_refresh))
-    Core.eval(m, :(const slate_progress = $slate_progress))   # slate_progress(frac; msg) → live cell progress
+    # slate_progress(frac; msg) → live cell progress; a cell asked to stop ends at its next report.
+    progress = (frac; kw...) -> (slate_checkpoint(); slate_progress(frac; kw...))
+    Core.eval(m, :(const slate_progress = $progress))
+    Core.eval(m, :(const slate_checkpoint = $slate_checkpoint))   # a stop point for a long loop
     Core.eval(m, :(const slate_emit = $slate_emit))           # slate_emit(channel, data) → live push to a cell's custom JS (cellstream:)
     # INTERNAL (underscored — not part of the authoring surface): capture.jl's output-streaming
     # watchdog pushes a cooked frame of what the running cell has printed so far through here.
