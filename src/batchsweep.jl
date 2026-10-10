@@ -953,27 +953,72 @@ function clear_attempts!(root::AbstractString, sweep::AbstractString)
     return n
 end
 
-"""
-    run_queued_chunk(root, chunk; owner = "", beat = 20) -> NamedTuple
+# How old a claim is before its worker counts as gone (`BatchLauncher.CLAIM_STALE_S`, which this
+# module cannot reach): its chunk is anyone's to take again.
+const QUEUE_CLAIM_STALE_S = 120
 
-Run one chunk of a region sweep's queue (`BatchLauncher.RegionLauncher`) where this process is, as a
-task worker does: claim it in the store's `queue/`, refresh the claim every `beat` seconds while it
-runs, and mark it done when it returns, whether its units succeeded or not. Returns `run_chunk`'s
-counts. The queue is how the notebook's card and the hub's driver see a chunk taken and finished.
-"""
-function run_queued_chunk(root::AbstractString, chunk::AbstractString; owner::AbstractString = "",
-                          beat::Real = 20)
-    q = joinpath(String(root), "queue"); mkpath(q)
-    claim = joinpath(q, String(chunk) * ".claim")
-    write(claim, String(owner))
-    t = Timer(_ -> (try; touch(claim); catch; end), beat; interval = beat)
-    try
-        return SlateTask.run_chunk(String(root), String(chunk))
-    finally
-        close(t)
-        try; write(joinpath(q, String(chunk) * ".done"), ""); catch; end
+# Take `chunk` for `owner`. A hard link fails when its name exists, so of two workers reaching one
+# chunk exactly one gets it. A claim left by a worker that is gone is removed first.
+function take_claim!(q::AbstractString, chunk::AbstractString, owner::AbstractString; now::Real = time())
+    claim = joinpath(q, chunk * ".claim")
+    if isfile(claim) && now - mtime(claim) > QUEUE_CLAIM_STALE_S
         rm(claim; force = true)
     end
+    tmp = joinpath(q, chunk * ".claim." * string(getpid()) * "." * string(rand(UInt32); base = 16))
+    write(tmp, owner)
+    try
+        hardlink(tmp, claim)
+        return true
+    catch
+        return false
+    finally
+        rm(tmp; force = true)
+    end
+end
+
+# The chunks named by the queue's wants, read from the files, so a chunk handed to a worker is
+# dropped when its want is cancelled.
+function wanted_chunks(q::AbstractString)
+    out = Set{String}()
+    isdir(q) || return out
+    for f in readdir(q)
+        endswith(f, ".want") || continue
+        for line in eachline(joinpath(q, f))
+            startswith(line, "chunks=") && union!(out, split(line[8:end]))
+        end
+    end
+    return out
+end
+
+"""
+    run_queued_chunks(root, chunks; owner = "", beat = 20, on_chunk = c -> nothing) -> Int
+
+Run the chunks of a region sweep's queue (`BatchLauncher.RegionLauncher`) where this process is, as a
+task worker does, in order: each one still wanted, not done, and not claimed by another worker is
+claimed, run (`SlateTask.run_chunk`) with its claim refreshed every `beat` seconds, and marked done when
+it returns, whether its units succeeded or not. Several workers can be given the same list: the claim
+decides which of them runs each chunk. Returns how many chunks this call ran.
+"""
+function run_queued_chunks(root::AbstractString, chunks; owner::AbstractString = "", beat::Real = 20,
+                           on_chunk = c -> nothing)
+    q = joinpath(String(root), "queue"); mkpath(q)
+    n = 0
+    for c in String.(chunks)
+        (c in wanted_chunks(q) && !isfile(joinpath(q, c * ".done"))) || continue
+        take_claim!(q, c, String(owner)) || continue
+        on_chunk(c)
+        claim = joinpath(q, c * ".claim")
+        t = Timer(_ -> (try; touch(claim); catch; end), beat; interval = beat)
+        try
+            SlateTask.run_chunk(String(root), c)
+        finally
+            close(t)
+            try; write(joinpath(q, c * ".done"), ""); catch; end
+            rm(claim; force = true)
+        end
+        n += 1
+    end
+    return n
 end
 
 end # module BatchSweep

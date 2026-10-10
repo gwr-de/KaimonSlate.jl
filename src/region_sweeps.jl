@@ -2,8 +2,9 @@
 # A job cell with `region=<name>` and no `cluster=` queues its chunks in the region's store
 # (`Sweep.RegionLauncher`). Here the hub takes them: on the node the region holds it starts task
 # workers, one per GPU (one on a CPU node), each pinned to its GPU and started in the notebook's
-# environment like the region's own worker, so it is synced and Revise'd the same way. Each worker runs
-# one chunk at a time and many chunks over its life, so loading and compilation are paid once.
+# environment like the region's own worker, so it is synced and Revise'd the same way. A worker is
+# handed the chunks queued and runs them one after another, claiming each in the store, so several
+# workers share a list without running a chunk twice, and loading and compilation are paid once.
 #
 # The store is the only channel between the notebook and this driver. The card submits by writing a
 # want, reads progress from the store and the claims, and cancels by removing the want; the driver
@@ -14,7 +15,8 @@
 mutable struct _TaskWorker
     kernel::ReportEngine.GateKernel
     slot::Int                       # the GPU it is pinned to; -1 on a CPU node
-    chunk::String                   # the chunk it is running ("" = free)
+    chunk::String                   # the chunk it is running
+    busy::Bool                      # working through the chunks it was handed
 end
 
 mutable struct _RegionSweeper
@@ -54,10 +56,10 @@ function _task_worker(r, parent::AbstractString, slot::Int)
                                 threads = ReportEngine.region_threads(r), label = label)
     k.conn, k.tunnel = ReportEngine.spawn_and_connect_remote!(k, t, String(parent))
     ReportEngine._rlog("region[$(r.name)]: task worker $label up on $(t.ssh_host)")
-    w = _TaskWorker(k, slot, "")
-    # Reattached to a worker a previous hub started: it may be part way through a chunk already.
+    w = _TaskWorker(k, slot, "", false)
+    # Reattached to a worker a previous hub started: it may be part way through its chunks already.
     st = try; ReportEngine._tool(k, "__slate_chunk_status", Dict{String,Any}(); timeout = 15.0); catch; nothing; end
-    (st !== nothing && get(st, "state", "") == "running") && (w.chunk = String(st["chunk"]))
+    (st !== nothing && get(st, "state", "") == "running") && (w.chunk = String(st["chunk"]); w.busy = true)
     return w
 end
 
@@ -85,9 +87,11 @@ function _drive_region_sweeps!(h)
         name = String(get(e, "_region", ""))
         r = ReportEngine.region_get(name)
         r === nothing && continue
-        # Every 10 s while the region has task workers, every 30 s otherwise: each pass is one
-        # command on the login host, and an idle store costs only that.
-        active = lock(_SWEEPERS_LOCK) do; any(s -> s.region == name && !isempty(s.workers), values(_SWEEPERS)); end
+        # Every 10 s while the region has work queued or task workers, every 30 s otherwise: each
+        # pass is one command on the login host, and an idle store costs only that.
+        active = lock(_SWEEPERS_LOCK) do
+            name in _SWEEP_QUEUED || any(s -> s.region == name && !isempty(s.workers), values(_SWEEPERS))
+        end
         now - get(_SWEEP_POLLED, name, 0.0) < (active ? 10.0 : 30.0) && continue
         store = String(get(e, "root_remote", ""))
         _region_work!(name, :sweep) do
@@ -101,12 +105,16 @@ function _drive_region_sweeps!(h)
     return nothing
 end
 const _SWEEP_POLLED = Dict{String,Float64}()
+const _SWEEP_QUEUED = Set{String}()       # regions whose last pass found work queued, under `_SWEEPERS_LOCK`
 
 function _drive_region_sweep!(r, store::AbstractString)
     BL = ReportEngine.Sweep.BatchLauncher
     runner = (hh, sc) -> ReportEngine.Sweep.run_there(hh, sc)
     ReportEngine.Sweep.connected(r.host) || return nothing        # nobody signed in: nothing to read
     q = BL.read_queue(runner, r.host, store)
+    lock(_SWEEPERS_LOCK) do
+        isempty(q.wants) ? delete!(_SWEEP_QUEUED, r.name) : push!(_SWEEP_QUEUED, r.name)
+    end
     wanted = Set{String}(c for w in values(q.wants) for c in w.chunks)
     mine = lock(_SWEEPERS_LOCK) do; [s for s in values(_SWEEPERS) if s.region == r.name]; end
     foreach(s -> _check_workers!(s, r, wanted), mine)
@@ -118,7 +126,7 @@ function _drive_region_sweep!(r, store::AbstractString)
     # submission of an interactive session usually follows soon, and starting a worker is the slow part.
     for s in mine
         haskey(byparent, s.parent) && continue
-        any(w -> !isempty(w.chunk), s.workers) && continue
+        any(w -> w.busy, s.workers) && continue
         s.idle_since == 0 && (s.idle_since = time())
         time() - s.idle_since > _SWEEP_IDLE_STOP && _stop_sweeper!(s, "nothing queued")
     end
@@ -160,38 +168,37 @@ function _check_workers!(s::_RegionSweeper, r, wanted::Set{String})
             _stop_task_worker!(w); filter!(!=(w), s.workers); continue
         end
         state = String(get(st, "state", "idle"))
-        if state == "running" && !(w.chunk in wanted)
+        w.chunk = String(get(st, "chunk", ""))
+        w.busy = state == "running"
+        if w.busy && !isempty(w.chunk) && !(w.chunk in wanted)
             ReportEngine._rlog("region[$(r.name)]: chunk $(w.chunk) is no longer wanted — stopping its worker")
             _stop_task_worker!(w); filter!(!=(w), s.workers); continue
         end
-        if state in ("finished", "failed")
-            state == "failed" && ReportEngine._rlog("region[$(r.name)]: chunk $(w.chunk) failed: " *
-                                                    String(get(st, "error", "")))
-            w.chunk = ""
-        elseif state == "idle"
-            w.chunk = ""
-        end
+        state == "failed" && ReportEngine._rlog("region[$(r.name)]: $(w.kernel.label) stopped on chunk " *
+                                                "$(w.chunk): " * String(get(st, "error", "")))
     end
     return nothing
 end
 
 function _feed_sweeper!(s::_RegionSweeper, r, store, q, names, runner)
     BL = ReportEngine.Sweep.BatchLauncher
-    # Chunks to give out: wanted, not returned, and not held by a live claim.
-    taken = Set{String}(w.chunk for w in s.workers if !isempty(w.chunk))
+    # Chunks to give out: wanted, not returned, and not held by a live claim. A busy worker's list may
+    # hold some of them too; the claim decides who runs each.
     free_claim(c) = (cl = get(q.claims, c, nothing); cl === nothing || cl.age >= BL.CLAIM_STALE_S)
-    todo = [c for n in sort!(collect(names)) for c in q.wants[n].chunks
-            if !(c in q.done) && !(c in taken) && free_claim(c)]
+    todo = unique!([c for n in sort!(collect(names)) for c in q.wants[n].chunks
+                    if !(c in q.done) && free_claim(c)])
     # A want whose chunks have all returned is finished: its card reads the store for what landed.
     finished = [n for n in names if all(in(q.done), q.wants[n].chunks)]
     isempty(finished) || runner(r.host, "rm -f " * join((BL._shq(joinpath(store, "queue", f))
         for n in finished for f in [n * ".want"; [c * ".done" for c in q.wants[n].chunks]]), ' '))
-    s.idle_since = isempty(todo) && isempty(taken) ? (s.idle_since == 0 ? time() : s.idle_since) : 0.0
+    busy = any(w -> w.busy, s.workers)
+    s.idle_since = isempty(todo) && !busy ? (s.idle_since == 0 ? time() : s.idle_since) : 0.0
     isempty(todo) && return nothing
-    # Start the workers the work can use, then hand each free one a chunk.
+    # Start the workers the work can use, then hand each free one the list, each starting at a
+    # different chunk so they do not race for the same claims.
     have = Set(w.slot for w in s.workers)
     for slot in _sweep_slots(r)
-        length(s.workers) >= length(todo) + length(taken) && break
+        length(s.workers) >= length(todo) && break
         slot in have && continue
         try
             push!(s.workers, _task_worker(r, s.parent, slot))
@@ -200,21 +207,21 @@ function _feed_sweeper!(s::_RegionSweeper, r, store, q, names, runner)
             break
         end
     end
-    for w in s.workers
-        isempty(w.chunk) || continue
-        isempty(todo) && break
-        c = popfirst!(todo)
+    free = [w for w in s.workers if !w.busy]
+    for (i, w) in enumerate(free)
+        k = (i - 1) * cld(length(todo), length(free))
+        list = vcat(todo[k+1:end], todo[1:k])
         res = try
-            ReportEngine._tool(w.kernel, "__slate_run_chunk",
-                               Dict{String,Any}("root" => store, "chunk" => c, "owner" => w.kernel.label); timeout = 30.0)
+            ReportEngine._tool(w.kernel, "__slate_run_chunks",
+                               Dict{String,Any}("root" => store, "chunks" => list, "owner" => w.kernel.label); timeout = 30.0)
         catch e
             Dict{String,Any}("error" => first(sprint(showerror, e), 200))
         end
         if haskey(res, "error")
-            ReportEngine._rlog("region[$(r.name)]: $(w.kernel.label) did not take chunk $c: $(res["error"])")
+            ReportEngine._rlog("region[$(r.name)]: $(w.kernel.label) did not take its chunks: $(res["error"])")
         else
-            w.chunk = c
-            ReportEngine._rlog("region[$(r.name)]: chunk $c → $(w.kernel.label)")
+            w.busy = true
+            ReportEngine._rlog("region[$(r.name)]: $(length(list)) chunk(s) → $(w.kernel.label)")
         end
     end
     return nothing

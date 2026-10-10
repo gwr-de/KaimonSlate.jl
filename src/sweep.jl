@@ -3561,7 +3561,9 @@ function handle_action(target::SweepTarget, run::AbstractString, params, keys,
     # rather than served for another few seconds. The payload built below is the first thing to ask
     # again, and a reset that still reported its old jobs would read as the reset not having worked.
     collect_invalidate!(target)
-    return status_payload(target, run, params, keys; plot)
+    # Answered without reconciling: submitting is several round trips to the host, and the card's
+    # call would outlast its deadline waiting for them. The next poll, or the hub, submits.
+    return status_payload(target, run, params, keys; plot, advance = false)
 end
 
 # Compact enough to poll on a timer: counts and rates, plus a per-unit status string of one

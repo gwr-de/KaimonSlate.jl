@@ -3708,7 +3708,7 @@ end
             @test (w.region, w.parent, sort(w.chunks)) == ("gpu", "/env", sort(chunks))
             @test BL.poll(l, root, names) == Dict(only(names) => :pending)
             # A task worker takes the first chunk: claimed while it runs, done when it returns.
-            BS.run_queued_chunk(root, chunks[1]; owner = "w0")
+            @test BS.run_queued_chunks(root, chunks[1:1]; owner = "w0") == 1
             q = BL.read_queue(l.runner, "", root)
             @test chunks[1] in q.done && !haskey(q.claims, chunks[1])
             @test BL.queue_state(q, only(names)) == :pending          # the other chunk is still to run
@@ -3718,14 +3718,24 @@ end
             stale = BL.parse_queue("$(only(names)).want\t5\tregion=gpu;parent=/env;chunks=$(join(chunks, ' '));\n" *
                                    "$(chunks[2]).claim\t$(BL.CLAIM_STALE_S + 1)\tw1;\n$(chunks[1]).done\t3\t\n")
             @test BL.queue_state(stale, only(names)) == :pending
+            # Another worker's live claim is left alone, and a chunk that has returned is not run again.
+            @test BS.run_queued_chunks(root, chunks; owner = "w0") == 0
             rm(joinpath(root, "queue", chunks[2] * ".claim"))
-            BS.run_queued_chunk(root, chunks[2]; owner = "w0")
+            @test BS.run_queued_chunks(root, chunks; owner = "w0") == 1
             @test BL.poll(l, root, names)[only(names)] == :unknown    # every chunk returned: the store says what landed
             p = BS.plan(root, sweep; launcher = l)
             @test (p.shards_total, p.shards_ok) == (4, 4)
             @test [r.value for r in BS.results(root, sweep)] == [2, 4, 6, 8]
-            # Cancelling removes the want, which is what stops the workers holding its chunks.
+            # Cancelling removes the want, which is what stops the workers holding its chunks; a worker
+            # handed them already skips the ones it has not started.
             @test BL.cancel!(l, root, names) == 1 && isempty(BL.read_queue(l.runner, "", root).wants)
+            rm.(joinpath.(root, "queue", chunks .* ".done"))
+            @test BS.run_queued_chunks(root, chunks; owner = "w0") == 0
+            # Of two workers reaching one chunk, one takes it.
+            q = joinpath(root, "queue")
+            @test BS.take_claim!(q, "cx", "a") && !BS.take_claim!(q, "cx", "b")
+            @test BS.take_claim!(q, "cx", "b"; now = time() + BS.QUEUE_CLAIM_STALE_S + 1) &&
+                  read(joinpath(q, "cx.claim"), String) == "b"                 # a claim left by a gone worker
         end
     end
 end

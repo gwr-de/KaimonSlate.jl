@@ -2784,7 +2784,7 @@ function tools()
         KaimonGate.GateTool("__slate_rerender_fig", __slate_rerender_fig),
         KaimonGate.GateTool("__slate_eval_batch", __slate_eval_batch),
         KaimonGate.GateTool("__slate_running", __slate_running),
-        KaimonGate.GateTool("__slate_run_chunk", __slate_run_chunk),
+        KaimonGate.GateTool("__slate_run_chunks", __slate_run_chunks),
         KaimonGate.GateTool("__slate_chunk_status", __slate_chunk_status),
         KaimonGate.GateTool("__slate_gc", __slate_gc),
         KaimonGate.GateTool("__slate_profile_prepare", __slate_profile_prepare),
@@ -3086,27 +3086,31 @@ function _gc_events(seen::Int, now::Float64)
 end
 
 # ── Chunks of a region sweep ───────────────────────────────────────────────────────────────────
-# The hub runs a region sweep's chunks in task workers on the region's node (`_drive_region_sweeps!`),
-# one chunk at a time per worker (`BatchSweep.run_queued_chunk`), and asks here how it is going.
-const _CHUNK = Ref{Any}(nothing)          # (; chunk, task, started)
-const _CHUNK_LOCK = ReentrantLock()
+# The hub hands a task worker on a region's node the chunks queued for it (`_drive_region_sweeps!`).
+# The worker runs them one after another, claiming each in the store (`BatchSweep.run_queued_chunks`),
+# so it does not wait on the hub between chunks, and the hub asks here what it is doing.
+const _CHUNKS = Ref{Any}(nothing)          # (; task, current::Ref{String}, chunks)
+const _CHUNKS_LOCK = ReentrantLock()
 
-function __slate_run_chunk(; root::AbstractString = "", chunk::AbstractString = "", owner::AbstractString = "")
-    (isempty(root) || isempty(chunk)) && return Dict{String,Any}("error" => "name the store and the chunk")
-    lock(_CHUNK_LOCK) do
-        cur = _CHUNK[]
+function __slate_run_chunks(; root::AbstractString = "", chunks = String[], owner::AbstractString = "")
+    (isempty(root) || isempty(chunks)) && return Dict{String,Any}("error" => "name the store and the chunks")
+    lock(_CHUNKS_LOCK) do
+        cur = _CHUNKS[]
         (cur !== nothing && !istaskdone(cur.task)) &&
-            return Dict{String,Any}("error" => "running chunk $(cur.chunk)")
-        t = Threads.@spawn Sweep.BatchSweep.run_queued_chunk(String(root), String(chunk); owner = String(owner))
-        _CHUNK[] = (; chunk = String(chunk), task = t, started = time())
+            return Dict{String,Any}("error" => "running chunk $(cur.current[])")
+        list = String.(collect(chunks))
+        current = Ref("")
+        t = Threads.@spawn Sweep.BatchSweep.run_queued_chunks(String(root), list; owner = String(owner),
+                                                              on_chunk = c -> (current[] = c))
+        _CHUNKS[] = (; task = t, current, chunks = list)
         Dict{String,Any}("ok" => true)
     end
 end
 
 function __slate_chunk_status()
-    cur = _CHUNK[]
+    cur = _CHUNKS[]
     cur === nothing && return Dict{String,Any}("state" => "idle")
-    out = Dict{String,Any}("chunk" => cur.chunk, "secs" => round(time() - cur.started; digits = 1))
+    out = Dict{String,Any}("chunk" => cur.current[], "chunks" => cur.chunks)
     if !istaskdone(cur.task)
         out["state"] = "running"
     elseif istaskfailed(cur.task)
@@ -3114,7 +3118,7 @@ function __slate_chunk_status()
         out["error"] = first(sprint(showerror, cur.task.result), 300)
     else
         out["state"] = "finished"
-        out["result"] = string(fetch(cur.task))
+        out["ran"] = fetch(cur.task)
     end
     return out
 end
