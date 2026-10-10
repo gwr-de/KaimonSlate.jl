@@ -6406,6 +6406,10 @@ function _find_live_worker(host, label, parent; workers = nothing)
     for w in (workers === nothing ? list_remote_workers(host) : workers)   # `something` would list them regardless
         w["alive"] === true || continue
         mf = w["manifest"]
+        # Compute nodes share the login node's home, so its roster lists the workers of every node:
+        # one started on another node is not this host's to dial.
+        n = _manifest_get(mf, "node")
+        (isempty(n) || n == String(host)) || continue
         (_manifest_get(mf, "notebook") == String(label) &&
          _manifest_get(mf, "parent") == String(parent) &&
          _manifest_ours(mf)) || continue

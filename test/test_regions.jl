@@ -2351,6 +2351,15 @@ end
         @test startswith(arm, "0x41-8-0xd0c-")
     end
 
+    @testset "a probe dials only the workers started on its own node" begin
+        mf(node, port) = "{\"notebook\":\"nb#dk#task0\",\"parent\":\"/env\",\"owner\":\"$(RE.worker_owner_tag())\"," *
+                         "\"hub\":\"$(gethostname())\"," *
+                         "\"node\":\"$node\",\"port\":\"$port\",\"stream_port\":\"$(port + 1)\"}"
+        roster = [Dict{String,Any}("alive" => true, "port" => 9102, "manifest" => mf("c2", 9102))]
+        @test RE._find_live_worker("c1", "nb#dk#task0", "/env"; workers = roster) === nothing
+        @test RE._find_live_worker("c2", "nb#dk#task0", "/env"; workers = roster).port == 9102
+    end
+
     @testset "a worker being reaped is not attached to again" begin
         RE._mark_reaped!("reapnode", 9311)
         now = time()

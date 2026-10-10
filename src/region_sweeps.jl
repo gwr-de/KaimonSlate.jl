@@ -90,7 +90,13 @@ function _drive_region_sweeps!(h)
         active = lock(_SWEEPERS_LOCK) do; any(s -> s.region == name && !isempty(s.workers), values(_SWEEPERS)); end
         now - get(_SWEEP_POLLED, name, 0.0) < (active ? 10.0 : 30.0) && continue
         store = String(get(e, "root_remote", ""))
-        _region_work!(() -> _drive_region_sweep!(r, store), name, :sweep) && (_SWEEP_POLLED[name] = now)
+        _region_work!(name, :sweep) do
+            t0 = time()
+            _drive_region_sweep!(r, store)
+            # A pass is a command on the login host and a status call per worker. One that takes long
+            # holds up every chunk behind it, so it is worth a line in the log.
+            (dt = time() - t0) > 30 && ReportEngine._rlog("region[$name]: a sweep pass took $(round(Int, dt))s")
+        end && (_SWEEP_POLLED[name] = now)
     end
     return nothing
 end
@@ -178,7 +184,8 @@ function _feed_sweeper!(s::_RegionSweeper, r, store, q, names, runner)
             if !(c in q.done) && !(c in taken) && free_claim(c)]
     # A want whose chunks have all returned is finished: its card reads the store for what landed.
     finished = [n for n in names if all(in(q.done), q.wants[n].chunks)]
-    isempty(finished) || runner(r.host, "rm -f " * join((BL._shq(joinpath(store, "queue", n * ".want")) for n in finished), ' '))
+    isempty(finished) || runner(r.host, "rm -f " * join((BL._shq(joinpath(store, "queue", f))
+        for n in finished for f in [n * ".want"; [c * ".done" for c in q.wants[n].chunks]]), ' '))
     s.idle_since = isempty(todo) && isempty(taken) ? (s.idle_since == 0 ? time() : s.idle_since) : 0.0
     isempty(todo) && return nothing
     # Start the workers the work can use, then hand each free one a chunk.
@@ -207,6 +214,7 @@ function _feed_sweeper!(s::_RegionSweeper, r, store, q, names, runner)
             ReportEngine._rlog("region[$(r.name)]: $(w.kernel.label) did not take chunk $c: $(res["error"])")
         else
             w.chunk = c
+            ReportEngine._rlog("region[$(r.name)]: chunk $c → $(w.kernel.label)")
         end
     end
     return nothing
