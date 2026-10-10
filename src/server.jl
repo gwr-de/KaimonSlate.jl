@@ -1602,6 +1602,9 @@ end
 
 # The region a cell is TAGGED into: `region=NAME`. "" = the main kernel.
 function _cell_region(cell::Cell)
+    # A job cell's `region=` names where its units run (`Sweep.RegionLauncher`); the cell itself
+    # plans and watches the sweep from the notebook's own kernel.
+    cell.kind == JOB && return ""
     for f in cell.flags
         s = String(f)
         startswith(s, "region=") && return String(chopprefix(s, "region="))
@@ -3734,6 +3737,9 @@ function _supervise_runs!(h)   # NOTE: `Hub` is defined later (server_hub.jl, in
     try; ReportEngine.Sweep.advance_started!()
     catch e; ReportEngine._rlog("supervisor: sweep advance error: " * first(sprint(showerror, e), 120))
     end
+    try; _drive_region_sweeps!(h)             # a region sweep's chunks, on the region's node
+    catch e; ReportEngine._rlog("supervisor: region sweep driver error: " * first(sprint(showerror, e), 120))
+    end
     try                                       # a leak is only visible as a series, so write one
         line = SlateDiag.diag_log_line()
         line === nothing || ReportEngine._rlog(line)
@@ -5615,6 +5621,7 @@ function redo!(nb::LiveNotebook)
 end
 
 
+include("region_sweeps.jl")     # the hub's driver for sweeps that run on a region's node
 include("server_history.jl")
 include("server_facts.jl")     # the one description of the hub's state that pages render from
 include("server_agentops.jl")

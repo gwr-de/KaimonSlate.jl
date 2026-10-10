@@ -368,6 +368,9 @@ struct ClusterTarget <: SweepTarget
     # environment is not among them does not submit.
     tested::String
     machine::String     # the machine's name, for the card's Prepare button
+    # `kind = :region` only: the region whose held node runs the units, in the hub's task workers. The
+    # store, the keys and the reconcile are a cluster's; only who runs a chunk differs (`launcher_for`).
+    region::String
 end
 #
 # A target DESCRIBES a cluster; it does not reach one. `parent` and an empty `project`/`payload` mean
@@ -382,12 +385,13 @@ function ClusterTarget(host = ""; kind = :slurm, root = "", root_remote = root, 
                        resources = (; cpus = 1, mem = "2G", walltime = "01:00:00", partition = ""),
                        chunk = 16, account = "", qos = "", prologue = "", directives = "",
                        julia = "julia", procs = 0, mode = "0700", probe = 1, setup = "", depot = "",
-                       tested = "", machine = "")
+                       tested = "", machine = "", region = "")
     ClusterTarget(Symbol(kind), String(host), String(root), String(root_remote),
                   project === nothing ? "" : String(project), String(payload),
                   resources, Int(chunk), String(account), String(qos), String(prologue),
                   String(directives), String(parent), String(julia), Int(procs), String(mode),
-                  Int(probe), String(setup), String(depot), String(tested), String(machine))
+                  Int(probe), String(setup), String(depot), String(tested), String(machine),
+                  String(region))
 end
 
 # `t` with the named fields replaced.
@@ -548,7 +552,7 @@ function cluster(spec::AbstractDict)
         return LocalTarget(; a.root, a.parent, a.chunk, a.procs)
     return ClusterTarget(a.host; kind = Symbol(a.kind), a.root, a.root_remote, a.parent, a.payload,
                          a.chunk, a.account, a.qos, a.prologue, a.directives, a.resources, a.procs,
-                         a.mode, a.setup, a.depot, a.tested, machine = a.name)
+                         a.mode, a.setup, a.depot, a.tested, machine = a.name, a.region)
 end
 
 """
@@ -564,7 +568,7 @@ function cluster_args(spec::AbstractDict)
     # `kind` names what SCHEDULES the work; `host` says where. `local` is the older spelling of
     # `exec` with no host, kept because a definition on disk uses it.
     kind == "local" && (kind = "exec")
-    kind in ("slurm", "pbs", "exec") ||
+    kind in ("slurm", "pbs", "exec", "region") ||
         error("cluster `$name` has kind `$kind`; this build supports `slurm`, `pbs` and `exec` " *
               "(no scheduler — Slate runs the processes itself, here or on a host). " *
               "Kubernetes is a separate backend, not an option here.")
@@ -609,8 +613,12 @@ function cluster_args(spec::AbstractDict)
               # Resolved by the hub from the machine and what preparing it found (`machine_setup`),
               # and added to the entry it hands a cell, since a worker has no registry of its own.
               setup = get_("_setup"), depot = get_("_depot"), tested = get_("_tested"),
+              region = get_("_region"),
               resources = res === nothing ? NamedTuple() : res)
 end
+
+# The target name a region's sweeps resolve through: `region:<name>`, beside the machine entries.
+region_target_name(region::AbstractString) = "region:" * String(region)
 
 # Resolve the target a job cell asked for: an explicit one written in the cell wins, else the
 # `cluster=` named on its header, else nothing to run on — which is worth an error naming the
@@ -623,6 +631,15 @@ function resolve_target(explicit, attrs::AbstractDict, clusters::AbstractDict)
     explicit === nothing || return explicit
     known() = join(sort!(collect(keys(clusters))), ", ")
     nm = String(get(attrs, "cluster", ""))
+    # A job cell that names a region and no cluster runs its units on the node that region holds.
+    rg = String(get(attrs, "region", ""))
+    if isempty(nm) && !isempty(rg)
+        spec = get(clusters, region_target_name(rg), nothing)
+        spec === nothing &&
+            error("@sweep: region `$rg` has no machine with a store, so its node cannot run a sweep. " *
+                  "Give the region a machine, and the machine a store (`root_remote`), on $_WHERE_TARGETS.")
+        return cluster(merge(Dict{String,Any}("name" => region_target_name(rg)), spec))
+    end
     if isempty(nm)
         isempty(clusters) &&
             error("@sweep: this cell has no cluster. Pick one from the ⚙ on the cell — or set one " *
@@ -769,6 +786,9 @@ function launcher_for(t::ClusterTarget)
     t.kind === :exec &&
         return BatchLauncher.ExecLauncher(t.host; maxproc = local_procs(t), root = job_root(t),
                                           runner = (h, sc) -> run_there(h, sc))
+    t.kind === :region &&
+        return BatchLauncher.RegionLauncher(t.host; region = t.region, root = job_root(t), parent = t.parent,
+                                            runner = (h, sc) -> run_there(h, sc))
     ctor = t.kind === :slurm ? BatchLauncher.SlurmLauncher :
            t.kind === :pbs   ? BatchLauncher.PbsLauncher :
            error("cluster: no launcher for scheduler `$(t.kind)`")
@@ -787,6 +807,10 @@ specfn_for(t::LocalTarget) = (name, cs) -> BatchLauncher.JobSpec(name, cs;
 # `reconcile!` calls this only when it has a job to submit, so provisioning here is what keeps it off
 # the path that merely reads the store. Once per reconcile, not once per job.
 function specfn_for(t::ClusterTarget)
+    # A region's node has the notebook's environment already: its own prepare built it, and the hub's
+    # task workers start in it. Nothing is provisioned, and the spec carries only what the queue needs.
+    t.kind === :region && return (name, cs) -> BatchLauncher.JobSpec(name, cs; root = t.root_remote,
+        project = "", payload = "", resources = t.resources, umask = store_umask(t))
     ready = Ref{Union{Nothing,ClusterTarget}}(nothing)
     return (name, cs) -> begin
         p = ready[] === nothing ? (ready[] = provision!(t)) : ready[]
@@ -1565,7 +1589,8 @@ node_type(partition::AbstractString, constraint::AbstractString) =
 
 # Whether `t`'s environment still has to pass a test task before an array goes out. Only a target the
 # hub resolved knows what has been tested (`setup` is set by it); one built by hand runs as it is.
-_untested(t::ClusterTarget) = !isempty(t.setup) && !(env_test_key(t) in split(t.tested, ','; keepempty = false))
+_untested(t::ClusterTarget) = t.kind !== :region && !isempty(t.setup) &&
+    !(env_test_key(t) in split(t.tested, ','; keepempty = false))
 _untested(::SweepTarget) = false
 
 # Runs whose descriptors this process has sent. The cell pushes them, but a cluster that wants a
@@ -4129,6 +4154,7 @@ end
 # what you need in order to read a stalled or killed run: "3 of 4, gave up" means one thing at a
 # 20-second walltime and another at two hours.
 function _target_line(t::ClusterTarget)
+    t.kind === :region && return "region $(t.region) · on its node · $(t.chunk)/chunk"
     # The scheduler leads, then where it is. Which scheduler ran the work is worth reading off the
     # card: the resources beside it mean different things on each, and the same notebook can point
     # at either. Matches the cluster summary the cell's ⚙ shows.

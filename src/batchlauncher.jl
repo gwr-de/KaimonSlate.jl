@@ -771,6 +771,112 @@ function logs(l::ExecLauncher, root::AbstractString, name::AbstractString; lines
     return String(take!(buf))
 end
 
+# ── A region's held node ─────────────────────────────────────────────────────────────────────
+# No scheduler is asked for anything: the node is the one a region already holds, and the hub runs
+# the chunks in task workers there (`_drive_region_sweeps!`). A submission is a file in the store's
+# `queue/` that names its chunks; a task worker running a chunk keeps `<chunk>.claim` fresh, and marks
+# `<chunk>.done` when the chunk returns. The store is the only channel, so a hub that restarts finds
+# the queue where it left it, and a worker that dies leaves a claim that goes stale and is taken again.
+struct RegionLauncher <: Launcher
+    host::String                 # where the store is reached: the region's login host
+    region::String
+    root::String                 # the store as the host sees it
+    parent::String               # the notebook environment the task workers start in
+    runner::Any                  # (host, script) -> (ok, output)
+end
+RegionLauncher(host::AbstractString; region::AbstractString, root::AbstractString,
+               parent::AbstractString = "", runner) =
+    RegionLauncher(String(host), String(region), String(root), String(parent), runner)
+
+"A claim older than this is a task worker that is gone: its chunk is pending again."
+const CLAIM_STALE_S = 120
+_queue_dir(root) = joinpath(String(root), "queue")
+
+function submit!(l::RegionLauncher, spec::JobSpec)
+    isempty(spec.chunks) && return ""
+    q = _queue_dir(l.root)
+    body = "region=$(l.region)\nparent=$(l.parent)\nchunks=$(join(spec.chunks, ' '))\n"
+    um = isempty(spec.umask) ? ":" : "umask " * spec.umask
+    ok, out = l.runner(l.host, "$um; mkdir -p $(_shq(q)) && rm -f " *
+                       join((_shq(joinpath(q, c * ".done")) for c in spec.chunks), ' ') *
+                       " && printf '%s' $(_shq(body)) > $(_shq(joinpath(q, spec.name * ".tmp"))) && " *
+                       "mv $(_shq(joinpath(q, spec.name * ".tmp"))) $(_shq(joinpath(q, spec.name * ".want")))")
+    ok || error("could not queue work for region $(l.region) on $(l.host): " * first(strip(String(out)), 300))
+    return spec.name
+end
+
+"""
+    read_queue(runner, host, root) -> (; wants, claims, done)
+
+A region store's queue in one round trip. `wants`: submission name → `(; region, parent, chunks, age)`.
+`claims`: chunk → `(; owner, age)` with `age` in seconds since the claim was last refreshed. `done`:
+chunks whose run returned.
+"""
+function read_queue(runner, host::AbstractString, root::AbstractString)
+    q = _queue_dir(root)
+    sc = "d=$(_shq(q)); [ -d \"\$d\" ] || exit 0; now=\$(date +%s); for f in \"\$d\"/*.want \"\$d\"/*.claim \"\$d\"/*.done; do " *
+         "[ -f \"\$f\" ] || continue; m=\$(stat -c %Y \"\$f\" 2>/dev/null || stat -f %m \"\$f\"); " *
+         "printf '%s\\t%s\\t' \"\${f##*/}\" \$((now - m)); tr '\\n' ';' < \"\$f\"; echo; done"
+    ok, out = runner(String(host), sc)
+    ok || error("could not read the queue under $root on $host: " * first(strip(String(out)), 300))
+    return parse_queue(String(out))
+end
+
+function parse_queue(txt::AbstractString)
+    wants = Dict{String,NamedTuple{(:region, :parent, :chunks, :age),Tuple{String,String,Vector{String},Int}}}()
+    claims = Dict{String,NamedTuple{(:owner, :age),Tuple{String,Int}}}()
+    done = Set{String}()
+    for line in eachsplit(txt, '\n'; keepempty = false)
+        parts = split(line, '\t'; limit = 3)
+        length(parts) == 3 || continue
+        f, age, body = String(parts[1]), something(tryparse(Int, parts[2]), typemax(Int) ÷ 2), String(parts[3])
+        if endswith(f, ".want")
+            kv = Dict{String,String}()
+            for item in eachsplit(body, ';'; keepempty = false)
+                i = findfirst('=', item); i === nothing || (kv[item[1:prevind(item, i)]] = item[nextind(item, i):end])
+            end
+            wants[f[1:end-5]] = (region = get(kv, "region", ""), parent = get(kv, "parent", ""),
+                                 chunks = String.(split(get(kv, "chunks", ""))), age = age)
+        elseif endswith(f, ".claim")
+            claims[f[1:end-6]] = (owner = String(strip(replace(body, ';' => ' '))), age = age)
+        elseif endswith(f, ".done")
+            push!(done, f[1:end-5])
+        end
+    end
+    return (; wants, claims, done)
+end
+
+# A submission is running while a chunk of it has a fresh claim, pending while it has a chunk not yet
+# done, and unknown once every chunk has returned or it was never queued: the store says what landed.
+function queue_state(q, name::AbstractString)
+    w = get(q.wants, String(name), nothing)
+    w === nothing && return :unknown
+    any(c -> (cl = get(q.claims, c, nothing); cl !== nothing && cl.age < CLAIM_STALE_S), w.chunks) && return :running
+    all(in(q.done), w.chunks) && return :unknown
+    return :pending
+end
+
+function poll(l::RegionLauncher, root::AbstractString, names)
+    out = Dict{String,Symbol}(String(n) => :unknown for n in names)
+    isempty(out) && return out
+    q = try; read_queue(l.runner, l.host, l.root); catch; return out; end
+    for n in keys(out); out[n] = queue_state(q, n); end
+    return out
+end
+
+# The queue entry goes, which is what the hub's driver acts on: a task worker still holding a chunk of
+# a submission that is no longer wanted is stopped. Units it already landed stay landed.
+function cancel!(l::RegionLauncher, root::AbstractString, names)
+    isempty(names) && return 0
+    q = _queue_dir(l.root)
+    ok, _ = l.runner(l.host, "rm -f " * join((_shq(joinpath(q, String(n) * ".want")) for n in names), ' '))
+    return ok ? length(names) : 0
+end
+
+# A chunk's output is in its task worker's log, which the region's worker panel shows.
+log_files(::RegionLauncher, ::AbstractString, ::AbstractVector) = NamedTuple[]
+logs(::RegionLauncher, ::AbstractString, ::AbstractString; lines::Int = 200) = ""
+
 # ── SLURM ────────────────────────────────────────────────────────────────────────────────────
 # One array job per submission: the scheduler sees a single entry with N elements, which is what
 # array jobs exist for, instead of N separate jobs competing in the queue.

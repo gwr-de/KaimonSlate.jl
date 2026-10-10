@@ -2784,6 +2784,8 @@ function tools()
         KaimonGate.GateTool("__slate_rerender_fig", __slate_rerender_fig),
         KaimonGate.GateTool("__slate_eval_batch", __slate_eval_batch),
         KaimonGate.GateTool("__slate_running", __slate_running),
+        KaimonGate.GateTool("__slate_run_chunk", __slate_run_chunk),
+        KaimonGate.GateTool("__slate_chunk_status", __slate_chunk_status),
         KaimonGate.GateTool("__slate_gc", __slate_gc),
         KaimonGate.GateTool("__slate_profile_prepare", __slate_profile_prepare),
         KaimonGate.GateTool("__slate_profile_arm", __slate_profile_arm),
@@ -3081,6 +3083,40 @@ function _gc_events(seen::Int, now::Float64)
     end
     print(io, ']')
     return String(take!(io)), n
+end
+
+# ── Chunks of a region sweep ───────────────────────────────────────────────────────────────────
+# The hub runs a region sweep's chunks in task workers on the region's node (`_drive_region_sweeps!`),
+# one chunk at a time per worker (`BatchSweep.run_queued_chunk`), and asks here how it is going.
+const _CHUNK = Ref{Any}(nothing)          # (; chunk, task, started)
+const _CHUNK_LOCK = ReentrantLock()
+
+function __slate_run_chunk(; root::AbstractString = "", chunk::AbstractString = "", owner::AbstractString = "")
+    (isempty(root) || isempty(chunk)) && return Dict{String,Any}("error" => "name the store and the chunk")
+    lock(_CHUNK_LOCK) do
+        cur = _CHUNK[]
+        (cur !== nothing && !istaskdone(cur.task)) &&
+            return Dict{String,Any}("error" => "running chunk $(cur.chunk)")
+        t = Threads.@spawn Sweep.BatchSweep.run_queued_chunk(String(root), String(chunk); owner = String(owner))
+        _CHUNK[] = (; chunk = String(chunk), task = t, started = time())
+        Dict{String,Any}("ok" => true)
+    end
+end
+
+function __slate_chunk_status()
+    cur = _CHUNK[]
+    cur === nothing && return Dict{String,Any}("state" => "idle")
+    out = Dict{String,Any}("chunk" => cur.chunk, "secs" => round(time() - cur.started; digits = 1))
+    if !istaskdone(cur.task)
+        out["state"] = "running"
+    elseif istaskfailed(cur.task)
+        out["state"] = "failed"
+        out["error"] = first(sprint(showerror, cur.task.result), 300)
+    else
+        out["state"] = "finished"
+        out["result"] = string(fetch(cur.task))
+    end
+    return out
 end
 
 """

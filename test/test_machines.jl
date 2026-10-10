@@ -48,6 +48,26 @@ const RE = KaimonSlate.ReportEngine
             @test m.name == "" && m.host == "box" && m.kind === :exec && m.depot == ""
         end
 
+        @testset "a region's node is a sweep target of its own" begin
+            RE.cluster_set!(Dict("name" => "pms", "host" => "perlmutter", "kind" => "slurm",
+                                 "root_remote" => "/scratch/store"))
+            RE.region_set!("pmsr"; machine = "pms", gpus = "4", data_root = "/scratch/data")
+            RE.region_set!("plain"; host = "box", data_root = "/data/x")
+            es = Dict(String(e["name"]) => e for e in RE.clusters_resolved())
+            e = es["region:pmsr"]
+            @test (e["kind"], e["_region"], e["root_remote"]) == ("region", "pmsr", "/scratch/store/regions/pmsr")
+            @test es["region:plain"]["root_remote"] == "/data/x/sweeps"             # no machine store: the data root
+            # A job cell naming the region and no cluster resolves to it, and its chunks go to the queue.
+            t = RE.Sweep.resolve_target(nothing, Dict("region" => "pmsr"),
+                                        Dict(k => Dict{String,Any}(v) for (k, v) in es))
+            @test t.kind === :region && t.region == "pmsr" && t.root_remote == "/scratch/store/regions/pmsr"
+            @test RE.Sweep.launcher_for(t) isa RE.Sweep.BatchLauncher.RegionLauncher
+            @test !RE.Sweep._untested(t)                     # the region's prepare built its environment
+            @test KaimonSlate.NotebookServer._sweep_slots(RE.region_get("pmsr")) == [0, 1, 2, 3] &&
+                  KaimonSlate.NotebookServer._sweep_slots(RE.region_get("plain")) == [-1]
+            RE.region_delete!("pmsr"); RE.region_delete!("plain")
+        end
+
         @testset "a machine says where a prepare compiles" begin
             RE.cluster_set!(Dict("name" => "pmc", "host" => "perlmutter", "kind" => "slurm"))
             @test RE.machine_get("pmc").compile === :node                       # the granted node, as before

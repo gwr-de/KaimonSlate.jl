@@ -3695,4 +3695,37 @@ end
             @test [r.value for r in BS.results(root, sweep)] == [2, 4, 6, 8]
         end
     end
+
+    @testset "a region's queue is the channel between the card and the task workers" begin
+        mktempdir() do root
+            sweep, chunks = mksweep(root; nchunk = 2, per = 2)
+            l = BL.RegionLauncher(""; region = "gpu", root, parent = "/env", runner = (h, sc) -> BL._local_run(sc))
+            names = String[]
+            spec = (name, cs) -> (push!(names, name); BL.JobSpec(name, cs; root, project = "", payload = ""))
+            BS.reconcile!(root, sweep, l, spec; failure_policy = NOPROBE)
+            q = BL.read_queue(l.runner, "", root)
+            w = only(values(q.wants))
+            @test (w.region, w.parent, sort(w.chunks)) == ("gpu", "/env", sort(chunks))
+            @test BL.poll(l, root, names) == Dict(only(names) => :pending)
+            # A task worker takes the first chunk: claimed while it runs, done when it returns.
+            BS.run_queued_chunk(root, chunks[1]; owner = "w0")
+            q = BL.read_queue(l.runner, "", root)
+            @test chunks[1] in q.done && !haskey(q.claims, chunks[1])
+            @test BL.queue_state(q, only(names)) == :pending          # the other chunk is still to run
+            # A fresh claim reads as running; one left by a worker that died is pending again.
+            write(joinpath(root, "queue", chunks[2] * ".claim"), "w1")
+            @test BL.poll(l, root, names)[only(names)] == :running
+            stale = BL.parse_queue("$(only(names)).want\t5\tregion=gpu;parent=/env;chunks=$(join(chunks, ' '));\n" *
+                                   "$(chunks[2]).claim\t$(BL.CLAIM_STALE_S + 1)\tw1;\n$(chunks[1]).done\t3\t\n")
+            @test BL.queue_state(stale, only(names)) == :pending
+            rm(joinpath(root, "queue", chunks[2] * ".claim"))
+            BS.run_queued_chunk(root, chunks[2]; owner = "w0")
+            @test BL.poll(l, root, names)[only(names)] == :unknown    # every chunk returned: the store says what landed
+            p = BS.plan(root, sweep; launcher = l)
+            @test (p.shards_total, p.shards_ok) == (4, 4)
+            @test [r.value for r in BS.results(root, sweep)] == [2, 4, 6, 8]
+            # Cancelling removes the want, which is what stops the workers holding its chunks.
+            @test BL.cancel!(l, root, names) == 1 && isempty(BL.read_queue(l.runner, "", root).wants)
+        end
+    end
 end

@@ -953,4 +953,27 @@ function clear_attempts!(root::AbstractString, sweep::AbstractString)
     return n
 end
 
+"""
+    run_queued_chunk(root, chunk; owner = "", beat = 20) -> NamedTuple
+
+Run one chunk of a region sweep's queue (`BatchLauncher.RegionLauncher`) where this process is, as a
+task worker does: claim it in the store's `queue/`, refresh the claim every `beat` seconds while it
+runs, and mark it done when it returns, whether its units succeeded or not. Returns `run_chunk`'s
+counts. The queue is how the notebook's card and the hub's driver see a chunk taken and finished.
+"""
+function run_queued_chunk(root::AbstractString, chunk::AbstractString; owner::AbstractString = "",
+                          beat::Real = 20)
+    q = joinpath(String(root), "queue"); mkpath(q)
+    claim = joinpath(q, String(chunk) * ".claim")
+    write(claim, String(owner))
+    t = Timer(_ -> (try; touch(claim); catch; end), beat; interval = beat)
+    try
+        return SlateTask.run_chunk(String(root), String(chunk))
+    finally
+        close(t)
+        try; write(joinpath(q, String(chunk) * ".done"), ""); catch; end
+        rm(claim; force = true)
+    end
+end
+
 end # module BatchSweep

@@ -129,6 +129,20 @@ function clusters_resolved()
         # an option naming the same setting no longer replaces it.
         push!(out, _resolved_entry(e; options = merge(machine_options(base), r.options)))
     end
+    # …and `region:<name>`, the region's held node: a job cell with `region=<name>` and no `cluster=`
+    # runs its units there, in the hub's task workers (`Sweep.RegionLauncher`). Its store is its own,
+    # so the scheduler's view of the machine's store and the region's queue never describe one store.
+    for r in regions()
+        base = isempty(r.machine) ? nothing : cluster_get(r.machine)
+        store = base !== nothing && !isempty(String(get(base, "root_remote", ""))) ?
+                rstrip(String(base["root_remote"]), '/') * "/regions/" * r.name :
+                !isempty(r.data_root) ? rstrip(r.data_root, '/') * "/sweeps" : ""
+        isempty(store) && continue
+        e = Dict{String,Any}(base === nothing ? Dict{String,Any}("host" => r.host) : base)
+        e["name"] = Sweep.region_target_name(r.name)
+        e["kind"] = "region"; e["root_remote"] = store; e["_region"] = r.name
+        push!(out, _resolved_entry(e; options = merge(machine_options(e), r.options)))
+    end
     return out
 end
 cluster_get_resolved(name::AbstractString) = (d = cluster_get(name); d === nothing ? nothing : _resolved_entry(d))
