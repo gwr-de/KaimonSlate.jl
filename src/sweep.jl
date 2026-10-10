@@ -1536,7 +1536,6 @@ function advance_started!(; every::Real = 30.0)
         # leaves this side holding the originals; folding here is what keeps the mirror from growing
         # for the life of the store. Local files only, and never required for correctness.
         try; SlateTask.compact_events!(root); BatchSweep.forget_fold!(root); catch; end
-        l = launcher_for(t)
         for run in runs
             # Clear markers with no run behind them; the store was synced in above.
             if MemoStore.read_manifest(root, run) === nothing
@@ -1552,7 +1551,9 @@ function advance_started!(; every::Real = 30.0)
                 continue
             end
             try
-                p = reconcile_and_sync!(t, run, l; submit = true, failure_policy = sweep_policy(t))
+                # The run's launcher, not the registry's: a region's queue names the environment its
+                # task workers start in, and that is the notebook's, which only the run records.
+                p = reconcile_and_sync!(t, run, launcher_for(tr); submit = true, failure_policy = sweep_policy(t))
                 BatchSweep.is_settled(p) || (n += 1)
             catch e
                 _hub_log("supervisor: advancing $(name)/$(run) failed: " * first(sprint(showerror, e), 160))
