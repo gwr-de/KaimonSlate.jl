@@ -4903,7 +4903,12 @@ function _live_script(io, r::ShardedResult)
         (act === "reset" ? confirmReset() :
          act === "submit" ? confirmSubmit() : Promise.resolve(true)).then(function(ok){
           if (!ok) { btn.disabled = false; return; }
-          btn.textContent = "…";
+          // The whole row holds still and says what it is doing until the reply lands: a poll that
+          // rebuilt it mid-call put Cancel under the pointer that had just pressed Submit.
+          acting = true;
+          btn.textContent = BUSY[act] || "…";
+          btn.classList.add("sw-busy");
+          rowButtons().forEach(function(b){ b.disabled = true; });
           // Asking this card to start work IS watching it. Without this, a sweep submitted from a
           // card that rendered `ready` never announces its settle: `watching` was seeded false at
           // render (nothing to watch yet) and is otherwise only set when a poll timer starts — which
@@ -4911,25 +4916,49 @@ function _live_script(io, r::ShardedResult)
           // fast units on a nearby cluster do exactly that, and the cells reading the sweep then sit
           // stale until someone re-runs them by hand.
           if (act === "submit" || act === "resume" || act === "retry") watching = true;
-          window.slateCall("$(doch)", { action: act }).then(paint).then(function(){
-            // `syncActions` restores the label by rebuilding the row, and it rebuilds only when the
-            // SET of actions changed. Submit, Cancel and Retry all change it; a read-only action
-            // like Logs does not, so its button kept the "…" and stayed disabled for good.
-            btn.disabled = false;
-            if (btn.textContent === "…") btn.textContent = was;
-          }).catch(function(e){
-            btn.disabled = false; btn.textContent = was;
+          var settle = function(s){
+            acting = false;
+            btn.classList.remove("sw-busy");
+            btn.textContent = was;
+            if (s) paint(s);
+            else if (held) syncActions(held, true);
+            held = null;
+            // Buttons that appeared in place of the one pressed take a moment to arm, so a second
+            // click aimed at the first does not land on what replaced it.
+            rowButtons().forEach(function(b){ b.disabled = true; b.style.opacity = ".5"; });
+            setTimeout(function(){ rowButtons().forEach(function(b){ b.disabled = false; b.style.opacity = ""; }); }, 1200);
+          };
+          window.slateCall("$(doch)", { action: act }).then(settle).catch(function(e){
+            settle(null);
             var n = root.querySelector('[data-sw="note"]');
-            if (n) n.textContent = String(e);
+            // A reply that did not come in time is not a failure of the action: it carries on, and
+            // the next poll shows where it got to.
+            if (n) n.textContent = /timed out/.test(String(e)) ? "still working on it; the card updates when it lands" : String(e);
           });
         });
       }
 
+      var acting = false, held = null;
+      var BUSY = { submit: "Submitting", cancel: "Cancelling", resume: "Resuming", retry: "Retrying", reset: "Resetting" };
+      function rowButtons(){
+        var host = root.querySelector('[data-sw="acts"]');
+        return host ? Array.prototype.slice.call(host.querySelectorAll("button")) : [];
+      }
+      if (!document.getElementById("sw-busy-style")) {
+        var st = document.createElement("style"); st.id = "sw-busy-style";
+        st.textContent = "@keyframes swpulse{0%,100%{opacity:1}50%{opacity:.4}}" +
+          ".sw-busy{animation:swpulse 1.1s ease-in-out infinite;cursor:progress!important;" +
+          "border-color:var(--accent,#7aa2f7)!important;color:var(--accent,#7aa2f7)!important}";
+        document.head.appendChild(st);
+      }
+
       // Rebuild the control row only when the SET of actions changed, so a click never lands on a
-      // button that a poll replaced underneath it mid-press.
-      function syncActions(list){
+      // button that a poll replaced underneath it mid-press. While an action is in flight the new
+      // set is held and applied when it lands.
+      function syncActions(list, now){
         var host = root.querySelector('[data-sw="acts"]');
         if (!host || !list) return;
+        if (acting && !now) { held = list; return; }
         var want = list.map(function(a){ return a[0] + "|" + a[1]; }).join(",");
         if (host.dataset.sig === want) return;
         host.dataset.sig = want;
