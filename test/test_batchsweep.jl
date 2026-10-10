@@ -2708,8 +2708,10 @@ end
             # …and it carries the results, which is the part the card had and this did not.
             @test occursin("sq", txt) && occursin(r"\bx\b", txt)
             @test occursin("9", txt)
-            # Exactly what `show` produces, so there is no second version of the truth.
-            @test txt == sprint((io, x) -> show(io, MIME"text/plain"(), x), r)
+            # Exactly what `show` produces, so there is no second version of the truth. The line saying
+            # when the units landed reads the clock, so two renders a second apart differ there only.
+            untimed(s) = replace(s, r"\n[^\n]* ago\)" => "")
+            @test untimed(txt) == untimed(sprint((io, x) -> show(io, MIME"text/plain"(), x), r))
             @test !occursin("<div", txt)
             # It PRINTS as the report rather than as a quoted string: a String returned to a cell
             # renders as its repr, which is the whole report on one line with escaped newlines.

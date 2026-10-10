@@ -3568,6 +3568,24 @@ function handle_action(target::SweepTarget, run::AbstractString, params, keys,
     return status_payload(target, run, params, keys; plot, advance = false)
 end
 
+# Polls of one run asked while one is out share its answer: every open card and the notebook's pill
+# poll the same run, each poll is round trips to the host, and a worker answers a bounded number of
+# calls at once.
+const _POLLS = Dict{Any,Task}()
+const _POLLS_LOCK = ReentrantLock()
+function _one_poll(f, key)
+    t = lock(_POLLS_LOCK) do
+        cur = get(_POLLS, key, nothing)
+        (cur !== nothing && !istaskdone(cur)) && return cur
+        _POLLS[key] = Threads.@spawn f()
+    end
+    try
+        return fetch(t)
+    catch e
+        throw(e isa TaskFailedException ? e.task.exception : e)
+    end
+end
+
 # Compact enough to poll on a timer: counts and rates, plus a per-unit status string of one
 # character each. At a few thousand units that string is a few KB, which is cheap next to sending
 # structured rows for every unit.
@@ -4858,10 +4876,18 @@ function _live_script(io, r::ShardedResult)
         fsel.value = s.chartfield || "";
         fsel.style.display = s.chartfields.length > 1 ? "" : "none";
       }
+      // One poll at a time. A worker answers a bounded number of calls at once, and polls piling up
+      // behind a slow host took every slot, including the one the host's own answer needs to get
+      // back in. A poll that fails or times out is followed by the next one rather than ending the
+      // card's updates.
+      var polling = false;
       function tick(){
         if (!document.body.contains(root)) { clearInterval(timer); return; }
-        if (!window.slateCall) return;
-        window.slateCall("$(ch)", { field: field }).then(paint).catch(function(){ clearInterval(timer); });
+        if (!window.slateCall || polling) return;
+        polling = true;
+        window.slateCall("$(ch)", { field: field }).then(paint).catch(function(e){
+          if (/no slate_on handler/.test(String(e))) clearInterval(timer);   // the cell is gone
+        }).then(function(){ polling = false; });
       }
 
       // Buttons. Disabled while the call is in flight so an impatient second click cannot cancel
@@ -5319,9 +5345,10 @@ function run_sweep(target::SweepTarget, params::AbstractVector, body_src::Abstra
         # say so. App mode pins it (`_app_channel_args`): a reader watching a card would otherwise
         # be submitting this sweep's outstanding chunks by polling it.
         register(status_channel(run),
-                 a -> status_payload(target, run, ps, ks; plot,
-                                     advance = get(a, :advance, true) !== false,
-                                     field = String(something(get(a, :field, ""), ""))))
+                 a -> (adv = get(a, :advance, true) !== false; fld = String(something(get(a, :field, ""), ""));
+                       _one_poll((run, fld, adv)) do
+                           status_payload(target, run, ps, ks; plot, advance = adv, field = fld)
+                       end))
         register(action_channel(run),
                  a -> handle_action(target, run, ps, ks, String(get(a, :action, ""));
                                     plot, notify = note,

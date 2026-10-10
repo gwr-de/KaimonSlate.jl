@@ -841,12 +841,16 @@
   };
   const sigOf = fs => fs.map(f => [f.path, f.bytes, f.done, f.failed, f.running].join(':')).join('|');
 
+  // Each poll waits for the one before it. A worker answers a bounded number of calls at once, and
+  // polls that pile up behind a slow host take every slot, including the one the host's own answer
+  // needs to get back in.
   function listing() {
-    if (!open_() || S.paused || !S.key) return;
+    if (!open_() || S.paused || !S.key || S.listing) return;
     const live = sweepLive();
     if (!live && S.lastPass) return;
     S.lastPass = !live;
-    call('logs').then(s => {
+    S.listing = true;
+    call('logs').finally(() => { S.listing = false; }).then(s => {
       if (!open_()) return;
       const fs = s.loglist || [];
       const sig = sigOf(fs);
@@ -860,8 +864,9 @@
   }
 
   function poll() {
-    if (!open_() || S.paused || !S.path || S.loading) return;
-    call('log_stat', S.path).then(st => {
+    if (!open_() || S.paused || !S.path || S.loading || S.statting) return;
+    S.statting = true;
+    call('log_stat', S.path).finally(() => { S.statting = false; }).then(st => {
       if (st.bytes < 0 || st.bytes === S.size) return;
       const pane = q('.logv-pane');
       // Follow only when the reader is AT the end that grows. Anywhere else, say that there is
