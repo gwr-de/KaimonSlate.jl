@@ -952,8 +952,11 @@ const MS = RE.MemoStore
             ds = RE.Sweep.adopt_into(store, ST.adopt(f))
             @test ds.kind === :group && keys(ds) == ["cube"] && reads[] == 1
             @test RE.Sweep.dimensions(ds, :cube) == ["x", "y", "t"]
-            p = ds[:cube][1]
-            @test size(p) == (4, 3, 5)
+            p = ds[:cube]
+            @test size(p) == (4, 3, 5) && eltype(p) == eltype(A) && ndims(p) == 3
+            @test RE.Sweep.dimensions(p) == ["x", "y", "t"]
+            @test RE.Sweep.attributes(p) == RE.Sweep.attributes(ds, :cube)
+            @test occursin("cube — 4×3×5", sprint(show, MIME"text/plain"(), p))
             @test p[:, :, 2:4] == A[:, :, 2:4]       # whole leading dimensions: one run
             @test p[2:3, :, 5] == A[2:3, :, 5]       # an integer drops its dimension
             @test p[:, 2, :] == A[:, 2, :]           # an inner slab: one run per t
@@ -962,7 +965,7 @@ const MS = RE.MemoStore
             @test_throws DimensionMismatch p[:, :]
 
             # Unchanged, the file is not read again; the store's manifest says what it holds.
-            @test RE.Sweep.adopt_into(store, ST.adopt(f))[:cube][1][:, :, 1] == A[:, :, 1]
+            @test RE.Sweep.adopt_into(store, ST.adopt(f))[:cube][:, :, 1] == A[:, :, 1]
             @test reads[] == 1
             mf = only(readdir(joinpath(store, "manifests")))
             d = MS.read_manifest(store, first(splitext(mf)))
@@ -974,7 +977,7 @@ const MS = RE.MemoStore
             # Moved to another machine, the same reads go over ssh (an empty host runs them here): a
             # selection is one stream of its byte ranges, landed as one file in the blob cache.
             far = RE.Sweep.relocate(ds, "")
-            q = far[:cube][1]
+            q = far[:cube]
             @test q.src isa RE.Sweep.SshSource && q.src.root == abspath(store)
             @test q[:, :, 2:4] == A[:, :, 2:4]
             @test q[2:3, :, 5] == A[2:3, :, 5]
@@ -983,6 +986,10 @@ const MS = RE.MemoStore
             @test q[2:3, 1:2:3, 2:2:4] == A[2:3, 1:2:3, 2:2:4]
             @test p[:, :, 1:2:5] == A[:, :, 1:2:5]       # …and locally
             @test q[1:7] == A[1:7]
+            # A remote read maps the cached selection privately: writing to it leaves the cache alone.
+            w = q[:, :, 1:2]
+            w[1] = -1
+            @test q[:, :, 1:2][1] == A[1]
             # In a worker a read waits on the cell's task, reporting progress and checking its Stop.
             calls = Ref(0)
             RE.Sweep.READ_HOOKS[] = (; progress = (f, m, d) -> nothing, checkpoint = () -> (calls[] += 1))
@@ -1016,6 +1023,17 @@ const MS = RE.MemoStore
                 rs = RE.Sweep.fetch_many("", "printf x", jobs; streams = 3)
                 @test all(first, rs) && all(i -> read(joinpath(jd, "out$i"), String) == "x", 1:9)
             end
+            # A job that fails is tried again; one that keeps failing reports why.
+            mktempdir() do jd
+                flaky = "read k; if [ -f $(jd)/seen\$k ]; then printf y; else touch $(jd)/seen\$k; echo dropped >&2; exit 1; fi"
+                jobs = [(Vector{UInt8}("$i\n"), joinpath(jd, "out$i"), joinpath(jd, "out$i.part")) for i in 1:5]
+                seen = Ref(0)
+                rs = RE.Sweep.fetch_many("", flaky, jobs; streams = 2, on_bytes = n -> (seen[] = n))
+                @test all(first, rs) && all(i -> read(joinpath(jd, "out$i"), String) == "y", 1:5)
+                @test seen[] == 5
+                rs = RE.Sweep.fetch_many("", "echo broken >&2; exit 1", jobs[1:1])
+                @test !rs[1][1] && occursin("broken", rs[1][3])
+            end
             cached() = filter(startswith("range-"), readdir(RE.Sweep._blob_cache_dir()))
             before = cached()
             @test q[:, 2, :] == A[:, 2, :]               # the same selection again: no new fetch
@@ -1026,7 +1044,7 @@ const MS = RE.MemoStore
             out = IOBuffer()
             run(pipeline(`sh -c $script`; stdin = IOBuffer("$(off) 8\n$(off + 16) 8\n"), stdout = out))
             @test reinterpret(Float64, take!(out)) == [A[1], A[3]]
-            @test RE.Sweep.relocate(far, "elsewhere")[:cube][1].src.host == ""   # already remote: kept
+            @test RE.Sweep.relocate(far, "elsewhere")[:cube].src.host == ""   # already remote: kept
 
             # Another notebook opens the newest adoption of the file by region and path, from the
             # region's dataset store; an empty host is this machine.
@@ -1034,7 +1052,7 @@ const MS = RE.MemoStore
             task_local_storage(:slate_ctx, ctx) do
                 other = RE.Sweep.adopted("r1", "a.cube")
                 @test keys(other) == ["cube"] && RE.Sweep.attributes(other)["note"] == "second"
-                @test other[:cube][1][:, 2, 3:4] == A[:, 2, 3:4]
+                @test other[:cube][:, 2, 3:4] == A[:, 2, 3:4]
                 e = try; RE.Sweep.adopted("r1", "nope.cube"); "" catch x; sprint(showerror, x); end
                 @test occursin("has not been adopted", e)
                 e2 = try; RE.Sweep.adopted("r2", "a.cube"); "" catch x; sprint(showerror, x); end

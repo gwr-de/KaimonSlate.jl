@@ -14,6 +14,7 @@ end
 module Sweep
 
 import SHA
+import Mmap
 import Serialization
 import Pkg
 import Dates   # the ETA as a wall-clock finish time, not only a remaining duration
@@ -1911,7 +1912,7 @@ HDF5 file holds several named variables. Picking one gives back an ordinary data
 past that point is special:
 
     keys(ds)                # the variable names
-    ds[:sst][1]             # part 1 of the `sst` variable, then slice it
+    ds[:sst]                # the `sst` variable (one per unit across a sweep: `[k]` for unit k)
 """
 struct Dataset
     kind::Symbol                  # :table | :array | :group
@@ -2415,11 +2416,13 @@ Base.keys(ds::Dataset) =
     String[String(v["name"]) for v in get(ds.parts[1].index, "vars", Any[])] : String[]
 
 """
-    ds[:sst] -> Dataset
+    ds[:sst] -> DatasetPart | Dataset
 
-One variable of a group dataset, as an ordinary dataset. The whole point of the group being a
-namespace rather than a shape: what comes back is a normal `:array` or `:table`, so slicing,
-`scan`, chunk pruning and the transfer accounting are the same code they always were.
+One variable of a group dataset. From one adopted file it is the variable itself, a stored array
+carrying its name, dimension names and attributes: `size`, `eltype`, `attributes` and `dimensions`
+describe it, and `v[i, j, …]` reads a selection. From a sweep it is an ordinary dataset with one part
+per unit, so slicing, `scan`, chunk pruning and the transfer accounting are the same code they always
+were, and `[k]` picks unit k's.
 
 The variable must be present in every landed unit — a sweep whose units wrote different variables
 is several datasets, not one, and is better adopted separately.
@@ -2434,6 +2437,9 @@ function Base.getindex(ds::Dataset, var::Symbol)
         v = _group_var(p.index, name)
         v === nothing && continue
         idx = Dict{String,Any}(String(k) => vv for (k, vv) in v["index"])
+        idx["name"] = name
+        idx["attrs"] = Dict{String,Any}(get(v, "attrs", Dict{String,Any}()))
+        idx["dimnames"] = String[String(d) for d in get(v, "dims", String[])]
         push!(parts, DatasetPart(p.root, :indexed, idx, p.params, p.facts,
                                  Int(get(idx, "rows", 0)), Int(get(idx, "bytes", 0)),
                                  p.label, p.src))
@@ -2443,6 +2449,7 @@ function Base.getindex(ds::Dataset, var::Symbol)
     length(parts) == length(ds.parts) ||
         error("`$(name)` is in $(length(parts)) of $(length(ds.parts)) units — a variable that " *
               "only some units wrote cannot be one dataset")
+    length(parts) == 1 && return parts[1]
     return Dataset(_ds_kind(parts[1].index), parts, ds.whole, ds.label, ds.purged; limit = ds.limit)
 end
 
@@ -2475,6 +2482,25 @@ Base.show(io::IO, p::DatasetPart) =
     print(io, "DatasetPart(", join(get(p.index, "dims", Int[]), "×"), " ",
           String(get(p.index, "eltype", "")), ", ", _bytes(p.bytes), ")")
 
+Base.eltype(p::DatasetPart) = SlateTask.eltype_of(String(p.index["eltype"]))
+Base.ndims(p::DatasetPart) = length(size(p))
+"An adopted variable's attributes, as its file gave them."
+attributes(p::DatasetPart) = Dict{String,Any}(get(p.index, "attrs", Dict{String,Any}()))
+"An adopted variable's dimension names, in the order of its indices (empty when the file named none)."
+dimensions(p::DatasetPart) = String[String(d) for d in get(p.index, "dimnames", String[])]
+
+function Base.show(io::IO, ::MIME"text/plain", p::DatasetPart)
+    name = String(get(p.index, "name", "part"))
+    dn = dimensions(p)
+    where = p.src isa SshSource ? " on " * p.src.host : ""
+    println(io, name, " — ", join(size(p), "×"), " ", String(get(p.index, "eltype", "")),
+            isempty(dn) ? "" : " (" * join(dn, ", ") * ")", ", ", _bytes(p.bytes), " in ", p.label, where)
+    for (k, v) in sort!(collect(attributes(p)); by = first)
+        println(io, "   ", rpad(k, 18), v)
+    end
+    print(io, "   ", name, "[i, j, …] reads a selection")
+end
+
 """
     part[i]      -> elements i of this part, as stored (linear order)
 
@@ -2499,22 +2525,28 @@ Base.size(p::DatasetPart) = Tuple(Int(d) for d in get(p.index, "dims", Int[]))
 
 # The elements of `runs` (linear ranges) of an array part, back to back. Locally each is an mmap of its
 # window, so the pages outside it are never faulted in. From a remote store all of them are one stream
-# written into this machine's blob cache (`_fetch_runs`), however many runs there are.
+# written into this machine's blob cache (`_fetch_runs`), however many runs there are, and the result
+# is a private mapping of that file: the selection is on disk once and paged in as it is used, and
+# writing to it changes this process's copy only.
 function _read_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
     t0 = time()
     T = SlateTask.eltype_of(String(p.index["eltype"]))
     n = sum(length, runs; init = 0)
-    out = Vector{T}(undef, n)
+    out = Vector{T}(undef, 0)
     n == 0 && return out
     try
         if p.src isa LocalSource
+            out = Vector{T}(undef, n)
             at = 0
             for r in runs
                 copyto!(out, at + 1, SlateTask.dataset_elements(p.root, p.index, r), 1, length(r))
                 at += length(r)
             end
         else
-            open(io -> read!(io, out), _fetch_runs(p, runs))
+            # Opened for writing only so the private mapping is writable: its pages are copied on
+            # write, and the file is never changed.
+            out = open(io -> Mmap.mmap(io, Vector{T}, n; shared = false, grow = false),
+                       _fetch_runs(p, runs), "r+")
         end
     catch e
         e isa InterruptException && rethrow()
@@ -2601,7 +2633,8 @@ function _fetch_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
         rethrow()
     end
     ok = all(first, results)
-    n = sum(last, results; init = 0)
+    n = sum(r -> r[2], results; init = 0)
+    why = ok ? "" : something((r[3] for r in results if !r[1]), "failed")
     if ok && n == total
         tmp = string(dest, ".join.", tag)
         open(tmp, "w") do io
@@ -2611,7 +2644,8 @@ function _fetch_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
     end
     foreach(pc -> rm(pc; force = true), pieces)
     (ok && n == total) ||
-        error("reading $(_bytes(total)) of $(p.label) from $(p.src.host) failed" * (ok ? " (got $(_bytes(n)))" : ""))
+        error("reading $(_bytes(total)) of $(p.label) from $(p.src.host) failed: " *
+              (ok ? "got $(_bytes(n))" : why))
     _BLOB_FETCHED[] += total
     if _BLOB_FETCHED[] > blob_cap() ÷ 8
         _BLOB_FETCHED[] = 0

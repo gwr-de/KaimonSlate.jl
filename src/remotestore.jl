@@ -355,25 +355,28 @@ const _FETCHES = Dict{String,Threads.Atomic{Bool}}()
 const _FETCHES_LOCK = ReentrantLock()
 
 """
-    fetch_to(host, script, dest; input, part, on_bytes, timeout = 3600) -> (ok, bytes)
+    fetch_to(host, script, dest; input, part, on_bytes, timeout = 3600) -> (ok, bytes, why)
 
 Run `script` on `host` ("" for this machine), `input` on its stdin, and write its stdout to the file
 `dest` as it arrives. How bulk data comes back: none of it is held in memory, and in a worker none of
 it crosses the gate, because the hub writes the file and the two share this machine's filesystem. The
 bytes land in `part` and are moved onto `dest` when complete, so a reader never sees half a file.
-`on_bytes(n)` is called with the count so far. `cancel_fetch!(part)` stops it.
+`on_bytes(n)` is called with the count so far. `cancel_fetch!(part)` stops it. `why` says what went
+wrong when it is not `ok`: `"stopped"`, or the far side's error.
 """
 function fetch_to(host::AbstractString, script::AbstractString, dest::AbstractString;
                   input::Union{Vector{UInt8},Nothing} = nothing,
                   part::AbstractString = string(dest, ".part.", getpid()), on_bytes = nothing,
                   timeout::Real = 3600.0, name::AbstractString = "", total::Integer = -1)
     if !isempty(host) && has_delegate()
-        r = _via(() -> (false, 0), :fetch, (; host = String(host), script = String(script), input,
-                                           dest = String(dest), part = String(part),
-                                           name = String(name), total = Int(total)))
-        return r === nothing ? (false, 0) : r
+        r = _via(() -> (false, 0, "the hub did not answer"), :fetch,
+                 (; host = String(host), script = String(script), input, dest = String(dest),
+                    part = String(part), name = String(name), total = Int(total)))
+        return r === nothing ? (false, 0, "the hub did not answer") : r
     end
-    runner = isempty(host) ? :here : (connect!(host) || return (false, 0); total < 0 || total >= BULK_BYTES[] ? :bulk : :session)
+    runner = isempty(host) ? :here :
+             (connect!(host) || return (false, 0, "could not connect to $(host)");
+              total < 0 || total >= BULK_BYTES[] ? :bulk : :session)
     sofar = Ref(0)                              # `_fetch_job` reports each write; this reports the total
     each = on_bytes === nothing ? nothing : (d -> on_bytes(sofar[] += d))
     return _fetch_job(runner, String(host), String(script), input, String(dest), String(part), each, timeout)
@@ -392,40 +395,49 @@ function _fetch_job(runner, host::String, script::String, input, dest::String, p
         part in _CANCELLED && (delete!(_CANCELLED, part); stop[] = true)
         _FETCHES[part] = stop
     end
-    stop[] && (lock(() -> delete!(_FETCHES, part), _FETCHES_LOCK); return (false, 0))
-    ok = false
+    stop[] && (lock(() -> delete!(_FETCHES, part), _FETCHES_LOCK); return (false, 0, "stopped"))
+    ok, why = false, ""
     try
         open(part, "w") do io
             last = Ref(0)
             sink = _CountingSink(io, 0, on_bytes === nothing ? nothing : (n -> (on_bytes(n - last[]); last[] = n)), stop)
-            ok = if runner === :here
+            ok, why = if runner === :here
+                err = IOBuffer()
                 cmd = pipeline(`sh -c $script`; stdin = input === nothing ? devnull : IOBuffer(input),
-                               stdout = sink, stderr = devnull)
-                try; run(cmd); true; catch; false; end
-            elseif runner === :session || runner === :bulk
-                first(SshTransport.exec_io(host, script, input; ask = _ask, sink, timeout, bulk = runner === :bulk))
+                               stdout = sink, stderr = err)
+                try; run(cmd); (true, ""); catch e; (false, strip(String(take!(err))) * " " * sprint(showerror, e)); end
             else
-                first(SshTransport._request_on(runner, :io, (script, input, sink, Float64(timeout)),
-                                               (false, UInt8[], "the bulk session closed")))
+                r = runner === :session || runner === :bulk ?
+                    SshTransport.exec_io(host, script, input; ask = _ask, sink, timeout, bulk = runner === :bulk) :
+                    SshTransport._request_on(runner, :io, (script, input, sink, Float64(timeout)),
+                                             (false, UInt8[], "the bulk session closed"))
+                (r[1], String(strip(r[3])))
             end
         end
-        ok = ok && !stop[]
+        if stop[]
+            ok, why = false, "stopped"
+        end
         ok && mv(part, dest; force = true)
     finally
         lock(_FETCHES_LOCK) do; delete!(_FETCHES, part); end
         rm(part; force = true)
     end
-    return (ok, ok ? Int(filesize(dest)) : 0)
+    return (ok, ok ? Int(filesize(dest)) : 0, ok ? "" : (isempty(why) ? "failed" : String(why)))
 end
 
+# Times a job whose read failed is put back for another connection to take.
+const FETCH_RETRIES = Ref(3)
+
 """
-    fetch_many(host, script, jobs; streams = 4, name = "", total = -1, on_bytes = nothing) -> Vector{(ok, bytes)}
+    fetch_many(host, script, jobs; streams = 4, name = "", total = -1, on_bytes = nothing) -> Vector{(ok, bytes, why)}
 
 `fetch_to` for a list of jobs, each `(input, dest, part)`: `script` runs once per job with the job's
 stdin, writing the job's file. `streams` workers each open one connection (`SshTransport._with_bulk`)
 and take the next job whenever they finish one, so a connection the path treats badly does less of the
-work rather than holding up the rest. A worker that cannot sign in by key uses the host's session. In a
-worker process the hub runs it. `on_bytes(n)` gets the running total over all jobs.
+work rather than holding up the rest. A job that fails goes back on the queue, up to `FETCH_RETRIES`
+times, and a worker whose connection has closed opens another. A worker that cannot sign in by key uses
+the host's session. In a worker process the hub runs it. `on_bytes(n)` gets the running total over all
+jobs, counting only the bytes of jobs that completed or are in flight.
 """
 function fetch_many(host::AbstractString, script::AbstractString, jobs::AbstractVector;
                     streams::Integer = 4, name::AbstractString = "", total::Integer = -1,
@@ -434,24 +446,49 @@ function fetch_many(host::AbstractString, script::AbstractString, jobs::Abstract
         r = _via(() -> nothing, :fetch_many, (; host = String(host), script = String(script),
                                               jobs = collect(jobs), streams = Int(streams),
                                               name = String(name), total = Int(total)))
-        return r === nothing ? [(false, 0) for _ in jobs] : r
+        return r === nothing ? [(false, 0, "the hub did not answer") for _ in jobs] : r
     end
     h, sc = String(host), String(script)
-    isempty(h) || connect!(h) || return [(false, 0) for _ in jobs]
-    results = Vector{Tuple{Bool,Int}}(fill((false, 0), length(jobs)))
-    queue = Channel{Int}(length(jobs))
-    foreach(i -> put!(queue, i), eachindex(jobs)); close(queue)
+    isempty(h) || connect!(h) || return [(false, 0, "could not connect to $(h)") for _ in jobs]
+    results = Vector{Tuple{Bool,Int,String}}(fill((false, 0, "not run"), length(jobs)))
+    pending = collect(eachindex(jobs))
+    tries = zeros(Int, length(jobs))
+    qlock = ReentrantLock()
+    next_job() = lock(() -> isempty(pending) ? 0 : popfirst!(pending), qlock)
     landed = Threads.Atomic{Int}(0)
     count = on_bytes === nothing ? nothing : (n -> on_bytes(Threads.atomic_add!(landed, n) + n))
-    run!(i, runner) = (j = jobs[i]; results[i] = _fetch_job(runner, h, sc, j[1], String(j[2]), String(j[3]), count, timeout))
-    function worker()
-        isempty(h) && (for i in queue; run!(i, :here); end; return)
-        r = SshTransport._with_bulk(h) do s
-            for i in queue; run!(i, s); end
-            true
+    # Run job `i`; a failure that was not a stop puts it back for another try, its bytes uncounted.
+    function run!(i, runner)
+        j = jobs[i]
+        got = Threads.Atomic{Int}(0)
+        each = count === nothing ? (n -> Threads.atomic_add!(got, n)) : (n -> (Threads.atomic_add!(got, n); count(n)))
+        r = _fetch_job(runner, h, sc, j[1], String(j[2]), String(j[3]), each, timeout)
+        results[i] = r
+        r[1] && return true
+        count === nothing || count(-got[])
+        r[3] == "stopped" && return false
+        lock(qlock) do
+            tries[i] += 1
+            tries[i] <= FETCH_RETRIES[] && push!(pending, i)
         end
-        r === nothing && (for i in queue; run!(i, :session); end)   # no key sign-in: the host's session
-        return
+        return false
+    end
+    function worker()
+        isempty(h) && (while (i = next_job()) != 0; run!(i, :here); end; return)
+        while true
+            done = Ref(false)
+            r = SshTransport._with_bulk(h) do s
+                while (i = next_job()) != 0
+                    run!(i, s) || s.alive || return true    # the connection closed: open another
+                end
+                done[] = true
+            end
+            if r === nothing                                # no key sign-in: the host's session
+                while (i = next_job()) != 0; run!(i, :session); end
+                return
+            end
+            (done[] || lock(() -> isempty(pending), qlock)) && return
+        end
     end
     foreach(wait, [Threads.@spawn worker() for _ in 1:max(1, min(streams, length(jobs)))])
     lock(() -> foreach(j -> delete!(_CANCELLED, String(j[3])), jobs), _FETCHES_LOCK)   # stops that arrived late

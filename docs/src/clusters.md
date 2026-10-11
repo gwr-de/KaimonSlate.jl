@@ -162,7 +162,7 @@ index, and each slice is read from the region over ssh:
 frames = adopt(@sfile("run.nc"))      # n(x, y, z, t), stored once on the region
 
 #%% code id=first_half
-n = frames[:n][1]                     # the variable, still on the region
+n = frames[:n]                        # the variable, still on the region
 block = n[:, :, :, 1:200]             # one contiguous read of 200 frames
 ```
 
