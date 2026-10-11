@@ -1690,7 +1690,10 @@ function _diagnose_start(host::AbstractString, port::Integer)
         tgt = _lustre_target(host, d.file)
         isempty(tgt) || (summary *= "; it is on $tgt")
     elseif d.kind === :spin
-        try; _run_on(String(host), "pkill -USR1 -u \"\$USER\" -f \"[w]orker-$port\\.jl\""); catch; end
+        # Julia writes its stacks on SIGUSR1 on Linux and SIGINFO on macOS and BSD; on those SIGUSR1
+        # would end the worker.
+        try; _run_on(String(host), "sig=USR1; case \"\$(uname)\" in Darwin|*BSD) sig=INFO;; esac; " *
+                                   "pkill -\$sig -u \"\$USER\" -f \"[w]orker-$port\\.jl\""); catch; end
         summary *= "; its thread stacks were requested in its log"
     end
     _rlog("start: worker-$port on $host did not open its port: $summary")

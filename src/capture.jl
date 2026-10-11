@@ -955,18 +955,23 @@ function interrupt_when_parked!(t::Task; steady::Float64 = 0.2, within::Float64 
             if q !== nothing
                 t1 = time()
                 while t.queue === q && !istaskdone(t) && time() - t1 < steady
-                    Libc.systemsleep(0.001)
+                    _gc_safe_sleep(0.001)
                 end
                 if t.queue === q && !istaskdone(t)
                     try; schedule(t, InterruptException(); error = true); catch; end
                     return true
                 end
             end
-            Libc.systemsleep(0.005)
+            _gc_safe_sleep(0.005)
         end
         false
     end
 end
+
+# A short sleep that holds the thread without holding up a garbage collection, which `systemsleep`
+# (a plain C call) does for its whole length.
+_gc_safe_sleep(s::Real) = Sys.iswindows() ? Libc.systemsleep(s) :
+    (@ccall gc_safe = true usleep(round(Cuint, 1e6 * s)::Cuint)::Cint; nothing)
 
 function run_capture(mod::Module, source::AbstractString, filename::AbstractString = "string";
                      capture::OutputCapture = RedirectCapture(), slate_ctx = nothing,

@@ -13,7 +13,8 @@ function _nvml_ready()
     h = Sys.iswindows() ? _Libdl.dlopen("nvml.dll"; throw_error = false) :
                           _Libdl.dlopen("libnvidia-ml.so.1"; throw_error = false)
     init = h === nothing ? nothing : _Libdl.dlsym(h, :nvmlInit_v2; throw_error = false)
-    if init === nothing || ccall(init, Cint, ()) != 0
+    # GC-safe: initialising can take a second or more per GPU without persistence mode.
+    if init === nothing || (@ccall gc_safe = true $init()::Cint) != 0
         _NVML_STATE[] = -1
         return false
     end
@@ -24,11 +25,11 @@ end
 
 _nvml_fn(name::Symbol) = _Libdl.dlsym(_NVML[], name; throw_error = false)
 
-# The memory of process `pid` on `dev`, from the running-compute-process list (struct versions 2 and 3
-# share a 24-byte layout: pid, then used bytes at offset 8; version 1 is 16 bytes). -1 when unknown.
+# The memory of process `pid` on `dev`, from the running-compute-process list: pid, then used bytes at
+# offset 8. Version 2's struct is 24 bytes and version 1's 16. Version 3 is not used: newer drivers grew
+# its struct, so its stride depends on the driver. -1 when unknown.
 function _nvml_proc_mem(dev::Ptr{Cvoid}, pid::Integer)
-    for (sym, stride) in ((:nvmlDeviceGetComputeRunningProcesses_v3, 24),
-                          (:nvmlDeviceGetComputeRunningProcesses_v2, 24),
+    for (sym, stride) in ((:nvmlDeviceGetComputeRunningProcesses_v2, 24),
                           (:nvmlDeviceGetComputeRunningProcesses, 16))
         f = _nvml_fn(sym); f === nothing && continue
         n = Ref{Cuint}(64)
@@ -51,7 +52,9 @@ end
 # of it and misses short kernels. `(avg, max)` in percent, or `nothing` when NVML has no samples to give.
 const _NVML_LAST_TS = Dict{Int,UInt64}()     # device index → timestamp of the newest sample seen
 const _NVML_SAMPLE_BUF = zeros(UInt8, 16 * 128)   # nvmlSample_t: UInt64 timestamp, then the 8-byte value
-function _nvml_util_window(i::Integer, dev::Ptr{Cvoid})
+const _NVML_SAMPLE_LOCK = ReentrantLock()          # the buffer and the timestamps are shared
+_nvml_util_window(i::Integer, dev::Ptr{Cvoid}) = lock(() -> _nvml_util_window_locked(i, dev), _NVML_SAMPLE_LOCK)
+function _nvml_util_window_locked(i::Integer, dev::Ptr{Cvoid})
     f = _nvml_fn(:nvmlDeviceGetSamples); f === nothing && return nothing
     last = get(_NVML_LAST_TS, Int(i), UInt64(0))
     vtype = Ref{Cint}(0); n = Ref{Cuint}(128)

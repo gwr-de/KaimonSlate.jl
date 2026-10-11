@@ -59,7 +59,10 @@ function _load_evp()
     names = String[]
     isempty(_LIBCRYPTO[]) || push!(names, _LIBCRYPTO[])
     append!(names, ["libcrypto.so.3", "libcrypto.so.1.1", "libcrypto.so",
-                    "libcrypto.3.dylib", "libcrypto.1.1.dylib", "libcrypto.dylib", "libcrypto"])
+                    "libcrypto.3.dylib", "libcrypto.1.1.dylib"])
+    # macOS ships an unversioned /usr/lib/libcrypto.dylib that aborts the process when loaded, which
+    # no `try` catches, so the unversioned names are only tried elsewhere.
+    Sys.isapple() || append!(names, ["libcrypto"])
     for name in names
         try
             lib = Libdl.dlopen(name; throw_error = false); lib === nothing && continue
