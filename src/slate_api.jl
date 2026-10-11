@@ -808,6 +808,14 @@ See also `save_asset`, `FileUpload`."""),
         """Report progress (0..1) from a running cell — drives the cell's progress bar + the floating
         run chip. `@progress`/`@withprogress` loops also drive it automatically.
         `for i in 1:n; slate_progress(i/n; msg=\"step \$i\"); end`."""),
+    SlateApiEntry("slate_checkpoint", "Progress",
+        "A point where Stop can end the running cell.",
+        ["stop", "cancel", "interrupt", "long running", "loop"],
+        "slate_checkpoint()",
+        """Ends the running cell here if Stop was pressed, and is free otherwise. Progress reports and
+        log records are checkpoints already; add this to a loop that reports nothing, since Julia cannot
+        interrupt code computing on another thread. Tasks the cell spawns see the same stop.
+        `for i in 1:n; slate_checkpoint(); heavy(i); end`."""),
 
     # ── Batch sweeps ─────────────────────────────────────────────────────────────────────────────
     SlateApiEntry("job cell", "Batch sweep",
