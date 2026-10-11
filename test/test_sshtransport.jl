@@ -152,3 +152,46 @@ end
         end
     end
 end
+
+# A sink whose reader has already stopped wanting the output.
+struct _StoppedSink <: IO end
+T.stop_requested(::_StoppedSink) = true
+Base.unsafe_write(::_StoppedSink, ::Ptr{UInt8}, n::UInt) = n
+
+# Needs a server with python3, as above.
+@testset "bulk data arrives whole, and a stopped transfer leaves the session usable" begin
+    host = get(ENV, "KAIMONSLATE_SSH_TEST_HOST", "")
+    if isempty(host)
+        @test_skip "KAIMONSLATE_SSH_TEST_HOST is not set"
+    else
+        ask = (_...) -> nothing
+        n = 24 * 1024 * 1024
+        try
+            # A command's output, into a file as it arrives.
+            f = tempname()
+            ok = open(io -> first(T.exec_io(host, "head -c $n /dev/zero", nothing; ask, sink = io)), f, "w")
+            @test ok && filesize(f) == n
+            # Stopped: the channel is closed, the command ends, the session carries on.
+            ok2, _, _ = T.exec_io(host, "head -c $n /dev/zero", nothing; ask, sink = _StoppedSink())
+            @test !ok2
+            @test first(T.exec(host, "echo still"; ask))
+            # A tunnel whose far side sends a stream and closes: every byte is delivered before the
+            # local end sees the close.
+            fp = 40000 + rand(0:9999)
+            py = "import socket\ns=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);" *
+                 "s.bind(('127.0.0.1',$fp));s.listen(1)\nc,_=s.accept();b=bytes(1<<20)\n" *
+                 "for _ in range($(n >> 20)): c.sendall(b)\nc.close()"
+            @test first(T.exec(host, "nohup python3 -c '$(replace(py, "'" => "'\\''"))' >/dev/null 2>&1 & sleep 0.5"; ask))
+            lp = let s = T.Sockets.listen(T.Sockets.localhost, 0); p = Int(T.Sockets.getsockname(s)[2]); close(s); p end
+            @test first(T.forward!(host, lp, "127.0.0.1", fp; ask))
+            sock = T.Sockets.connect(T.Sockets.localhost, lp)
+            got = 0
+            while !eof(sock); got += length(readavailable(sock)); end
+            close(sock); T.unforward!(host, lp)
+            @test got == n
+            @test first(T.exec(host, "echo after"; ask))
+        finally
+            T.disconnect!(host)
+        end
+    end
+end

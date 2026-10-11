@@ -143,6 +143,7 @@ mutable struct Conn
     outbox::Vector{UInt8}   # read from the local socket, not yet accepted by the far side
     stalled::Float64        # when the far side stopped accepting bytes; 0 while it keeps up
     tosock::Channel{Vector{UInt8}}   # from the far side, for this connection's writer task
+    queued::Threads.Atomic{Int}      # bytes in `tosock` not yet written to the local socket
 end
 
 # A local port carried to `host:port` as seen from the far side. `host` is resolved THERE, which is
@@ -179,10 +180,35 @@ mutable struct Session
     slots::Base.Semaphore
     busy::Threads.Atomic{Int}       # commands running now
     pending::Channel{Any}           # sockets accepted by a forward's listener, waiting for a channel
+    # The pump waits on `kick` rather than sleeping: the socket turning readable (`_watch_socket`), a
+    # local connection's bytes, an accepted socket, or another channel's read (which can leave tunnel
+    # bytes buffered inside libssh2) set it. `pumped` is set after each pass.
+    kick::Base.Event
+    pumped::Base.Event
+    # How many forwards are open: `fwds` changes only under `lk`, and this is what other tasks read.
+    ntun::Threads.Atomic{Int}
+    # The task polling the socket for the pump. The socket is closed only after it has stopped, so it
+    # can never poll a descriptor number the system has handed to something else.
+    watcher::Union{Task,Nothing}
 end
 Session(ep, fd, ptr, req, owner, prompter, alive, err, fwds) =
     Session(ep, fd, ptr, req, owner, prompter, alive, err, fwds, ReentrantLock(), ReentrantLock(), Cint(0), "",
-            Base.Semaphore(_max_channels()), Threads.Atomic{Int}(0), Channel{Any}(32))
+            Base.Semaphore(_max_channels()), Threads.Atomic{Int}(0), Channel{Any}(32),
+            Base.Event(true), Base.Event(true), Threads.Atomic{Int}(0), nothing)
+
+# Wake the session's pump: something it may have to move has arrived.
+_kick!(s::Session) = (notify(s.kick); nothing)
+
+# Wait for `ev`, or `timeout` seconds at most.
+function _wait_event(ev::Base.Event, timeout::Real)
+    t = Timer(_ -> notify(ev), timeout)
+    try
+        wait(ev)
+    finally
+        close(t)
+    end
+    return nothing
+end
 
 # Read when a session opens, not when this file is compiled into an image.
 _max_channels() = something(tryparse(Int, get(ENV, "KAIMONSLATE_SSH_MAX_CHANNELS", "")), 8)
@@ -427,6 +453,15 @@ function _try_kbdint(s::Session, ask)::Symbol
 end
 
 # ── running things ───────────────────────────────────────────────────────────────────────────
+# How much one read asks for, which is also what paces a transfer: libssh2 tops a channel's receive
+# window up only when a read's buffer is larger than what is left, and only by that buffer
+# (`libssh2_channel_read_ex`), so the far side can have about one buffer in flight per round trip. A
+# small buffer caps a long link at a few MB/s. The window is grown this way, inside libssh2's own read,
+# rather than adjusted separately: an adjustment that cannot be sent at once has to be finished by the
+# same call before anything else is sent on the session, and the read does exactly that.
+const READ_BYTES = 4 * 1024 * 1024          # a command's output
+const PUMP_READ_BYTES = 1024 * 1024         # a tunnel's, per connection per pass
+
 # A channel, or NULL with why: `(ch, err, msg)`, all read under the open lock.
 _open_channel(s::Session) = lock(s.openlk) do
     ch = _again_ptr(s, () -> ccall((:libssh2_channel_open_ex, LIB), Ptr{Cvoid},
@@ -456,7 +491,7 @@ stop_requested(::IO) = false
 # `:lost` (a read failed, so what arrived is not all the command wrote) or `:stopped` (the sink's
 # reader stopped wanting it).
 function _drain(s::Session, ch, stream::Cint, sink::IO, deadline::Float64)
-    buf = Vector{UInt8}(undef, 65536)
+    buf = Vector{UInt8}(undef, stream == 0 ? READ_BYTES : 65536)   # stderr carries messages, not data
     while true
         stop_requested(sink) && return :stopped
         n = lock(() -> ccall((:libssh2_channel_read_ex, LIB), Cssize_t,
@@ -472,6 +507,9 @@ function _drain(s::Session, ch, stream::Cint, sink::IO, deadline::Float64)
             Cint(n) in _TRANSPORT_ERRS && _channel_dead!(s, "read: " * lock(() -> _lasterr(s), s.lk))
             return :lost
         end
+        # This read took what was on the socket, tunnel bytes included, into libssh2: the pump has to
+        # look, since the socket will not tell it.
+        s.ntun[] > 0 && _kick!(s)
         write(sink, view(buf, 1:Int(n)))
     end
 end
@@ -693,18 +731,23 @@ end
 # window never reopens; without a bound the pump waits on it for as long as the hub runs.
 const FWD_STALL_S = 20.0
 
+# Bytes queued for a connection's local writer past which the pump stops reading its channel, so the
+# far side waits rather than the queue growing. A connection whose queue still reaches four times this
+# is dropped as dead (`_pump_forwards!`).
+const _TOSOCK_HIGH = 16 * 1024 * 1024
+
 # Move whatever is ready, in both directions. Runs on the session's pump task (`_pump_loop`), never
 # under a command. libssh2 is called under the session lock; bytes for a local socket are written
 # after it is released, so a local reader that falls behind slows only its own connection's turn.
 # Returns whether anything moved.
-function _pump_forwards!(s::Session)
-    buf = Vector{UInt8}(undef, 32768)
+function _pump_forwards!(s::Session, buf::Vector{UInt8} = Vector{UInt8}(undef, PUMP_READ_BYTES))
     deliver = Tuple{Conn,Vector{UInt8}}[]
+    ended = Conn[]                  # the far side finished: write what it sent, then close
     moved = false
     lock(s.lk) do
         isempty(s.fwds) && return
         for f in s.fwds, c in f.conns
-            c.closed && continue
+            (c.closed || c.ch == C_NULL) && continue
             # local → remote. Whatever the far side will not take now stays in `outbox` for the next
             # sweep, and a window shut for longer than `FWD_STALL_S` ends the connection.
             while !c.closed && (!isempty(c.outbox) || isready(c.inbox))
@@ -725,13 +768,29 @@ function _pump_forwards!(s::Session)
                 deleteat!(c.outbox, 1:Int(n)); c.stalled = 0.0; moved = true
             end
             c.closed && continue
-            # remote → local, collected here and written below
-            while true
+            # remote → local, collected here and written below. A connection whose local reader has
+            # fallen behind is not read: its bytes wait inside libssh2, its window is not topped up,
+            # and the far side stops sending until the reader catches up.
+            queued = c.queued[]
+            while queued < _TOSOCK_HIGH
                 n = ccall((:libssh2_channel_read_ex, LIB), Cssize_t,
                           (Ptr{Cvoid}, Cint, Ptr{UInt8}, Csize_t), c.ch, 0, buf, length(buf))
                 n == Cssize_t(EAGAIN) && break
-                if n <= 0; _close_conn!(c); break; end
+                if n <= 0
+                    # End of the far side's stream, however libssh2 reports it. What it sent before is
+                    # still to be written, so the channel goes and the connection stays until its
+                    # writer has written all of it. Any other failure ends the connection now.
+                    if ccall((:libssh2_channel_eof, LIB), Cint, (Ptr{Cvoid},), c.ch) == 1
+                        ccall((:libssh2_channel_free, LIB), Cint, (Ptr{Cvoid},), c.ch)
+                        c.ch = C_NULL
+                        push!(ended, c); moved = true
+                    elseif n < 0
+                        _close_conn!(c)
+                    end
+                    break
+                end
                 push!(deliver, (c, buf[1:Int(n)])); moved = true
+                queued += Int(n)
             end
         end
         for f in s.fwds
@@ -742,20 +801,29 @@ function _pump_forwards!(s::Session)
         c.closed && continue
         # Handed to the connection's writer: a local reader that falls behind holds up only its own
         # connection. One that stops altogether fills its queue, and the connection is closed.
-        if Base.n_avail(c.tosock) < 256
+        if c.queued[] < 4 * _TOSOCK_HIGH
+            Threads.atomic_add!(c.queued, length(bytes))
             try; put!(c.tosock, bytes); catch; end      # closed meanwhile
         else
             lock(() -> _close_conn!(c), s.lk)
         end
     end
+    # No more is coming: the writer writes what is queued, then closes the connection.
+    for c in ended
+        try; close(c.tosock); catch; end
+    end
     return moved
 end
 
 # The session's pump: gives accepted sockets their channels and moves tunnel bytes, for as long as
-# the session is open. Quick turns while bytes are moving, slower ones while nothing is.
+# the session is open. It runs pass after pass while bytes move, then waits for something to happen
+# (`kick`). The timeout is only a backstop: a timer cannot be the pace, because a short sleep lasts
+# milliseconds and a tunnel's rate would be bounded by it.
 function _pump_loop(s::Session)
-    idle = 0
+    watcher = s.watcher = errormonitor(Threads.@spawn _watch_socket(s))
+    buf = Vector{UInt8}(undef, PUMP_READ_BYTES)     # reused: each read is copied before delivery
     while s.ptr != C_NULL && s.alive
+        moved = false
         try
             while isready(s.pending)
                 f, sock = take!(s.pending)
@@ -763,12 +831,42 @@ function _pump_loop(s::Session)
                 # gone, and the pump keeps moving every other connection meanwhile.
                 s.alive ? Threads.@spawn(_attach_conn!(s, f, sock)) : (try; close(sock); catch; end)
             end
-            moved = _pump_forwards!(s)
-            idle = moved ? 0 : idle + 1
+            moved = _pump_forwards!(s, buf)
         catch
-            idle += 1
         end
-        sleep(idle == 0 ? 0.0005 : isempty(s.fwds) ? 0.05 : 0.002)
+        notify(s.pumped)
+        if moved
+            yield()
+        else
+            _wait_event(s.kick, s.ntun[] == 0 ? 1.0 : 0.05)
+        end
+    end
+    notify(s.pumped)
+    try; wait(watcher); catch; end
+    return nothing
+end
+
+# Wake the pump when the session's socket has something for libssh2: bytes from the far side, or room
+# to write again. Each wake waits for the pump's next pass, since the socket stays readable until
+# libssh2 takes the bytes and polling it again before then would only spin.
+function _watch_socket(s::Session)
+    while s.alive
+        # No tunnels: commands wait on the socket themselves (`_ready`), so there is nothing to do.
+        s.ntun[] == 0 && (sleep(0.25); continue)
+        fd, dir = lock(s.lk) do
+            s.ptr == C_NULL ? (Cint(-1), Cint(0)) :
+                (s.fd, ccall((:libssh2_session_block_directions, LIB), Cint, (Ptr{Cvoid},), s.ptr))
+        end
+        fd < 0 && break
+        ev = try
+            FileWatching.poll_fd(RawFD(fd), 0.25; readable = true, writable = (dir & DIR_OUTBOUND) != 0)
+        catch
+            sleep(0.05); continue
+        end
+        if (ev.readable || ev.writable) && s.alive
+            _kick!(s)
+            _wait_event(s.pumped, 0.05)
+        end
     end
     return nothing
 end
@@ -782,11 +880,12 @@ function _add_forward!(s::Session, localport::Integer, host::AbstractString, por
         return (false, "cannot listen on $localport: $(sprint(showerror, e))")
     end
     f = Fwd(Int(localport), String(host), Int(port), l, Conn[])
-    lock(() -> push!(s.fwds, f), s.lk)
+    lock(() -> (push!(s.fwds, f); s.ntun[] = length(s.fwds)), s.lk)
     Threads.@spawn begin
         while isopen(l)
             sock = try; Sockets.accept(l); catch; break; end
             put!(s.pending, (f, sock))
+            _kick!(s)
         end
     end
     return (true, "")
@@ -799,22 +898,31 @@ function _attach_conn!(s::Session, f::Fwd, sock)
         try; close(sock); catch; end
         return nothing
     end
-    c = Conn(sock, ch, Channel{Vector{UInt8}}(64), false, UInt8[], 0.0, Channel{Vector{UInt8}}(Inf))
+    c = Conn(sock, ch, Channel{Vector{UInt8}}(64), false, UInt8[], 0.0, Channel{Vector{UInt8}}(Inf),
+             Threads.Atomic{Int}(0))
     lock(() -> push!(f.conns, c), s.lk)
+    _kick!(s)                                       # the far side may already have bytes for it
     Threads.@spawn begin
+        # Until the queue is closed and empty: closed with bytes still in it when the far side has
+        # finished, so all of them are written before the socket goes.
         for bytes in c.tosock
             c.closed && break
-            try; write(c.sock, bytes); catch; lock(() -> _close_conn!(c), s.lk); break; end
+            try; write(c.sock, bytes); catch; break; end
+            Threads.atomic_sub!(c.queued, length(bytes))
+            _kick!(s)                               # room again: the pump may have held back
         end
+        lock(() -> _close_conn!(c), s.lk)
     end
     Threads.@spawn begin
         try
             while !eof(sock) && !c.closed
                 put!(c.inbox, readavailable(sock))
+                _kick!(s)
             end
         catch
         end
         try; put!(c.inbox, UInt8[]); catch; end     # empty frame = the local side hung up
+        _kick!(s)
     end
     return nothing
 end
@@ -827,6 +935,7 @@ function _drop_forward!(s::Session, localport::Integer)
         for c in f.conns; _close_conn!(c); end
     end
     filter!(f -> f.localport != Int(localport), s.fwds)
+    s.ntun[] = length(s.fwds)
     end
     return nothing
 end
@@ -838,6 +947,7 @@ function _close_forwards!(s::Session)
             for c in f.conns; _close_conn!(c); end
         end
         empty!(s.fwds)
+        s.ntun[] = 0
     end
     return nothing
 end
@@ -1031,6 +1141,11 @@ function _close_session!(s::Session)
         sleep(0.05)
     end
     _close_forwards!(s)
+    # The pump and its socket watcher see `alive` at their next turn; wake them, and let the watcher
+    # stop before the socket is closed (its poll ends within a quarter second).
+    notify(s.kick); notify(s.pumped)
+    w = s.watcher
+    w === nothing || timedwait(() -> istaskdone(w), 2.0)
     lock(() -> _close!(s), s.lk)
     return nothing
 end
