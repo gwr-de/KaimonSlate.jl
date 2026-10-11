@@ -57,7 +57,7 @@ end
 const AF_INET = Cint(2)
 const SOCK_STREAM = Cint(1)
 const F_SETFL = Cint(4)
-const O_NONBLOCK = Cint(4)
+const O_NONBLOCK = Cint(Sys.isbsd() ? 0x0004 : 0o4000)
 
 const AF_INET6 = Cint(Sys.isbsd() ? 30 : 10)
 
@@ -79,22 +79,70 @@ function _sockaddr(ip::IPAddr, port::Integer)
     return fam, sa
 end
 
-# Connect to the first of the host's addresses that answers, IPv6 and IPv4 alike, in the order the
-# resolver gives them: a network that offers IPv6 first may have no usable IPv4 route, or the reverse.
+# How long one address may take to accept a connection before the next is tried. An address family
+# the network does not route (IPv6 on many networks) otherwise holds a connect for the system's TCP
+# timeout, over a minute.
+const CONNECT_TIMEOUT_S = 4.0
+const SOL_SOCKET = Cint(Sys.isbsd() ? 0xffff : 1)
+const SO_ERROR = Cint(Sys.isbsd() ? 0x1007 : 4)
+const EINPROGRESS = Cint(Sys.isbsd() ? 36 : 115)
+
+const F_GETFL = Cint(3)
+
+# Put a socket in non-blocking mode, keeping its other flags, and confirm it took. `fcntl` is variadic,
+# and on arm64 macOS a variadic argument is passed on the stack, so the call must say so (`Cint...`)
+# or the flag never arrives. Every libssh2 call on the session relies on this: a blocking socket holds
+# the session lock inside `recv`.
+function _set_nonblocking(fd::Cint)
+    fl = ccall(:fcntl, Cint, (Cint, Cint, Cint...), fd, F_GETFL, Cint(0))
+    fl < 0 && return false
+    ccall(:fcntl, Cint, (Cint, Cint, Cint...), fd, F_SETFL, fl | O_NONBLOCK) < 0 && return false
+    return (ccall(:fcntl, Cint, (Cint, Cint, Cint...), fd, F_GETFL, Cint(0)) & O_NONBLOCK) != 0
+end
+
+# The address family that last connected to each host, tried first next time, so a network without a
+# route for the other family costs its timeout once rather than on every connection.
+const _GOOD_FAMILY = Dict{String,Bool}()        # host => connected over IPv6
+const _GOOD_FAMILY_LOCK = ReentrantLock()
+
+# Connect to the first of the host's addresses that answers, IPv6 and IPv4 alike: a network that
+# offers IPv6 may have no usable IPv4 route, or the reverse. Non-blocking, so a wait yields the task
+# rather than holding a thread.
 function _tcp_connect(hostname::AbstractString, port::Integer)
     Sys.iswindows() && error("SshTransport: Windows needs a Winsock socket here (WSAStartup + SOCKET)")
-    ips = getalladdrinfo(String(hostname))
+    host = String(hostname)
+    ips = getalladdrinfo(host)
     isempty(ips) && error("$hostname did not resolve")
+    good = lock(() -> get(_GOOD_FAMILY, host, nothing), _GOOD_FAMILY_LOCK)
+    good === nothing || (ips = sort(ips; by = ip -> (ip isa IPv6) != good))      # stable: last good family first
     tried = String[]
     for ip in ips
         fam, sa = _sockaddr(ip, port)
         fd = ccall(:socket, Cint, (Cint, Cint, Cint), fam, SOCK_STREAM, 0)
         fd < 0 && (push!(tried, "$ip: socket() failed"); continue)
-        if ccall(:connect, Cint, (Cint, Ptr{UInt8}, Cuint), fd, sa, length(sa)) == 0
-            ccall(:fcntl, Cint, (Cint, Cint, Cint), fd, F_SETFL, O_NONBLOCK)
+        _set_nonblocking(fd) || (push!(tried, "$ip: could not make the socket non-blocking");
+                                 ccall(:close, Cint, (Cint,), fd); continue)
+        rc = ccall(:connect, Cint, (Cint, Ptr{UInt8}, Cuint), fd, sa, length(sa))
+        err = rc == 0 ? Cint(0) : Libc.errno()
+        if err == EINPROGRESS
+            ev = try
+                FileWatching.poll_fd(RawFD(fd), CONNECT_TIMEOUT_S; writable = true)
+            catch
+                nothing
+            end
+            if ev === nothing || !ev.writable
+                err = Cint(-1)                          # no answer within the timeout
+            else
+                v = Ref{Cint}(0); l = Ref{Cuint}(4)
+                ccall(:getsockopt, Cint, (Cint, Cint, Cint, Ptr{Cint}, Ptr{Cuint}), fd, SOL_SOCKET, SO_ERROR, v, l)
+                err = v[]
+            end
+        end
+        if err == 0
+            lock(() -> (_GOOD_FAMILY[host] = ip isa IPv6), _GOOD_FAMILY_LOCK)
             return fd
         end
-        push!(tried, "$ip: errno $(Libc.errno())")
+        push!(tried, err == -1 ? "$ip: no answer in $(CONNECT_TIMEOUT_S)s" : "$ip: errno $err")
         ccall(:close, Cint, (Cint,), fd)
     end
     error("could not connect to $hostname:$port (" * join(tried, "; ") * ")")
