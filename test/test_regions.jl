@@ -882,6 +882,15 @@ end
                 RE.region_delete!("filedtest")
             end
 
+            @testset "a node is given back only on a roster that shows it empty" begin
+                r = RE.region_set!("unanswered"; host = "not-signed-in.invalid")
+                try
+                    @test RE._region_has_live_workers(r)
+                finally
+                    RE.region_delete!("unanswered")
+                end
+            end
+
             @testset "telemetry is watched only on workers this hub started and nothing holds" begin
                 ws = Any[Dict{String,Any}("port" => 9300, "alive" => true, "state" => "idle",
                                           "manifest" => "{\"hub\":\"elsewhere\",\"stream_port\":\"9301\"}")]

@@ -6000,11 +6000,14 @@ end
 # Anything of ours still running where this region is currently placed. Consulted before letting an
 # allocation go: `warm = 0` means "keep none READY", not "kill the one a notebook is attached to".
 # Read-only — it uses the cached placement, so it never asks the scheduler for a node in order to
-# decide whether to give one back.
+# decide whether to give one back. A host that does not answer counts as having some: a node is
+# given back only on a roster that shows it empty.
 function _region_has_live_workers(r::Region)
     h = region_host(r)
     isempty(h) && return false
-    return any(list_remote_workers(h)) do w
+    ok, ws = _list_remote_workers(h)
+    ok || return true
+    return any(ws) do w
         w["alive"] === true && _manifest_get(w["manifest"], "region") == r.name &&
             _manifest_ours(w["manifest"])
     end
