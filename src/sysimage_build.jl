@@ -167,7 +167,7 @@ try
     end
     Pkg.instantiate(; io = devnull)
     exec = joinpath(dir, "precompile_exec.jl"); write(exec, EXEC)
-    pkgs = (f = joinpath(envdir, "Project.toml"); isfile(f) ? sort!(collect(keys(get(TOML.parsefile(f), "deps", Dict{String,Any}())))) : String[])
+    pkgs = sort!(collect(keys(get(TOML.parsefile(joinpath(envdir, "Project.toml")), "deps", Dict{String,Any}()))))
     println("[sysimg] baking $(length(pkgs)) package(s) and the worker's code → $target"); flush(stdout)
     # Each thread emitting the image holds its own share of it; short of memory, one is slower but fits.
     avail < 16 && (ENV["JULIA_IMAGE_THREADS"] = "1"; println("[sysimg] $(round(avail; digits = 1))GB free: emitting the image on one thread"); flush(stdout))

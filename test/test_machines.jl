@@ -411,18 +411,18 @@ const RE = KaimonSlate.ReportEngine
                     manifest_format = "2.0"
                     [[deps.A]]
                     deps = ["B"]
-                    git-tree-sha1 = "aaaa"
+                    git-tree-sha1 = "$(repeat('a', 40))"
                     uuid = "00000000-0000-0000-0000-00000000000a"
                     version = "1.0.0"
                     weakdeps = ["C"]
                     [deps.A.extensions]
                     ACExt = "C"
                     [[deps.B]]
-                    git-tree-sha1 = "bbbb"
+                    git-tree-sha1 = "$(repeat('b', 40))"
                     uuid = "00000000-0000-0000-0000-00000000000b"
                     version = "$bv"
                     [[deps.C]]
-                    git-tree-sha1 = "cccc"
+                    git-tree-sha1 = "$(repeat('c', 40))"
                     uuid = "00000000-0000-0000-0000-00000000000c"
                     version = "$cv"
                     """)
@@ -453,11 +453,11 @@ const RE = KaimonSlate.ReportEngine
                 manifest("2.0.0", "3.0.0")
                 # The environment the image is built from reads as a Manifest, though A's weakdep C is not in it.
                 let f = joinpath(home, "env.jl"), s = RE._sysimage_build_script(r, "env", spec; infra = ("A",))
-                    write(f, first(s, findfirst("image() =", s).start - 1) *
+                    write(f, s[1:prevind(s, findfirst("image() =", s).start)] *
                              "\nwrite_env(); import Pkg; m = Pkg.Types.read_manifest(joinpath(envdir, \"Manifest.toml\"))\n" *
-                             "print(sort!([e.name for e in values(m.deps)]), \" \", m[Base.UUID(\"00000000-0000-0000-0000-00000000000a\")].weakdeps)\n")
+                             "print(sort!([e.name for e in values(m.deps)]), \" \", m[Base.UUID(\"00000000-0000-0000-0000-00000000000a\")].weakdeps[\"C\"])\n")
                     out = read(setenv(`$(Base.julia_cmd()) --startup-file=no $f`, merge(ENV, Dict("HOME" => home))), String)
-                    @test occursin("[\"A\", \"B\"]", out) && occursin("\"C\" => UUID(\"00000000-0000-0000-0000-00000000000c\")", out)
+                    @test occursin("[\"A\", \"B\"]", out) && endswith(out, " 00000000-0000-0000-0000-00000000000c")
                     rm(joinpath(store, key, "env"); recursive = true)
                 end
                 # A build of the same image already running elsewhere holds it; the lock names its region.
