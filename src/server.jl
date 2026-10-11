@@ -2929,8 +2929,26 @@ end
 # Ping every connected kernel: refresh the heartbeat, track failures, heal dead remote wires, and
 # stash the running cell ids, with which kernels answered, for the orphan reconciler. Runs every sweep (idle or busy) so a
 # wire that dies while nothing is running is still healed before the next cell is dispatched onto it.
+# One heartbeat: `(ok, the run and cell ids it is evaluating, the error)`.
+function _liveness_ping(k)
+    t1 = time_ns()
+    r = try
+        ReportEngine._tool(k, "__slate_running", Dict{String,Any}(); timeout = _LIVENESS_PING_TIMEOUT)
+    catch e
+        return (false, String[], e)
+    end
+    _note_clock!(k, r, t1, time_ns())   # the heartbeat is already a round trip; measure it
+    field(f) = r isa NamedTuple ? get(r, f, nothing) :
+               r isa AbstractDict ? get(r, String(f), get(r, f, nothing)) : nothing
+    run = field(:running)
+    run === nothing && return (false, String[], nothing)
+    return (true, String[String.(run); String.(collect(something(field(:runs), ())))], nothing)
+end
+
 function _liveness_sweep!(nb::LiveNotebook)
     ids = Set{String}(); answered = Set{String}(); asked = Set{String}()
+    # Every kernel is pinged at once, so a silent one costs the sweep one timeout, not one each.
+    pings = Tuple{Any,Any,Task}[]
     for k in _nb_kernels(nb)
         (k isa ReportEngine.GateKernel && k.conn !== nothing) || continue
         push!(asked, _kernel_side_label(nb, k))
@@ -2943,22 +2961,13 @@ function _liveness_sweep!(nb::LiveNotebook)
             _drop_signed_out_wire!(nb, k, h; hold = false)
             continue
         end
-        ok = false; err = nothing
-        conn0 = k.conn
-        try
-            t1 = time_ns()
-            r = ReportEngine._tool(k, "__slate_running", Dict{String,Any}(); timeout = _LIVENESS_PING_TIMEOUT)
-            _note_clock!(k, r, t1, time_ns())   # the heartbeat is already a round trip; measure it
-            field(f) = r isa NamedTuple ? get(r, f, nothing) :
-                       r isa AbstractDict ? get(r, String(f), get(r, f, nothing)) : nothing
-            run = field(:running)
-            if run !== nothing
-                for id in run; push!(ids, String(id)); end
-                for id in something(field(:runs), ()); push!(ids, String(id)); end
-                push!(answered, _kernel_side_label(nb, k)); ok = true
-            end
-        catch e
-            err = e
+        push!(pings, (k, k.conn, Threads.@spawn _liveness_ping(k)))
+    end
+    for (k, conn0, t) in pings
+        ok, got, err = fetch(t)
+        if ok
+            union!(ids, got)
+            push!(answered, _kernel_side_label(nb, k))
         end
         if ok && haskey(_KERNEL_BUSY_SINCE, k)
             delete!(_KERNEL_BUSY_SINCE, k)
