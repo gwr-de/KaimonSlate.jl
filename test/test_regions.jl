@@ -1377,7 +1377,7 @@ end
                         write(joinpath(bin, "queue"), "124|PENDING||\n")
                         res, told = release!()
                         @test res.ok && told
-                        @test readlines(joinpath(bin, "cancelled")) == ["-n slate-queue"]
+                        @test readlines(joinpath(bin, "cancelled")) == ["124"]   # the job found, by its id
                         # The cell waits for a run, which the supervisor leaves alone. The cell waiting
                         # on another region still waits in its queue.
                         @test w.state == RE.BLOCKED && w.blocked == NS.WAIT_NOT_REQUESTED && w.blocked_region == "queue"
@@ -1524,7 +1524,7 @@ end
                     end
                     try
                         @test startswith(release(), "✅ released job 123 of 'here'")
-                        @test readlines(cancelled) == ["-n slate-here"]
+                        @test readlines(cancelled) == ["123"]
                         @test RE.region_placement(RE.region_get("here")) === nothing
                     finally
                         lock(RE._REGION_PLACE_LOCK) do; delete!(RE._REGION_PLACE, "here"); end
