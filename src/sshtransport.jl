@@ -443,36 +443,46 @@ end
 # read took the socket's data first.
 const _TRANSPORT_ERRS = (Cint(-7), Cint(-13), Cint(-30), Cint(-43), EAGAIN)
 
+# Reads one stream to its end: `:eof`, `:timeout` (past the deadline, or the session is closing), or
+# `:lost` (a read failed, so what arrived is not all the command wrote).
 function _drain(s::Session, ch, stream::Cint, sink::IO, deadline::Float64)
     buf = Vector{UInt8}(undef, 65536)
     while true
         n = lock(() -> ccall((:libssh2_channel_read_ex, LIB), Cssize_t,
                              (Ptr{Cvoid}, Cint, Ptr{UInt8}, Csize_t), ch, stream, buf, length(buf)), s.lk)
-        if n == Cssize_t(EAGAIN)
-            (time() > deadline || !s.alive) && return false     # past its time, or the session is closing
+        # -1 is libssh2 still waiting on data another channel's read took off the socket: not yet, the
+        # same as at a channel open.
+        if n == Cssize_t(EAGAIN) || n == Cssize_t(-1)
+            (time() > deadline || !s.alive) && return :timeout
             _ready(s, 5.0); continue
         end
-        n <= 0 && return true                  # 0 = EOF, negative = a real error
+        n == 0 && return :eof
+        if n < 0
+            Cint(n) in _TRANSPORT_ERRS && _channel_dead!(s, "read: " * lock(() -> _lasterr(s), s.lk))
+            return :lost
+        end
         write(sink, view(buf, 1:Int(n)))
     end
 end
 
-# The command's exit status, or -1 when its output did not end by `timeout`. That is a failure even
-# though the channel then closes cleanly: libssh2 reports 0 for a command whose exit it never saw,
-# and a step that ran past its deadline is not one that succeeded. It may still be running there.
+# The command's exit status, or one of these when it has none. Both are failures even though the
+# channel then closes cleanly: libssh2 reports 0 for a command whose exit it never saw. A command that
+# ran past its deadline, or whose output was cut off, may still be running there.
 const TIMED_OUT = Cint(-1)
+const LOST = Cint(-2)
 
 function _finish(s::Session, ch, out::IO, err::IO, timeout::Real)
     deadline = time() + timeout
-    done = _drain(s, ch, Cint(0), out, deadline)
-    done = _drain(s, ch, Cint(1), err, deadline) && done
+    a = _drain(s, ch, Cint(0), out, deadline)
+    b = a === :eof ? _drain(s, ch, Cint(1), err, deadline) : a
     _again(s, () -> ccall((:libssh2_channel_close, LIB), Cint, (Ptr{Cvoid},), ch); timeout = 10.0)
     status = lock(s.lk) do
         st = ccall((:libssh2_channel_get_exit_status, LIB), Cint, (Ptr{Cvoid},), ch)
         ccall((:libssh2_channel_free, LIB), Cint, (Ptr{Cvoid},), ch)
         st
     end
-    return done ? status : TIMED_OUT
+    (a === :lost || b === :lost) && return LOST
+    return (a === :eof && b === :eof) ? status : TIMED_OUT
 end
 
 # A sink that hands each complete line to `f` as it arrives and keeps everything, so a long command
@@ -570,16 +580,23 @@ function _channel_dead!(s::Session, why::AbstractString)
     return nothing
 end
 
-"Run `cmd` on the session's host. `(ok, output)` with stdout and stderr interleaved; `online` gets each line as it arrives."
+"""
+Run `cmd` on the session's host: `(ok, output, how)`, with stdout and stderr interleaved; `online` gets
+each line as it arrives. `how` says what became of the command: `:ok`, `:failed` (it exited non-zero),
+`:not_started` (no channel, or the server refused the command, so it never ran and is safe to send
+again), `:timed_out` or `:lost` (it started and its end was not seen, so it may still be running).
+"""
 function _exec(s::Session, cmd::AbstractString; timeout::Real = 120.0, online = nothing)
     ch, why = _open_started(s, cmd; merge = true)
-    ch == C_NULL && return (false, why)
+    ch == C_NULL && return (false, why, :not_started)
     out = online === nothing ? IOBuffer() : LineTap(online)
     status = _finish(s, ch, out, out, timeout)
     text = String(take!(out))
     status == TIMED_OUT &&
-        (text *= "\n[no end within $(round(Int, timeout))s; the command may still be running there]")
-    return (status == 0, text)
+        return (false, text * "\n[no end within $(round(Int, timeout))s; the command may still be running there]", :timed_out)
+    status == LOST &&
+        return (false, text * "\n[the connection failed before the command ended; it may still be running there]", :lost)
+    return (status == 0, text, status == 0 ? :ok : :failed)
 end
 
 # Run `cmd`, streaming `input` to its stdin and collecting stdout. This is what replaces rsync: the
@@ -960,7 +977,8 @@ function _serve(s::Session, ask)
                         arg isa AbstractString ? _exec(s, arg) : _exec(s, arg.cmd; timeout = arg.timeout, online = arg.online)
                     end
                 catch e
-                    kind === :io ? (false, UInt8[], sprint(showerror, e)) : (false, sprint(showerror, e))
+                    kind === :io ? (false, UInt8[], sprint(showerror, e)) :
+                    kind === :exec ? (false, sprint(showerror, e), :lost) : (false, sprint(showerror, e))
                 end)
             finally
                 Threads.atomic_sub!(s.busy, 1)
@@ -1110,16 +1128,17 @@ function _request(host::AbstractString, kind::Symbol, arg, fail; ask)
 end
 
 """
-    exec(host, cmd; ask, timeout = 120, online = nothing) -> (ok, output)
+    exec(host, cmd; ask, timeout = 120, online = nothing) -> (ok, output, how)
 
 Run `cmd` on `host` over the shared session. A command still producing output at `timeout` seconds is
 a failure. `online(line)` is called with each line as it arrives, on the session's task: keep it quick.
+`how` is what became of the command (`_exec`): only a `:not_started` one is safe to send again.
 """
 exec(host::AbstractString, cmd::AbstractString; ask, timeout::Real = 120.0, online = nothing) =
     _request(String(host), :exec,
              (timeout == 120.0 && online === nothing) ? String(cmd) :
                  (; cmd = String(cmd), timeout = Float64(timeout), online = online),
-             (false, "session for $host is gone"); ask = ask)
+             (false, "session for $host is gone", :not_started); ask = ask)
 
 """
     exec_io(host, cmd, input) -> (ok, stdout::Vector{UInt8}, stderr::String)

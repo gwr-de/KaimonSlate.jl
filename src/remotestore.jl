@@ -189,7 +189,7 @@ function connect!(host::AbstractString; interactive::Bool = false)
     # it queues behind the opening and comes back when there is a session, or when there cannot be.
     ok, why = try
         r = SshTransport.exec(String(host), "true"; ask = interactive ? _ask : _noask)
-        (first(r) && SshTransport.connected(String(host)), String(last(r)))
+        (first(r) && SshTransport.connected(String(host)), String(r[2]))
     catch e
         (false, first(sprint(showerror, e), 200))
     end
@@ -268,13 +268,13 @@ function run_there(host::AbstractString, script::AbstractString; timeout::Real =
     has_delegate() && return _via(() -> (false, _offline(host)), :exec,
                                   (; host = String(host), script = String(script), timeout = Float64(timeout)))
     connect!(host) || return (false, _offline(host))
-    ok, out = SshTransport.exec(String(host), String(script); ask = _ask, timeout, online)
+    ok, out, how = SshTransport.exec(String(host), String(script); ask = _ask, timeout, online)
     # A session can die between one command and the next — the far side reboots, a NAT drops the
-    # flow — and the first call to notice is the one that fails. The transport drops a session it
-    # could not open a channel on, so "no longer connected" distinguishes that from a command which
-    # simply exited non-zero, and the caller never sees the reconnect.
-    if !ok && !SshTransport.connected(String(host)) && connect!(host)
-        ok, out = SshTransport.exec(String(host), String(script); ask = _ask, timeout, online)
+    # flow — and the first call to notice is the one that fails. Sent again on a new session only when
+    # it never started: one that started and was cut off may still be running there, and a second
+    # `sbatch` is a second job.
+    if how === :not_started && !SshTransport.connected(String(host)) && connect!(host)
+        ok, out, _ = SshTransport.exec(String(host), String(script); ask = _ask, timeout, online)
     end
     return (ok, out)
 end
