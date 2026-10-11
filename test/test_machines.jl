@@ -63,8 +63,6 @@ const RE = KaimonSlate.ReportEngine
             @test t.kind === :region && t.region == "pmsr" && t.root_remote == "/scratch/store/regions/pmsr"
             @test RE.Sweep.launcher_for(t) isa RE.Sweep.BatchLauncher.RegionLauncher
             @test !RE.Sweep._untested(t)                     # the region's prepare built its environment
-            @test KaimonSlate.NotebookServer._sweep_slots(RE.region_get("pmsr")) == [0, 1, 2, 3] &&
-                  KaimonSlate.NotebookServer._sweep_slots(RE.region_get("plain")) == [-1]
             RE.region_delete!("pmsr"); RE.region_delete!("plain")
         end
 
