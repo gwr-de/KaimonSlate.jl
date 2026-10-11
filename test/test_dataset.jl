@@ -992,6 +992,22 @@ const MS = RE.MemoStore
             finally
                 RE.Sweep.READ_HOOKS[] = nothing
             end
+            # Split into streams: every byte once, in order, whatever the cut.
+            sp = [(0, 10), (20, 5), (100, 17)]
+            for k in 1:5
+                g = RE.Sweep._split_spans(sp, k)
+                @test length(g) <= k && sum(x -> sum(last, x), g) == 32
+                flat = reduce(vcat, [collect(o:o+l-1) for grp in g for (o, l) in grp])
+                @test flat == reduce(vcat, [collect(o:o+l-1) for (o, l) in sp])
+            end
+            old = RE.Sweep.STREAM_MIN_BYTES[]
+            try
+                RE.Sweep.STREAM_MIN_BYTES[] = 1                  # small enough to read as several streams
+                @test q[:, 3, :] == A[:, 3, :]
+                @test q[1:2:4, 1:3, 2:5] == A[1:2:4, 1:3, 2:5]
+            finally
+                RE.Sweep.STREAM_MIN_BYTES[] = old
+            end
             cached() = filter(startswith("range-"), readdir(RE.Sweep._blob_cache_dir()))
             before = cached()
             @test q[:, 2, :] == A[:, 2, :]               # the same selection again: no new fetch

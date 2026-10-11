@@ -2556,11 +2556,38 @@ function _fetch_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
         try; touch(dest); catch; end
         return dest
     end
-    part = string(dest, ".part.", getpid(), ".", string(rand(UInt32); base = 16))
-    ok, n = _await_fetch(part, total, p.label) do
-        fetch_to(p.src.host, ranges_command(p.src.root, blob), dest; input = Vector{UInt8}(ranges),
-                 part, name = p.label, total)
+    # A large selection is read as several streams, each its own connection: on a lossy path each
+    # loses and recovers on its own, and together they keep the link fuller than one can. Each stream
+    # writes its share to a piece of its own, and the pieces are joined in order.
+    groups = _split_spans(spans, total >= STREAM_MIN_BYTES[] ? FETCH_STREAMS[] : 1)
+    tag = string(getpid(), ".", string(rand(UInt32); base = 16))
+    pieces = [string(dest, ".piece.", tag, ".", i) for i in eachindex(groups)]
+    parts = [pc * ".part" for pc in pieces]
+    script = ranges_command(p.src.root, blob)
+    landed() = sum((isfile(pt) ? Int(filesize(pt)) : isfile(pc) ? Int(filesize(pc)) : 0
+                    for (pt, pc) in zip(parts, pieces)); init = 0)
+    results = try
+        _await_fetch(landed, () -> foreach(pt -> (try; cancel_fetch!(pt); catch; end), parts), total, p.label) do
+            tasks = [Threads.@spawn fetch_to(p.src.host, script, pieces[i];
+                                             input = Vector{UInt8}(join((string(o, ' ', l, '\n') for (o, l) in groups[i]))),
+                                             part = parts[i], name = p.label, total = sum(last, groups[i]))
+                     for i in eachindex(groups)]
+            Base.fetch.(tasks)
+        end
+    catch
+        foreach(pc -> rm(pc; force = true), pieces)
+        rethrow()
     end
+    ok = all(first, results)
+    n = sum(last, results; init = 0)
+    if ok && n == total
+        tmp = string(dest, ".join.", tag)
+        open(tmp, "w") do io
+            for pc in pieces; open(src -> write(io, src), pc); end
+        end
+        mv(tmp, dest; force = true)
+    end
+    foreach(pc -> rm(pc; force = true), pieces)
     (ok && n == total) ||
         error("reading $(_bytes(total)) of $(p.label) from $(p.src.host) failed" * (ok ? " (got $(_bytes(n)))" : ""))
     _BLOB_FETCHED[] += total
@@ -2571,15 +2598,41 @@ function _fetch_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
     return dest
 end
 
+"How many streams a large remote read is split into, and the size below which it is one."
+const FETCH_STREAMS = Ref(4)
+const STREAM_MIN_BYTES = Ref(16 * 1024 * 1024)
+
+# `spans` (offset, length) cut into at most `k` groups of about equal bytes, in order: a group is a
+# contiguous stretch of the bytes the selection asks for, so the pieces join back in group order.
+function _split_spans(spans::Vector{Tuple{Int,Int}}, k::Integer)
+    total = sum(last, spans; init = 0)
+    (k <= 1 || total == 0) && return [spans]
+    per = cld(total, k)
+    groups = [Tuple{Int,Int}[]]
+    room = per
+    for (o, l) in spans
+        while l > 0
+            take = length(groups) == k ? l : min(l, room)
+            push!(groups[end], (o, take))
+            o += take; l -= take; room -= take
+            if room <= 0 && length(groups) < k
+                push!(groups, Tuple{Int,Int}[]); room = per     # an empty last one is dropped below
+            end
+        end
+    end
+    return filter(!isempty, groups)
+end
+
 """
 How a long read reports on the running cell and hears its Stop: `(; progress(frac, msg, done),
 checkpoint())`, set by a worker. `nothing` elsewhere, where a read just waits.
 """
 const READ_HOOKS = Ref{Any}(nothing)
 
-# Run the fetch `f` while reporting how much of `total` has landed in `part`, and stop it when the
-# cell is stopped. The wait is on the cell's own task, which is where its Stop is visible.
-function _await_fetch(f, part::AbstractString, total::Integer, label::AbstractString)
+# Run the fetch `f` while reporting how much of `total` has landed (`landed()`), and stop it
+# (`cancel()`) when the cell is stopped. The wait is on the cell's own task, which is where its Stop
+# is visible.
+function _await_fetch(f, landed, cancel, total::Integer, label::AbstractString)
     h = READ_HOOKS[]
     h === nothing && return f()
     t = Threads.@spawn f()
@@ -2590,13 +2643,13 @@ function _await_fetch(f, part::AbstractString, total::Integer, label::AbstractSt
             timedwait(() -> istaskdone(t), 0.25)
             h.checkpoint()
             if !istaskdone(t) && time() - t0 > 1.0
-                got = isfile(part) ? Int(filesize(part)) : 0
+                got = landed()
                 h.progress(total > 0 ? got / total : 0.0, "reading $(label): $(_bytes(got)) of $(_bytes(total))", false)
                 shown = true
             end
         end
     catch e
-        e isa InterruptException && (try; cancel_fetch!(part); catch; end)
+        e isa InterruptException && (try; cancel(); catch; end)
         rethrow()
     finally
         shown && (try; h.progress(1.0, "", true); catch; end)
