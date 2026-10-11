@@ -39,7 +39,8 @@ end
 
 export Cell, CellOutput, MimeChunk, BindSpec, Report, CellKind, CellState
 export SlateTable, slate_table, SlatePagedTable, slate_query
-export MARKDOWN, CODE, WEB, TOOL, JOB, FRESH, STALE, RUNNING, ERRORED, BLOCKED
+export MARKDOWN, CODE, WEB, TOOL, JOB, FRESH, STALE, RUNNING, ERRORED, BLOCKED, STOPPED
+export Run, is_running, shown_state
 # Kind predicates, exported alongside the kinds themselves: sibling modules (`ReportRender`,
 # `NotebookServer`) reach the enum by `using ..ReportEngine`, so a helper that is not exported is
 # invisible to exactly the code that classifies cells.
@@ -75,7 +76,39 @@ export standalone!
 # because the two need opposite handling. An error is the cell's own, is worth showing in red, and is
 # retried by running it again; a wait is somebody else's, belongs in the header rather than the
 # output, and is cleared by the thing it is waiting for (which re-runs the cell itself).
-@enum CellState FRESH STALE RUNNING ERRORED BLOCKED   # never-run ≡ STALE
+#
+# A cell's state is the scheduling verdict: what the cell needs. Whether it is computing right now is a
+# separate fact, its `Run` (below). RUNNING is never stored; it is what `shown_state` reports while a run
+# exists, so a cell restaled mid-run is STALE with a run in flight rather than a RUNNING that lies.
+#
+# STOPPED is a run someone stopped. The cell keeps what the run printed, cells reading it wait, and
+# nothing reruns it on its own (an upstream change, a worker restart): only a run asked for it does.
+@enum CellState FRESH STALE RUNNING ERRORED BLOCKED STOPPED   # never-run ≡ STALE
+
+"""
+One computation of one cell, from the runner picking the cell up to its result being merged.
+
+`phase` is `:preparing` until the cell is handed to a worker (a region's bring-up, the namespace
+prime and the input transfer all happen first) and `:dispatched` after. A result is accepted only
+from the run that is still the cell's (`cell.run === run`), so a restart, a replaced worker or a
+superseded edit drops the late answer instead of overwriting newer state.
+
+`rerun` records that an input changed while the run was in flight: the result is kept and shown, and
+the cell is left STALE so it runs again. `stop_at` is when Stop was asked of this run (0 = not asked).
+"""
+mutable struct Run
+    id::String
+    src_hash::UInt64          # the source this run computes
+    side::String              # "" = the main kernel, else the region; set when the cell is routed
+    phase::Symbol             # :preparing | :dispatched
+    rerun::Bool
+    stop_at::Float64
+    started::Float64
+    dispatched::Float64       # when it was handed to a worker (0 while preparing)
+    kernel::Any               # the kernel it was dispatched to, and that kernel's namespace generation
+    gen::Int                  # then: a result from a replaced worker is not this run's
+    misses::Int               # consecutive liveness answers that did not list it (orphan detection)
+end
 
 "One representation of a cell's output (MIME-generic display bundle, §7)."
 struct MimeChunk
@@ -185,6 +218,7 @@ mutable struct Cell
                                   # status and the facts behind it, never a sentence.
     blocked_region::String        # the region the wait is for. Not necessarily the cell's own: a cell
                                   # whose input is waiting waits for the region that input runs on.
+    run::Union{Run,Nothing}       # the computation in flight, if any — see `Run`
 end
 
 "Construct a fresh cell, hashing its source and marking it stale (never-run)."
@@ -192,7 +226,8 @@ function Cell(id::AbstractString, kind::CellKind, source::AbstractString)
     src = String(source)
     return Cell(String(id), kind, src, hash(src),
                 Set{Symbol}(), Set{Symbol}(), Set{Symbol}(), Set{Symbol}(), Set{String}(), String[],
-                STALE, nothing, Set{Symbol}(), BindSpec[], Vector{String}[], CellOutput[], Set{Symbol}(), 0, "", 0.0, "", "")
+                STALE, nothing, Set{Symbol}(), BindSpec[], Vector{String}[], CellOutput[], Set{Symbol}(), 0, "", 0.0, "", "",
+                nothing)
 end
 
 # The names a cell DEFINES — its full write-set minus the names it only mutates in place. A mutation

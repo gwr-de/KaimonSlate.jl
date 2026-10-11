@@ -369,7 +369,7 @@ function _app_warm_state(h::Hub)
     starting = 0; running = 0
     for nb in nbs
         get(nb.report.meta, "hydrating", false) === true && (starting += 1)
-        running += with_report(nb) do r; count(c -> c.state == RUNNING, r.cells); end
+        running += with_report(nb) do r; count(is_running, r.cells); end
     end
     return (starting, running)
 end
@@ -583,7 +583,7 @@ function _status_json(h::Hub)
             "state" => get(nb.report.meta, "inactive", false) === true ? "inactive" :
                        get(nb.report.meta, "hydrating", false) === true ? "starting" : "live",
             "cells" => length(cells),
-            "running" => count(c -> c.state == RUNNING, cells),
+            "running" => count(is_running, cells),
             "stale" => count(c -> c.state == STALE, cells),
             "errors" => length(errs),
             # The error TEXT, not just a count — this is the whole reason someone opens /status.

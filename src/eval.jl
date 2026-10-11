@@ -14,7 +14,6 @@ export register_userprog!, unregister_userprog!
 export register_cellout!, unregister_cellout!
 export register_prepare!, unregister_prepare!
 export register_emit!, unregister_emit!, register_bin_emit!, unregister_bin_emit!
-export register_celldone!, unregister_celldone!
 export register_cleanup_cells!, unregister_cleanup_cells!, run_cleanups!
 export register_toolcall!, unregister_toolcall!
 export register_setbind!, unregister_setbind!
@@ -164,26 +163,11 @@ function _do_emit_bin(report_id::AbstractString, frame::Vector{UInt8})
     return nothing
 end
 
-# Parallel batch results: the gate worker evaluates a batch of stale cells CONCURRENTLY and PUBs each
-# cell's wire-form result on the `slate_celldone` channel the instant it finishes (see worker.jl
-# `__slate_eval_batch`). The poller routes each here; the server merges it version-guarded and pushes a
-# single-cell patch — so a fast cell renders while a slow sibling is still running. Same out-of-band
-# registry. The callback takes (run_id, cell_id, wire).
-const _CELLDONE_REGISTRY = Dict{String,Any}()
-register_celldone!(report_id::AbstractString, cb) = _reg_set!(_CELLDONE_REGISTRY, report_id, cb)
-unregister_celldone!(report_id::AbstractString) = _reg_del!(_CELLDONE_REGISTRY, report_id)
-function _do_celldone(report_id::AbstractString, run_id, cell_id, wire)
-    cb = _reg_get(_CELLDONE_REGISTRY, report_id)
-    cb === nothing && return nothing
-    try; cb(String(run_id), String(cell_id), wire); catch e; @warn "slate: celldone merge failed" cell = cell_id exception = e; end
-    return nothing
-end
-
 # Cell DELETE teardown: `update_source!` (deps.jl) detects removed cells and fires this so the server can
 # run those cells' `slate_on_cleanup` callbacks — closing a live per-cell resource (a Bonito `Session`)
 # a deleted cell held. The callback lives WHERE the sessions do (a worker's namespace), so the server
 # broadcasts to its kernel(s); a re-eval/rebuild path fires cleanups worker-locally without this. Same
-# out-of-band registry as celldone. The callback takes the removed cell ids.
+# out-of-band registry as the others. The callback takes the removed cell ids.
 const _CLEANUP_CELLS_REGISTRY = Dict{String,Any}()
 register_cleanup_cells!(report_id::AbstractString, cb) = _reg_set!(_CLEANUP_CELLS_REGISTRY, report_id, cb)
 unregister_cleanup_cells!(report_id::AbstractString) = _reg_del!(_CLEANUP_CELLS_REGISTRY, report_id)
@@ -1408,7 +1392,10 @@ function eval_cell!(report::Report, cell::Cell, kernel::Kernel = InProcessKernel
     end
     # Bind cells are ordinary code now: `@bind x W(…)` runs, assigns `x`, and reports
     # its control through the capture channel (`output.binds`). No special path.
-    mark_running!(cell)
+    # A caller that already started the run (the hub's runner) ends it; otherwise this call owns it.
+    owned = cell.run === nothing
+    run = owned ? begin_run!(cell) : cell.run
+    run.phase = :dispatched; run.dispatched = time()
     _emit_progress(report.id, cell)   # announce: this cell is now running (live status stream)
     # `trace` flag: wrap the source in `@trace begin … end` so eval returns a SlateTrace of
     # inline values (the cell's normal output is replaced by the trace table). Dependency
@@ -1429,7 +1416,11 @@ function eval_cell!(report::Report, cell::Cell, kernel::Kernel = InProcessKernel
             # `cache` tag: a pipeline stage whose result must persist REGARDLESS of runtime — the
             # explicit opposite of `nocache` (auto-caching only catches cells over the threshold).
             always = (:cache in cell.flags))
-    out = eval_capture(kernel, report, src, "cell:" * cell.id, memo)
+    out = try
+        with_run_id(() -> eval_capture(kernel, report, src, "cell:" * cell.id, memo), run.id)
+    finally
+        owned && end_run!(cell, run)
+    end
     mark_result!(cell, out)
     cell.binds = out.binds
     _emit_progress(report.id, cell)   # announce: finished (the result/error can light up immediately)

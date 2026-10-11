@@ -176,38 +176,25 @@ end
 
 @testset "a reactive push during a run isn't lost" begin
     RE = KaimonSlate.ReportEngine
-    # The hazard, in the two lines that matter: a cell is RUNNING, a reactive value it reads
-    # changes, and the run then finishes. `mark_result!` marks it FRESH — silently discarding the
-    # STALE that the push set mid-run — and since the push has already been and gone, nothing ever
-    # restales it again. The cell keeps output computed from values that have since moved.
-    #
-    # In the app this showed up as a progress bar that never cleared: a handler writes several
-    # reactives in a burst (`msg[]`, `result[]`, `busy[] = false`) and the LAST one — the one that
-    # clears the flag — is the one most likely to land while the status cell is still running.
-    c = RE.Cell("status", RE.CODE, "busy[]")
-    RE.mark_running!(c)
-    @test c.state == RE.RUNNING
+    # A handler writes several reactives in a burst, and the last write can land while a cell reading
+    # it is still running. The run's result is computed from the earlier value, so the cell must come
+    # back STALE after it settles, keeping that result on screen until the rerun lands.
+    nb = NS.LiveNotebook("rr", "/tmp/rr.jl", RE.parse_report("#%% code id=status\nbusy[]\n"; title = "rr"),
+        RE.InProcessKernel(), 1, String[], String[], ReentrantLock(), Channel{String}[],
+        ReentrantLock(), "", false, Dict{String,String}())
+    c = nb.report.cells[1]
+    run = RE.begin_run!(c)
+    @test RE.shown_state(c) == RE.RUNNING
+    RE.restale!(c)                                   # the push
+    @test run.rerun
+    out = RE.CellOutput("", RE.MimeChunk[], Any[], Any[], RE.BindSpec[], "true", nothing, nothing, 0.0)
+    NS._settle!(x -> RE.mark_result!(x, out), nb, "status", run)
+    @test c.state == RE.STALE && c.run === nothing && c.output !== nothing
 
-    # What a reactive push does to a RUNNING cell.
-    RE.restale!(c)
-    @test c.state == RE.STALE
-
-    # …and what the run's completion did to it before this fix.
-    RE.mark_result!(c, nothing)
-    @test c.state == RE.FRESH        # ← the STALE above is gone, and nothing will set it again
-
-    # The fix keeps the result but restores STALE, so the runner comes back to it. (`_eval_one!`
-    # does exactly this when the cell id is in `_DIRTY_WHILE_RUNNING`.)
-    RE.restale!(c)
-    @test c.state == RE.STALE
-
-    # The marker is per notebook and consumed once — a re-run must not loop forever.
-    empty!(NS._DIRTY_WHILE_RUNNING)
-    s = get!(Set{String}, NS._DIRTY_WHILE_RUNNING, "nb1")
-    push!(s, "status")
-    @test pop!(s, "status", nothing) !== nothing     # first completion re-runs it…
-    @test pop!(s, "status", nothing) === nothing     # …the second doesn't
-    empty!(NS._DIRTY_WHILE_RUNNING)
+    # The rerun settles FRESH: the mark is consumed with the run that carried it.
+    run2 = RE.begin_run!(c)
+    NS._settle!(x -> RE.mark_result!(x, nothing), nb, "status", run2)
+    @test c.state == RE.FRESH
 end
 
 # An app is BUILT by copying the notebook into the bundle, so it is always a copy of its source and

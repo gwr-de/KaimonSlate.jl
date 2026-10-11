@@ -900,7 +900,7 @@ _ctx_save_asset(name, data; mime = "", dtype = nothing) =
 
 # ── Stopping a running cell ──────────────────────────────────────────────────
 # Julia cannot interrupt a task that is running on another thread, so a stop is asked of the cell
-# rather than forced on it. Each running cell has a stop flag, by cell id: Stop sets it, and the cell
+# rather than forced on it. Each running cell has a stop flag, by run id: Stop sets it, and the cell
 # ends at its next `slate_checkpoint()`, progress report or log record. The flag is a scoped value
 # around the cell's run, so the tasks the cell starts (`@threads`, `@spawn`) see it too.
 const _STOP_FLAG = Base.ScopedValues.ScopedValue{Union{Nothing,Threads.Atomic{Bool}}}(nothing)
@@ -920,7 +920,7 @@ end
 const _CELL_STOPS = Dict{String,Threads.Atomic{Bool}}()
 const _CELL_STOPS_LOCK = ReentrantLock()
 
-"Ask the running cells `ids` to stop. Returns how many of them were running."
+"Ask the runs `ids` (run ids; a cell id for an eval outside a run) to stop. Returns how many of them were running."
 function request_stop!(ids)
     lock(_CELL_STOPS_LOCK) do
         n = 0
@@ -938,7 +938,7 @@ _is_interrupt(e) = e isa InterruptException ||
     (e isa CompositeException && !isempty(e.exceptions) && all(_is_interrupt, e.exceptions)) ||
     (e isa LoadError && _is_interrupt(e.error))
 
-"The cells running now (those with a stop flag)."
+"The runs in flight now (those with a stop flag), by run id."
 stoppable_cells() = lock(() -> collect(keys(_CELL_STOPS)), _CELL_STOPS_LOCK)
 
 # Interrupt task `t` once it is waiting: parked on one wait queue (a sleep, a socket, a long GPU
@@ -969,7 +969,8 @@ function interrupt_when_parked!(t::Task; steady::Float64 = 0.2, within::Float64 
 end
 
 function run_capture(mod::Module, source::AbstractString, filename::AbstractString = "string";
-                     capture::OutputCapture = RedirectCapture(), slate_ctx = nothing)
+                     capture::OutputCapture = RedirectCapture(), slate_ctx = nothing,
+                     stop_key::Union{Nothing,String} = nothing)
     chunks = Tuple{String,Vector{UInt8}}[]
     # Begin output capture (stdout/stderr + display) via the strategy: process-global redirect for the
     # in-process/serial kernel, or task-local demux for the worker's parallel evaluators. The strategy
@@ -1021,8 +1022,12 @@ function run_capture(mod::Module, source::AbstractString, filename::AbstractStri
     # BEFORE the buffers are consumed, so the last thing the page sees is the real result, never a
     # half-sampled frame that arrived after it.
     outwatch = _start_cellout(capture, _cellout_sink(mod), cid)
+    # The stop flag is registered under the run this eval belongs to (`:slate_run_id`, set by whoever
+    # dispatched it), else under the cell. `stop_key = ""` registers none: a re-render of a live output
+    # is not a run, and must not take over the flag of the cell's run in flight.
+    skey = something(stop_key, String(get(task_local_storage(), :slate_run_id, cid)))
     stop = Threads.Atomic{Bool}(false)
-    lock(() -> (_CELL_STOPS[cid] = stop), _CELL_STOPS_LOCK)
+    isempty(skey) || lock(() -> (_CELL_STOPS[skey] = stop), _CELL_STOPS_LOCK)
     t0 = time_ns()
     try
         # ConsoleLogger on the captured stderr (`_logio`), so @warn/@info/@error land in this cell's
@@ -1038,7 +1043,7 @@ function run_capture(mod::Module, source::AbstractString, filename::AbstractStri
         err = e
         btrace = catch_backtrace()
     finally
-        lock(() -> (get(_CELL_STOPS, cid, nothing) === stop && delete!(_CELL_STOPS, cid)), _CELL_STOPS_LOCK)
+        isempty(skey) || lock(() -> (get(_CELL_STOPS, skey, nothing) === stop && delete!(_CELL_STOPS, skey)), _CELL_STOPS_LOCK)
         _stop_cellout(outwatch)
         raw_out, raw_err = _finish_capture!(capture)
         slate_ctx === nothing || delete!(task_local_storage(), :slate_ctx)   # never outlive this eval
@@ -1242,7 +1247,7 @@ function rerender_live_outputs(mod::Module)
     outs = Tuple{String,Vector{Tuple{String,Vector{UInt8}}},Vector{Any}}[]
     for (cid, spec) in lock(() -> collect(_LIVE_OUTPUTS), _LIVE_OUTPUTS_LOCK)
         w = try
-            run_capture(mod, spec.source, spec.filename; capture = DemuxCapture(), slate_ctx = ctx)
+            run_capture(mod, spec.source, spec.filename; capture = DemuxCapture(), slate_ctx = ctx, stop_key = "")
         catch
             nothing
         end

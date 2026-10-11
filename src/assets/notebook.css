@@ -704,6 +704,11 @@ body.app .appfail .appfailjump:hover { color:var(--text); border-color:var(--acc
    matches, so a notebook waiting on a cluster node does not read as a notebook full of errors. */
 .cell.state-blocked .badge { color:var(--gold); }
 .cell.state-blocked { border-left-color:var(--gold); }
+/* STOPPED: someone stopped it. Not a failure, and not work still to come either: it waits for a run
+   asked of it. Muted, so a stopped notebook does not read as broken or as busy. */
+.cell.state-stopped .badge { color:var(--muted); }
+.cell.state-stopped { border-left-color:var(--muted); }
+.cell.state-stopped .output .err { color:var(--muted); background:none; }
 /* A waiting cell's region chip: the same pill in the same place, gold, with the status after the
    region name. Only the status word lives here — the explanation is in the hover panel. */
 .cregion.blocked { color:var(--gold) !important; border-color:rgba(210,168,80,.55) !important;

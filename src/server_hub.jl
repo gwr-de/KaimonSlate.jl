@@ -63,7 +63,7 @@ function _notebooks_json(h::Hub)
              "md" => count(c -> c.kind == MARKDOWN, cs),
              "errors" => count(c -> c.state == ERRORED, cs),
              "stale" => count(c -> c.state == STALE, cs),
-             "running" => count(c -> c.state == RUNNING, cs),
+             "running" => count(is_running, cs),
              "binds" => sum(c -> length(c.binds), cs; init = 0),
              "compute_ms" => sum(c -> c.output === nothing ? 0.0 : c.output.duration_ms, cs; init = 0.0),
              "mtime" => _file_mtime(nb.path),

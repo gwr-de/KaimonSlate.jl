@@ -63,7 +63,8 @@ end
 @testset "a cell's revision advances on every pushed change" begin
     c = RE.Cell("c", RE.CODE, "1+1")
     r0 = c.rev
-    RE.mark_running!(c);          r1 = c.rev
+    run = RE.begin_run!(c);       r1 = c.rev
+    RE.end_run!(c, run)
     RE.mark_result!(c, nothing);  r2 = c.rev
     RE.restale!(c);               r3 = c.rev
     @test r1 > r0 && r2 > r1 && r3 > r2
@@ -118,7 +119,7 @@ end
 
     # Every other transition clears the reason, so it can never outlive the wait it describes —
     # including `restale!`, which is how the placement task re-arms the cell once a node lands.
-    for step in (RE.restale!, RE.mark_running!, RE.mark_fresh!,
+    for step in (RE.restale!, x -> RE.end_run!(x, RE.begin_run!(x)), RE.mark_fresh!,
                  x -> RE.mark_result!(x, nothing), x -> RE.mark_errored!(x, "boom"))
         RE.mark_blocked!(c, "waiting", "somehost")
         @test c.blocked == "waiting" && c.blocked_at > 0

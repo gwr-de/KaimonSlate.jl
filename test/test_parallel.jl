@@ -101,9 +101,11 @@ cell(src) = RE.Cell("c", RE.CODE, src)
     end
 
     @testset "_preempt_victims: only running pure-compute cells are interruptible" begin
-        running(src) = (c = cell(src); c.state = RE.RUNNING; c)
+        running(src) = (c = cell(src); RE.begin_run!(c).phase = :dispatched; c)
         # a running compute cell is a victim; the guards must hold everything else back
-        @test NS._preempt_victims((running("x = sum(rand(10^8))"),)) == ["c"]
+        @test [c.id for c in NS._preempt_victims((running("x = sum(rand(10^8))"),))] == ["c"]
+        # one still being prepared has nothing on a worker to stop
+        @test (c = cell("x = sum(rand(10^8))"); RE.begin_run!(c); isempty(NS._preempt_victims((c,))))
         @test isempty(NS._preempt_victims((cell("x = 1"),)))                       # not running
         @test isempty(NS._preempt_victims((running("f(x) = x + 1"),)))             # method def — never
         @test isempty(NS._preempt_victims((running("struct S; a; end"),)))         # type def — never

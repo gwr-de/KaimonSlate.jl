@@ -635,7 +635,7 @@ function _cell_view(cell::Cell)
     o = cell.output
     chunks = o === nothing ? MimeChunk[] : o.display
     return (kind    = "code",
-            state   = lowercase(string(cell.state)),
+            state   = lowercase(string(shown_state(cell))),
             source  = cell.source,
             stdout  = o === nothing ? "" : o.stdout,
             # suppress the text/plain value repr when richer output is present

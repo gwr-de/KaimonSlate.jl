@@ -805,38 +805,98 @@ function _set_frozen_stamp!(c::Cell, stamp::AbstractString)
     return c
 end
 
-# Shared guard for every upstream-change cascade (source edit, bind push, asset watcher, force-run,
-# reorder): a locked cell holding a FRESH frozen result stays put — only its OWN ▶ may restale it.
+# Shared guard for every upstream-change cascade (source edit, bind push, asset watcher, reorder,
+# a replaced namespace): the cell needs computing again. Two cells stay put — a locked cell holding a
+# FRESH frozen result (only its OWN ▶ may restale it) and a STOPPED one (only a run asked for it may
+# run it; see `request_run!`). A cell with a run in flight keeps the run and is marked to run again
+# when it ends, since the result it is computing answers inputs that have since changed.
 # Returns whether the cell was actually restaled, so callers can track which cells changed.
 function restale!(c::Cell)
     (:locked in c.flags && c.state == FRESH) && return false
+    c.state == STOPPED && return false
+    c.run === nothing || (c.run.rerun = true)
     _unblock!(c)            # whatever it was waiting for, it is being given another go
     c.state = STALE
     bump_rev!(c)
     return true
 end
 
-# Unconditional wipe — a fresh/replaced process has NOTHING established, so every code cell
-# (including locked ones) must go STALE with its in-memory output dropped. Bypasses `restale!`'s
-# locked guard on purpose: the caller (a full kernel reset) is responsible for reconciling locked
-# cells back to FRESH afterward (`_self_heal_locked!`), same as `restart_kernel!` already does.
+# A run someone asked for (run all, an agent's run): a stopped cell runs again too. Everything else
+# about it is `restale!`'s, so a locked cell holding its frozen result stays put.
+function request_run!(c::Cell)
+    c.state == STOPPED && (c.state = STALE)
+    return restale!(c)
+end
+
+# A run asked of THIS cell (its own ▶, re-running everything): it goes stale whatever it is, locked
+# or stopped included. A run in flight is marked to run again when it ends.
+function force_stale!(c::Cell)
+    c.run === nothing || (c.run.rerun = true)
+    _unblock!(c)
+    c.state = STALE
+    bump_rev!(c)
+    return true
+end
+
+# Unconditional wipe — a fresh/replaced process has NOTHING established, so every cell (including
+# locked ones) must go STALE with its in-memory output dropped. Bypasses `restale!`'s locked guard on
+# purpose: the caller (a full kernel reset) is responsible for reconciling locked cells back to FRESH
+# afterward (`_self_heal_locked!`), same as `restart_kernel!` already does. A STOPPED cell stays
+# stopped, with what its run printed: a restart is not a request to run it.
 function reset_all!(report::Report)
     for c in report.cells
+        c.state == STOPPED && continue
+        _unblock!(c)
         c.state = STALE
         c.output = nothing
+        bump_rev!(c)
     end
     return report
 end
 
-# A cell caught mid-run when something invalidated it (an orphaned worker eval, a source edit
-# racing its own in-flight run, a bring-up failure) snaps back to STALE so it gets picked up again —
-# but only if it's genuinely still RUNNING; a cell that already finished (FRESH/ERRORED) or was never
-# started (STALE) is left alone. Returns whether it actually reverted.
-function revert_running!(c::Cell)
-    c.state == RUNNING || return false
-    c.state = STALE
+# ── Runs ────────────────────────────────────────────────────────────────────────────────────────
+# Run ids are unique across hub processes: a worker that outlives the hub can still be computing a
+# run when a new hub starts numbering its own.
+const _RUN_SEQ = Threads.Atomic{Int}(0)
+const _RUN_PREFIX = Ref("")
+function _new_run_id()
+    isempty(_RUN_PREFIX[]) && (_RUN_PREFIX[] = string(round(Int, time() * 1000); base = 36))
+    return "r" * _RUN_PREFIX[] * "-" * string(Threads.atomic_add!(_RUN_SEQ, 1) + 1; base = 36)
+end
+
+# The run an evaluation belongs to travels with the task that dispatches it, so every kernel can pass it
+# on (a gate worker keys its running evals and their stop flags by it) without a new argument on every
+# `eval_capture` method. Evaluations outside a run (a namespace prime, a scratch eval) carry none.
+with_run_id(f, id::AbstractString) = task_local_storage(f, :slate_run_id, String(id))
+current_run_id() = String(get(task_local_storage(), :slate_run_id, ""))
+
+"Whether a computation of `c` is in flight."
+is_running(c::Cell) = c.run !== nothing
+
+"The state to show for `c`: RUNNING while a run is in flight, else its stored state."
+shown_state(c::Cell) = c.run === nothing ? c.state : RUNNING
+
+# Start a run of `c` (the caller holds the notebook lock and has checked none is in flight).
+function begin_run!(c::Cell)
+    c.run === nothing || error("cell $(c.id) is already running")
+    _unblock!(c)
+    c.run = Run(_new_run_id(), c.src_hash, "", :preparing, false, 0.0, time(), 0.0, nothing, 0, 0)
+    bump_rev!(c)
+    return c.run
+end
+
+# End `run` on `c` if it is still the cell's run. Returns whether it was. The cell's state is left as
+# the caller set it.
+function end_run!(c::Cell, run::Run)
+    c.run === run || return false
+    c.run = nothing
+    bump_rev!(c)
     return true
 end
+
+# A run that was stopped: it keeps what it printed (the output carries the stop) and waits for a run
+# asked of it.
+mark_stopped!(c::Cell, out) = (_unblock!(c); c.output = out; c.state = STOPPED; bump_rev!(c))
 
 # Every change worth pushing gets a new stamp, from ONE process-wide counter.
 #
@@ -863,8 +923,6 @@ end
 # Drop the wait: the reason AND the clock behind it. Called by every transition out of BLOCKED, so
 # a stale "waiting 40m" can never sit on a cell that has since run.
 _unblock!(c::Cell) = (c.blocked = ""; c.blocked_host = ""; c.blocked_region = ""; c.blocked_at = 0.0; c)
-
-mark_running!(c::Cell) = (_unblock!(c); c.state = RUNNING; bump_rev!(c))
 
 # A state flip with no output involved (markdown render, `@bind` value change, a fresh empty
 # cell) — nothing to compute, so no exception to check.
@@ -1178,14 +1236,22 @@ function update_source!(report::Report, new_source::AbstractString)
     changed = Set{String}()
     for nc in newr.cells
         oc = get(old_by_id, nc.id, nothing)
+        # A run in flight belongs to the cell id, edited or not: the runner settles it on whatever
+        # object holds the id when it ends, and a run for source that has since changed is dropped there.
+        oc === nothing || (nc.run = oc.run; nc.rev = oc.rev)
         if oc !== nothing && oc.src_hash == nc.src_hash
             nc.output = oc.output         # carry cached result forward
             nc.state = oc.state
             nc.deps = oc.deps
             nc.binds = oc.binds           # preserve live widget values
             nc.interp = oc.interp         # carry resolved md interpolations forward
+            nc.blocked = oc.blocked       # …and a wait, with what it waits for and since when
+            nc.blocked_at = oc.blocked_at
+            nc.blocked_host = oc.blocked_host
+            nc.blocked_region = oc.blocked_region
         else
             nc.state = STALE
+            nc.run === nothing || (nc.run.rerun = true)   # whatever the old source's run ends in, this one runs
             push!(changed, nc.id)         # new or edited
         end
     end

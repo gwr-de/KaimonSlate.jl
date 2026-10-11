@@ -71,7 +71,7 @@ function _schedule_live_rerender!(nb::LiveNotebook)
 end
 
 # The immortal per-notebook debouncer: wait for the first connect of a burst, sleep out the burst, drain
-# the rest, then re-render once and deliver each live output via `server_celldone`. Loops until the mailbox
+# the rest, then re-render once and deliver each live output via `apply_live_rerender!`. Loops until the mailbox
 # is closed (notebook teardown). Any error is logged and the loop continues — one bad re-render never stops
 # future ones. `rerender_live` no-ops without a live worker and carries its own gate timeout, so a down or
 # slow worker can't hang this loop indefinitely.
@@ -82,7 +82,7 @@ function _run_live_rerender_loop!(nb::LiveNotebook, ch::Channel{Nothing})
             sleep(_LIVE_RERENDER_DEBOUNCE)         # let a reload burst settle to the final page
             while isready(ch); take!(ch); end      # coalesce the rest of the burst into this one pass
             for (cid, wire) in ReportEngine.rerender_live(nb.kernel, nb.report)
-                try; server_celldone(nb, "reconnect", cid, wire); catch; end
+                try; apply_live_rerender!(nb, cid, wire); catch; end
             end
         catch e
             e isa InvalidStateException && break    # mailbox closed → notebook closing → end the task

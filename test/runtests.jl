@@ -58,6 +58,7 @@ module LiveOutput; include("test_live_output.jl"); end
 module Tables;    include("test_tables.jl");    end
 module Trace;     include("test_trace.jl");     end
 module Complete;  include("test_complete.jl");  end
+module RunRecord; include("test_runrecord.jl"); end
 module Debugger;  include("test_debugger.jl");  end
 module Profiler;  include("test_profile.jl");   end
 module Specialist;include("test_specialist.jl");end
@@ -93,7 +94,7 @@ const _TESTMODS = (Defname, Prepare, Demux, Termcook, SharedInc, Parsched, Memos
                    Batchsweep, Transfer, SyncDictT, Dataset, TablesInc, Jobcell, FormatT, Effectstore,
                    Blobchannel, RemotePool, Regions, Machines, SlateDiagT, Parallel, Animation, Echarts, SlateLook,
                    Engine, Eval, Deps, Envprep, Gateauth, SshTransportT, Tools, Registry, Toolcell, Web,
-                   Bind, ReactiveState, Render, LiveOutput, Tables, Trace, Complete, History, SlateApi,
+                   Bind, ReactiveState, Render, LiveOutput, Tables, Trace, Complete, RunRecord, History, SlateApi,
                    Agentops, Repro, Slides, Debugger, Profiler, Specialist, Findings, ToolDocs, AppRender,
                    Frontmatter, Export, Bootfail, Publishing, App, AppMode, Workbook, Extensions, CatalogT, AssetsSyntax, Files, Config, WscallBinary, WsOrder, BindObs, RecordDisplay)
 

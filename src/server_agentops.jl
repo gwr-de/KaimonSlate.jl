@@ -302,7 +302,7 @@ const _READTOK = Dict{String,Tuple{Vector{String},Dict{String,String}}}()   # "n
 const _READTOK_LOCK = ReentrantLock()
 # A cell's content hash for delta detection — source AND result/state, so a re-run (new output) counts.
 _cell_state_hash(c::Cell) = string(hash((c.kind, c.source,
-                                         c.kind == CODE ? _cell_result_text(c) : "", c.state)); base = 16)
+                                         c.kind == CODE ? _cell_result_text(c) : "", shown_state(c))); base = 16)
 function _read_token!(nbid, order, hashes)
     tok = string(hash(join((string(id, ':', hashes[id]) for id in order), '\n')); base = 16)[1:12]
     lock(_READTOK_LOCK) do
@@ -318,7 +318,7 @@ _trunc(s, n::Int) = (t = String(s); length(t) <= n ? t : first(t, n) * "…")
 # FULL content of a cell — source + result.
 function _print_cell!(io::IO, c::Cell)
     print(io, "\n\n### id=", c.id, "  [", ReportEngine._kind_token(c.kind), ", ",
-          lowercase(string(c.state)), "]\n")
+          lowercase(string(shown_state(c))), "]\n")
     print(io, rstrip(c.source))
     ReportEngine.is_code_kind(c.kind) &&
         print(io, "\n→ ", replace(_cell_result_text(c), "\n" => "\n  "))
@@ -328,7 +328,7 @@ end
 # the md heading). Keeps a big notebook's read small; the agent drills into specific cells from here.
 function _outline_cell!(io::IO, c::Cell)
     print(io, "\nid=", rpad(c.id, 16), " [", ReportEngine._kind_token(c.kind), ",",
-          lowercase(string(c.state)), "]")
+          lowercase(string(shown_state(c))), "]")
     tags = sort!(String[string(f) for f in c.flags if f !== :opaque])   # user tags (not the inferred :opaque)
     isempty(tags) || print(io, " {", join(tags, " "), "}")
     if c.kind == MARKDOWN
@@ -455,7 +455,7 @@ function cell_inspect(nb::LiveNotebook, cellid::AbstractString)
         c = nb.report.cells[idx]
         io = IOBuffer()
         println(io, "Cell '", c.id, "' in '", nb.id, "' — ", ReportEngine._kind_token(c.kind), ", ",
-                lowercase(string(c.state)),
+                lowercase(string(shown_state(c))),
                 " — position ", idx, "/", length(nb.report.cells), " — v", nb.version)
         if ReportEngine.is_code_kind(c.kind)
             isempty(c.reads)  || println(io, "reads:    ", join(sort(string.(collect(c.reads))), ", "))
@@ -552,7 +552,7 @@ function agent_scratch_eval!(nb::LiveNotebook, source::AbstractString;
     memo = isempty(memo_key) ? nothing :
         (; key = String(memo_key), names = collect(String, memo_names), threshold = Float64(memo_threshold))
     cell = Cell(_scratch_id(), CODE, String(source))   # display the ORIGINAL source, not the let-wrap
-    ReportEngine.mark_running!(cell)
+    run = ReportEngine.begin_run!(cell)                 # shown running in the panel until it settles
     _push_scratch!(nb, cell)                            # surface it immediately (running) in the panel
     out = try
         lock(_eval_mutex(nb)) do
@@ -562,6 +562,7 @@ function agent_scratch_eval!(nb::LiveNotebook, source::AbstractString;
         why = e isa RegionWaiting ? _region_wait_text(e) : first(sprint(showerror, e), 300)
         ReportEngine.CellOutput("", ReportEngine.MimeChunk[], Any[], Any[], ReportEngine.BindSpec[], "", why, nothing, 0.0)
     end
+    ReportEngine.end_run!(cell, run)
     ReportEngine.mark_result!(cell, out)
     _broadcast_scratch(nb, cell)                        # push the finished cell (result / error)
     return _output_result_text(out)
@@ -738,7 +739,7 @@ function _force_locked!(nb::LiveNotebook, id::AbstractString; self::Bool = false
                           push!(_upstream_closure(nb.report, String(id)), String(id))
     n = 0
     for c in nb.report.cells
-        (c.id in reach && :locked in c.flags && c.state != RUNNING) || continue
+        (c.id in reach && :locked in c.flags && !is_running(c)) || continue
         (c.state != FRESH || (self && c.id == id)) || continue
         ReportEngine.restale!(c)
         push!(frc, c.id)
@@ -875,7 +876,7 @@ answer) and this returns `false`.
 """
 function _force_cell!(nb::LiveNotebook, id::AbstractString)
     i = findfirst(c -> c.id == id, nb.report.cells)
-    (i === nothing || nb.report.cells[i].state == RUNNING) && return false
+    (i === nothing || is_running(nb.report.cells[i])) && return false
     frc = get!(Set{String}, _FORCE_RUN, nb.id)
     for did in dependents_of(nb.report, Set([String(id)]))   # closure includes `id` itself
         j = findfirst(c -> c.id == did, nb.report.cells)
@@ -884,7 +885,7 @@ function _force_cell!(nb::LiveNotebook, id::AbstractString)
         # A locked dependent stays frozen against this cascade too — only its OWN
         # ▶ (did == id) may re-run it, so the played cell itself bypasses the guard.
         # One with nothing frozen yet is re-run unforced, so it only restores.
-        ok = did == id ? (c.state = STALE; true) : ReportEngine.restale!(c)
+        ok = did == id ? ReportEngine.force_stale!(c) : ReportEngine.restale!(c)
         ok || continue
         (did == id || !(:locked in c.flags)) && push!(frc, String(did))
     end
@@ -893,13 +894,15 @@ end
 
 # What a run of the whole notebook left behind: the cells still waiting and what on, and how many failed.
 function _drain_text(nb::LiveNotebook)
-    waiting, failed = lock(nb.lock) do
+    waiting, failed, stopped = lock(nb.lock) do
         ([(c.id, _cell_result_text(c)) for c in nb.report.cells if c.state == BLOCKED],
-         [c.id for c in nb.report.cells if c.state == ERRORED])
+         [c.id for c in nb.report.cells if c.state == ERRORED],
+         [c.id for c in nb.report.cells if c.state == STOPPED])
     end
-    isempty(waiting) && isempty(failed) && return "ran stale cells; notebook is up to date"
+    isempty(waiting) && isempty(failed) && isempty(stopped) && return "ran stale cells; notebook is up to date"
     out = "ran stale cells"
     isempty(failed) || (out *= "; $(length(failed)) failed: " * join(failed, ", "))
+    isempty(stopped) || (out *= "; $(length(stopped)) stopped: " * join(stopped, ", "))
     isempty(waiting) || (out *= "; $(length(waiting)) waiting:\n" * join(("  $i $why" for (i, why) in waiting), "\n"))
     return out
 end
@@ -1219,7 +1222,7 @@ function set_cell_flag!(nb::LiveNotebook, flag::Symbol, value::Bool; ids::Union{
             _flag_skips(flag, c.kind) && continue
             (flag in c.flags) == value && continue           # already in the wanted state → skip
             value ? push!(c.flags, flag) : delete!(c.flags, flag)
-            restale && (c.state = STALE)
+            restale && ReportEngine.force_stale!(c)
             push!(changed, c.id)
         end
         isempty(changed) && return false

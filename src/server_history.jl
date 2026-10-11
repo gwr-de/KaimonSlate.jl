@@ -237,7 +237,7 @@ function notebook_pkg_op!(nb::LiveNotebook, op::AbstractString, name::AbstractSt
     end
     if get(r, "ok", false) === true                  # env changed → re-run so `using` cells pick it up
         @report_op nb report begin
-            for c in report.cells; c.kind == CODE && (c.state = STALE); end
+            for c in report.cells; c.kind == CODE && c.state != STOPPED && ReportEngine.force_stale!(c); end
         end
         _eval!(nb)                                   # non-blocking; the runner drains the restaled cells
         _refresh_env_meta!(nb)                       # sync the .jl footer (itself round-trips off-lock)
@@ -1004,7 +1004,7 @@ function cell_json(c::Cell, bindref::Dict{String,Tuple{Cell,BindSpec}} = Dict{St
         # Canonical per-cell content hash (the SAME SHA the history uses) — a version token the browser
         # keys reconcile off, instead of a fuzzy string comparison that can drift.
         "hash"    => SlateHistory._sha(c.source),
-        "state"   => lowercase(string(c.state)),
+        "state"   => lowercase(string(shown_state(c))),
         # Why a BLOCKED cell cannot run yet — for the header, NOT the output area. A CODE the page
         # words itself, with the host it is about; "" when the cell is not blocked, so the browser
         # can key on the string alone. `blocked_at` is when the wait started, so the page can count
@@ -1844,7 +1844,7 @@ function edit_cell!(nb::LiveNotebook, id::AbstractString, source::AbstractString
         # restales dependents when the SOURCE changed, so on an unchanged force-run we do it explicitly.
         # A ▶ on a cell already running its current code asks for the run in flight, not a second one
         # queued behind it.
-        if force && !(cells[idx].state == RUNNING && !changed)
+        if force && !(is_running(cells[idx]) && !changed)
             i = findfirst(c -> c.id == id, nb.report.cells)
             if i !== nothing
                 frc = get!(Set{String}, _FORCE_RUN, nb.id)
@@ -1854,7 +1854,7 @@ function edit_cell!(nb::LiveNotebook, id::AbstractString, source::AbstractString
                     c = nb.report.cells[j]
                     # A locked dependent stays frozen against this cascade too — only its OWN
                     # ▶ (did == id) may re-run it, so the played cell itself bypasses the guard.
-                    ok = did == id ? (c.state = STALE; true) : ReportEngine.restale!(c)
+                    ok = did == id ? ReportEngine.force_stale!(c) : ReportEngine.restale!(c)
                     ok || continue
                     # ▶ means "actually re-evaluate" — for the WHOLE cascade, not just this cell.
                     # The memo key digests upstream SOURCES, so if the played cell is impure (a data

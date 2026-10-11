@@ -409,35 +409,35 @@ end
             end
 
             @testset "stop reaches every worker with a cell running" begin
-                # A region cell runs in its region's worker: the stop goes there as well as to the main
-                # kernel. A region with no kernel has nothing running; a cell not running is left alone.
+                # Each dispatched run is asked to stop on the kernel it was handed to, by its run id. A
+                # run still being prepared has nothing on a worker, and a cell not running is left alone.
                 rep = RE.parse_report("#%% code id=a\nsleep(1)\n#%% code id=g region=gpu\nsleep(1)\n" *
                                       "#%% code id=h region=gpu\n1\n#%% code id=z region=cpu\nsleep(1)\n")
                 RE.build_dependencies!(rep)
                 nb = NS.LiveNotebook("stopall", joinpath(mktempdir(), "stopall.jl"), rep, RE.InProcessKernel(), 1,
                                      String[], String[], ReentrantLock(), Channel{String}[],
                                      ReentrantLock(), "", false, Dict{String,String}())
-                for c in rep.cells; c.state = c.id == "h" ? RE.FRESH : RE.RUNNING; end
-                lock(NS._REGION_LOCK) do; NS._REGION_KERNELS[("stopall", "gpu")] = :gpu_kernel; end
-                try
-                    running = lock(nb.lock) do; NS._running_kernels(nb); end
-                    @test [(side, ids) for (side, _, ids) in running] == [("", ["a"]), ("gpu", ["g"])]
-                    asked = Any[]
-                    NS.cancel_run!(nb; cancel = (k, ids) -> (push!(asked, (k, ids)); k === :gpu_kernel ? 1 : -1))
-                    @test length(asked) == 2 && asked[1][1] isa RE.InProcessKernel && asked[2] == (:gpu_kernel, ["g"])
-                    # The worker that answered shows the stop as pending until its cell ends; the one that
-                    # did not answer shows none.
-                    @test NS._stop_pending(nb, "gpu")[2] == ["g"] && NS._stop_pending(nb, "") === nothing
-                    rep.cells[2].state = RE.FRESH
-                    @test NS._stop_pending(nb, "gpu") === nothing
-                    @test !haskey(NS._STOP_ASKED, ("stopall", "gpu"))
-                    # With nothing running, a stop asks nothing of any worker (and restarts none).
-                    for c in rep.cells; c.state = RE.FRESH; end
-                    empty!(asked)
-                    @test NS.cancel_run!(nb; cancel = (k, ids) -> (push!(asked, k); 1)) === nb && isempty(asked)
-                finally
-                    lock(NS._REGION_LOCK) do; delete!(NS._REGION_KERNELS, ("stopall", "gpu")); end
+                function dispatched(c, side, k)
+                    r = RE.begin_run!(c)
+                    r.phase = :dispatched; r.side = side; r.kernel = k
+                    r
                 end
+                ra = dispatched(rep.cells[1], "", nb.kernel)
+                rg = dispatched(rep.cells[2], "gpu", :gpu_kernel)
+                rz = RE.begin_run!(rep.cells[4]); rz.side = "cpu"
+                asked = Any[]
+                NS.cancel_run!(nb; cancel = (k, ids) -> (push!(asked, (k, ids)); k === :gpu_kernel ? 1 : -1))
+                @test nb.halted
+                @test Set(asked) == Set([(nb.kernel, [ra.id]), (:gpu_kernel, [rg.id])])
+                @test all(r -> r.stop_at > 0, (ra, rg, rz))
+                # The stop shows as pending on its side until the run ends, whether the worker answered or not.
+                @test NS._stop_pending(nb, "gpu")[2] == ["g"] && NS._stop_pending(nb, "")[2] == ["a"]
+                RE.end_run!(rep.cells[2], rg)
+                @test NS._stop_pending(nb, "gpu") === nothing
+                # With nothing running, a stop asks nothing of any worker (and restarts none).
+                RE.end_run!(rep.cells[1], ra); RE.end_run!(rep.cells[4], rz)
+                empty!(asked)
+                @test NS.cancel_run!(nb; cancel = (k, ids) -> (push!(asked, k); 1)) === nb && isempty(asked)
             end
 
             @testset "a new allocation on the same node rebuilds the region kernel" begin
@@ -897,10 +897,10 @@ end
                                      ReentrantLock(), "", false, Dict{String,String}())
                 nb.closed = true
                 c = only(rep.cells)
-                RE.mark_running!(c)
+                RE.begin_run!(c)
                 try
                     NS.edit_cell!(nb, "r", c.source; force = true, run = false)
-                    @test c.state == RE.RUNNING && !("r" in get(NS._FORCE_RUN, "rerun", Set{String}()))
+                    @test RE.is_running(c) && !("r" in get(NS._FORCE_RUN, "rerun", Set{String}()))
                 finally
                     delete!(NS._FORCE_RUN, "rerun")
                 end
@@ -1018,19 +1018,19 @@ end
                 # A worker not connected yet still has its bring-up ahead; an in-process kernel has none.
                 @test NS._region_bringup_pending(nb, nb.kernel)
                 @test !NS._region_bringup_pending(nb, RE.InProcessKernel())
-                c.state = RE.RUNNING
-                NS._RUN_SINCE[(nb.id, "c")] = time() - 60
+                run = RE.begin_run!(c)
+                run.phase = :dispatched; run.side = "gpu"; run.dispatched = time() - 60
                 sweep!(answered, asked) = (NS._LAST_RUNNING[nb.id] = (Set{String}(), Set(answered), Set(asked));
                                            NS._reconcile_nb_runs!(nb))
                 try
                     # The main kernel answers, the busy region worker misses its ping: nothing is known.
                     sweep!(["local"], ["local", "gpu"]); sweep!(["local"], ["local", "gpu"])
-                    @test c.state == RE.RUNNING
+                    @test c.run === run
                     # No kernel for its region at all: nothing can be running it.
                     sweep!(["local"], ["local"]); sweep!(["local"], ["local"])
-                    @test c.state == RE.STALE
+                    @test c.run === nothing && c.state == RE.STALE
                 finally
-                    delete!(NS._LAST_RUNNING, nb.id); delete!(NS._RUN_SINCE, (nb.id, "c"))
+                    delete!(NS._LAST_RUNNING, nb.id)
                 end
             end
 

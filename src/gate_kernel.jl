@@ -1461,6 +1461,7 @@ function eval_capture(k::GateKernel, report::Report, source::AbstractString, fil
         # must ride as a keyword (Dict key → kwarg) to survive the hop. See worker.jl `__slate_eval`.
         # `ctx_*` seed the worker's task-local Slate execution context (see `_build_slate_ctx`).
         _tool(k, "__slate_eval", Dict{String,Any}("source" => String(source), "filename" => String(filename),
+              "run_id" => current_run_id(),
               _ctx_args(report, region, regions, filename)...); timeout = _eval_timeout())
     catch e
         return CellOutput("", MimeChunk[], Any[], Any[], BindSpec[], "", _eval_failure(k, e), nothing, 0.0)
@@ -1599,7 +1600,7 @@ end
 
 # Ask the worker to re-render its retained LIVE (session-bound) outputs — WGLMakie figures — for a browser
 # page that just connected, the way a Bonito server serves a fresh session per page. Returns `[(cid, wire),
-# …]` (empty if there's no live worker or nothing is live); the hub applies each via `server_celldone`. No
+# …]` (empty if there's no live worker or nothing is live); the hub applies each via `apply_live_rerender!`. No
 # `prepare!` — this must NOT spawn a worker just because a page connected; if the worker's down it no-ops.
 function rerender_live(k::GateKernel, report::Report)
     res = try
@@ -1672,6 +1673,7 @@ function eval_capture(k::GateKernel, report::Report, source::AbstractString, fil
         _flush_sources!(k)
         _tool(k, "__slate_eval", Dict{String,Any}(
             "source" => String(source), "filename" => String(filename),
+            "run_id" => current_run_id(),
             _ctx_args(report, region, regions, filename)...,
             "memo_key" => String(memo.key), "memo_names" => collect(String, memo.names),
             "memo_threshold" => Float64(memo.threshold),
@@ -1692,29 +1694,10 @@ function eval_capture(k::GateKernel, report::Report, source::AbstractString, fil
     return _wire_to_output(wire)
 end
 
-# Run a batch of stale cells in PARALLEL in the worker (inter-cell, in-process). `batch` is a vector of
-# per-cell Dicts (id, source, filename, deps, reads, writes, opaque, memo_*) built by the server. The
-# worker schedules them (par_blockers) and STREAMS each result on the `slate_celldone` channel as it
-# finishes — the poller routes those to `server_celldone` for a version-guarded live merge. This call
-# blocks on the ACK (the worker returns once the whole batch has drained), so by the time it returns,
-# every result has been published; the merge itself happens asynchronously in the poller. Returns the
-# worker's ack `(; run_id, ids)` (or rethrows — the caller restales any cell left RUNNING).
-function eval_batch(k::GateKernel, report::Report, run_id::AbstractString, batch::Vector)
-    prepare!(k, report)
-    # NOTE: `cells` is a nested Vector{Dict}. This depends on the gate delivering structured tool-call
-    # arguments intact — currently it does NOT (they arrive empty; see GATE_STRUCTURED_ARGS_ISSUE.md).
-    # Until the fabric fix lands the worker gets an empty batch and the caller falls back to serial.
-    # The RESULT rides back binary in the REQ/REP value field (return values aren't schema-filtered).
-    return _tool(k, "__slate_eval_batch",
-                 Dict{String,Any}("cells" => batch, "run_id" => String(run_id), "npool" => 0);
-                 timeout = _eval_timeout())
-end
-
-# Interrupt the worker's currently-running batch cells (the stop button). Deliberately does NOT
-# `prepare!` — if the worker is gone there's nothing to cancel, and we must not respawn one here. Runs
-# as its own gate request, which the worker handles on a separate task (the message loop spawns every
-# request), so it lands WHILE the blocking `eval_batch` is still in flight. Returns the count of cells
-# interrupted, or -1 if there's no live worker to talk to.
+# Ask every cell the worker is running to stop. Deliberately does NOT `prepare!` — if the worker is
+# gone there's nothing to cancel, and we must not respawn one here. Runs as its own gate request, which
+# the worker handles on a separate task (the message loop spawns every request), so it lands WHILE a
+# blocking eval is still in flight. Returns the count of cells asked, or -1 if there's no live worker.
 function cancel_eval(k::GateKernel)
     k.conn === nothing && return -1
     return try

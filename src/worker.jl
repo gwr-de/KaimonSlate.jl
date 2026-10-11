@@ -105,7 +105,7 @@ include(joinpath(@__DIR__, "envprep.jl"))   # shared notebook-env prep policy (s
 include(joinpath(@__DIR__, "gateauth.jl"))  # how the gate's auth switches are read (pure; unit-tested on its own)
 include(joinpath(@__DIR__, "docharvest.jl")) # shared docstring harvest (runs where the deps are loaded)
 include(joinpath(@__DIR__, "demux.jl"))     # task-demux output capture (parallel evaluator I/O isolation)
-include(joinpath(@__DIR__, "parsched.jl"))  # ParCell / par_blockers / run_scheduled — parallel batch scheduler
+include(joinpath(@__DIR__, "parsched.jl"))  # brings in graphics_detect.jl (the theme-call scan the restore replay uses)
 include(joinpath(@__DIR__, "macroexpand.jl")) # _expand_cell_source — macro-aware deps (engine + worker)
 include(joinpath(@__DIR__, "termcook.jl"))  # cook_terminal — replay \r/cursor redraws (used by capture.jl)
 include(joinpath(@__DIR__, "record_display.jl")) # record_html — a NamedTuple value as a grid of fields (used by capture.jl)
@@ -893,7 +893,7 @@ function _memo_store(cellkey::String, names::Vector{String}, wire;
 end
 
 # Evaluate ONE cell's source in the warm namespace, returning its wire-form capture — the shared core
-# of both the serial `__slate_eval` and the parallel `__slate_eval_batch`. Runs under a `DemuxCapture`
+# of `__slate_eval`. Runs under a `DemuxCapture`
 # so it's safe to call from a spawned task (each task captures its own task-local stdout/stderr/display;
 # see demux.jl). `memo_*` enable durable caching: restore an expensive cell with no recompute, or persist
 # it after a run exceeding `memo_threshold` ms. NOTE: assignment into the shared namespace `_NS[]` is the
@@ -951,8 +951,8 @@ function _eval_one(source::String, filename::String, memo_key::String,
         tr["action"] = "held"
         tr["note"] = "locked — restore only, " * String(get(tr, "miss", "no stored result"))
         _trace_commit!(cid, tr)
-        return merge(_interrupted_wire(), (exception = nothing, memo = "absent",
-                                           memo_why = String(get(tr, "miss", "no stored result"))))
+        return merge(_empty_wire(), (memo = "absent",
+                                     memo_why = String(get(tr, "miss", "no stored result"))))
     end
     local r
     try
@@ -962,7 +962,7 @@ function _eval_one(source::String, filename::String, memo_key::String,
         # captured inside run_capture). Log it loudly and return an error wire so the cell shows the
         # failure and the worker keeps running, instead of the exception vanishing into the gate.
         @error "slate eval: capture machinery threw" cell = cid exception = (e, catch_backtrace())
-        return merge(_interrupted_wire(), (; exception = "internal capture error: " * sprint(showerror, e)))
+        return merge(_empty_wire(), (; exception = "internal capture error: " * sprint(showerror, e)))
     end
     _keep_last_run!(cid, memo_key, r)
     if r.exception !== nothing
@@ -1035,21 +1035,28 @@ function __slate_eval(source::String; filename::String = "string",
                      ctx_region::String = "", ctx_notebook::String = "", ctx_docid::String = "",
                      ctx_regions::Vector{String} = String[],
                      ctx_attrs::Vector{String} = String[],
-                     ctx_clusters::Vector{String} = String[])
+                     ctx_clusters::Vector{String} = String[],
+                     run_id::String = "")
     filename == "cell:__prewarm__" || (_HUB_SEEN[] = true)   # an eval is the hub attached, too
-    # Register this eval's task under its cell id so __slate_cancel can interrupt it (the server runs
-    # parallel cells as concurrent __slate_eval calls; a stop throws InterruptException into them).
+    # Register this eval's task under its run id, which is what the hub stops and what it asks about
+    # (the server runs parallel cells as concurrent __slate_eval calls). An eval outside a run (a
+    # namespace prime, a scratch eval) is registered under its file name instead.
     cid = replace(filename, r"^cell:" => "")
-    lock(_CANCEL_LOCK) do; _RUNNING_TASKS[cid] = current_task(); end
+    rid = isempty(run_id) ? cid : run_id
+    lock(_CANCEL_LOCK) do; _RUNNING_TASKS[rid] = current_task(); _RUN_CELLS[rid] = cid; end
     # Rebuild the Slate execution context from the hub's `ctx_*` args, adding this worker's own
     # `slate_emit` (which PUBs on the gate stream) — cell code reads it via `slate_context()`.
     ctx = _build_slate_ctx(_NS[], ctx_notebook, ctx_region, ctx_regions, ctx_attrs, ctx_clusters,
                            ctx_docid)
     try
-        return _eval_one(source, filename, memo_key, memo_names, memo_threshold, memo_force,
-                         memo_always, memo_unread, memo_safe; memo_restore_only, slate_ctx = ctx)
+        return task_local_storage(:slate_run_id, rid) do
+            _eval_one(source, filename, memo_key, memo_names, memo_threshold, memo_force,
+                      memo_always, memo_unread, memo_safe; memo_restore_only, slate_ctx = ctx)
+        end
     finally
-        lock(_CANCEL_LOCK) do; delete!(_RUNNING_TASKS, cid); end
+        lock(_CANCEL_LOCK) do
+            _RUNNING_TASKS[rid] === current_task() && (delete!(_RUNNING_TASKS, rid); delete!(_RUN_CELLS, rid))
+        end
         # A cell that loaded a package registers ITS gate tools during this eval (a model package's
         # `using` is how they arrive), so the wrap runs after every cell rather than once at boot.
         # Idempotent and cheap: a no-op once every tool is wrapped.
@@ -1057,125 +1064,44 @@ function __slate_eval(source::String; filename::String = "string",
     end
 end
 
-# ── Parallel batch evaluation (inter-cell, in-process) ───────────────────────────────────────────
-# Run a batch of stale cells CONCURRENTLY in this one worker, sharing the warm namespace. Each cell is
-# a Dict from the server carrying its source + dataflow metadata (deps/reads/writes/opaque, already
-# folding define-cells into `opaque` server-side for world-age safety). The pure scheduler
-# (`run_scheduled`, parsched.jl) launches independent cells on spawned tasks while serialising any pair
-# that conflicts, and streams each cell's wire result back the instant it finishes via the gate
-# `slate_celldone` channel `(; run_id, id, wire)` — so a fast cell renders while a slow sibling is still
-# running. Returns `(; run_id, ids)` (a small ack; the real payloads rode the stream).
-_as_symset(v) = Set{Symbol}(Symbol(x) for x in (v === nothing ? () : v))
-_as_strset(v) = Set{String}(String(x) for x in (v === nothing ? () : v))
-_cell_get(c, k, default) = c isa AbstractDict ? get(c, k, get(c, Symbol(k), default)) : default
-
-# Currently-running batch evaluator tasks (id → Task), so `__slate_cancel` can interrupt them. The
-# runner is serial per notebook and this worker serves one notebook, so at most one batch is live and
-# ids are unique within it. Guarded by a lock (mutated from the scheduler task + the cancel handler).
+# Evaluations in flight: run id → its task, and run id → the cell it evaluates, so `__slate_cancel_cells`
+# can stop a run and telemetry can say which cells are busy. Guarded by a lock (mutated from each eval's
+# task and read by the cancel handler and the telemetry loop).
 const _CANCEL_LOCK = ReentrantLock()
 const _RUNNING_TASKS = Dict{String,Task}()
+const _RUN_CELLS = Dict{String,String}()
 # The running cells' tasks, for the profiler to tell another cell's samples from the profiled one's.
 _running_task_ids() = lock(_CANCEL_LOCK) do; UInt[UInt(pointer_from_objref(t)) for t in values(_RUNNING_TASKS)]; end
 const _WARM_STATUS = Ref{String}("")     # pool worker's preload/precompile progress → telemetry → pool UI
 const _LAST_HUB_REQ = Ref(time())        # wall time of the last hub heartbeat (__slate_running) — the spin-guard's orphan signal
 const _LAST_EVAL_AT = Ref(time_ns())     # MONOTONIC: reported as an instant, mapped into hub time by ClockTrack
-const _BATCH_CANCEL = Ref(false)          # set by __slate_cancel; checked by the batch evalfn
+# The wire-form of a cell that produced nothing (callers fill in why).
+_empty_wire() = (stdout = "", mime = Tuple{String,Vector{UInt8}}[], echarts = Any[], tables = Any[],
+                 binds = NamedTuple[], value_repr = "", exception = nothing,
+                 backtrace = nothing, duration_ms = 0.0, trace = Any[], stderr = "",
+                 overflow = NamedTuple[], animations = Any[])
 
-# The wire-form of a cancelled cell — an error result so the UI marks it interrupted (not stuck).
-_interrupted_wire() = (stdout = "", mime = Tuple{String,Vector{UInt8}}[], echarts = Any[], tables = Any[],
-                       binds = NamedTuple[], value_repr = "", exception = "InterruptException: run cancelled",
-                       backtrace = nothing, duration_ms = 0.0, trace = Any[], stderr = "",
-                       overflow = NamedTuple[], animations = Any[])
+# Stop every running cell (a worker about to be torn down). Julia cannot interrupt a task running on
+# another thread, so each run is asked to stop (`request_stop!`: it ends at its next checkpoint,
+# progress report or log record) and is interrupted if it is waiting (`interrupt_when_parked!`). An
+# interrupted cell's `run_capture` catches the exception and returns an error wire, and the WARM
+# NAMESPACE is preserved. Returns how many runs were asked.
+__slate_cancel(; run_id::String = "") = _stop_runs!(nothing)
 
-# Stop every running cell (the stop button). Julia cannot interrupt a task running on another thread,
-# so each cell is asked to stop (`request_stop!`: it ends at its next checkpoint, progress report or log
-# record) and is interrupted if it is waiting (`interrupt_when_parked!`). An interrupted cell's
-# `run_capture` catches the exception and returns an error wire, and the WARM NAMESPACE is preserved.
-# Returns how many cells were asked.
-function __slate_cancel(; run_id::String = "")
-    _BATCH_CANCEL[] = true             # short-circuit any cell that hasn't started yet (evalfn checks this)
-    return _stop_cells!(nothing)
-end
+"Stop ONLY the named runs (the Stop button, and superseded-edit preemption). `ids` are run ids; unknown
+or finished ones are no-ops. Returns how many of them were running. (`ids` is a KEYWORD arg — see
+`__slate_macroexpand`'s raw-Dict caveat.)"
+__slate_cancel_cells(; ids::Vector = Any[]) = _stop_runs!(String[String(i) for i in ids])
 
-"Stop ONLY the named cells: superseded-edit preemption. An edited/deleted cell's old-source run can only
-be discarded on completion (the server's src_hash version guard), so stop burning worker time on it.
-Unknown/finished ids are no-ops; unlike `__slate_cancel` this never touches `_BATCH_CANCEL` (unstarted
-siblings still run). Returns the number asked. (`ids` is a KEYWORD arg — see `__slate_macroexpand`'s
-raw-Dict caveat.)"
-__slate_cancel_cells(; ids::Vector = Any[]) = _stop_cells!(String[String(i) for i in ids])
-
-# `ids` nothing: every running cell.
-function _stop_cells!(ids)
+# `ids` nothing: every run.
+function _stop_runs!(ids)
     running = lock(_CANCEL_LOCK) do
-        [(id, t) for (id, t) in _RUNNING_TASKS if !istaskdone(t) && (ids === nothing || id in ids)]
+        [(id, t, get(_RUN_CELLS, id, id)) for (id, t) in _RUNNING_TASKS if !istaskdone(t) && (ids === nothing || id in ids)]
     end
-    n = request_stop!(first.(running))
+    n = request_stop!([r[1] for r in running])
     foreach(r -> interrupt_when_parked!(r[2]), running)
-    @info "slate cancel: asked cells to stop" count = n cells = join(first.(running), ",")
+    @info "slate cancel: asked cells to stop" count = n cells = join((r[3] for r in running), ",")
     return max(n, length(running))
-end
-
-# `cells` is a Vector{Dict} (id/source/deps/reads/writes/opaque/memo fields per cell). NOTE: this
-# currently depends on the gate delivering structured (non-scalar) tool-call arguments intact — see
-# GATE_STRUCTURED_ARGS_ISSUE.md. Until that fabric fix lands, the batch arrives empty and the server
-# falls back to the serial path (it guards on empty results).
-function __slate_eval_batch(cells; run_id::String = "", npool::Int = 0)
-    specs = ParCell[]
-    meta = Dict{String,Any}()
-    for c in cells
-        id = String(_cell_get(c, "id", ""))
-        isempty(id) && continue
-        writes = _as_symset(_cell_get(c, "writes", Symbol[]))
-        # Plotting cells share Makie's non-thread-safe globals (invisible to dataflow analysis): give
-        # them a synthetic shared write so par_blockers serialises graphics-vs-graphics. See parsched.jl.
-        _uses_shared_graphics(String(_cell_get(c, "source", ""))) && push!(writes, _GRAPHICS_SENTINEL)
-        push!(specs, ParCell(id, _as_strset(_cell_get(c, "deps", String[])),
-                             _as_symset(_cell_get(c, "reads", Symbol[])),
-                             writes,
-                             _cell_get(c, "opaque", false) === true))
-        meta[id] = c
-    end
-    # Max concurrent evaluator TASKS — deliberately NOT tied to Threads.nthreads(): tasks interleave on
-    # one OS thread at yield points (sleep / IO / async), so independent I/O-bound cells overlap even on
-    # the safe single-compute-thread worker. (CPU-bound cells need real OS threads, which await the
-    # world-age binding fix — see GATE/threads notes.) Bound it so a huge notebook doesn't spawn 100s.
-    pool = npool > 0 ? npool : max(8, Threads.nthreads())
-    _BATCH_CANCEL[] = false            # fresh batch — clear any prior cancel
-    @info "slate batch: scheduling" run = run_id cells = length(specs) pool = pool
-
-    evalfn = function (id)
-        _BATCH_CANCEL[] && return _interrupted_wire()   # cancelled before this cell started → don't run it
-        c = meta[id]
-        _eval_one(String(_cell_get(c, "source", "")),
-                  String(_cell_get(c, "filename", "cell:" * id)),
-                  String(_cell_get(c, "memo_key", "")),
-                  Vector{String}(String[String(x) for x in _cell_get(c, "memo_names", String[])]),
-                  Float64(_cell_get(c, "memo_threshold", 0.0)),
-                  _cell_get(c, "memo_force", false) === true,
-                  _cell_get(c, "memo_always", false) === true,
-                  Vector{String}(String[String(x) for x in _cell_get(c, "memo_unread", String[])]);
-                  memo_restore_only = _cell_get(c, "memo_restore_only", false) === true)
-    end
-    # Track each task so __slate_cancel can interrupt it; drop it once it finishes.
-    onspawn = (id, t) -> lock(_CANCEL_LOCK) do; _RUNNING_TASKS[id] = t; end
-    ondone = (id, _wire) -> lock(_CANCEL_LOCK) do; delete!(_RUNNING_TASKS, id); end
-
-    local res
-    try
-        res = run_scheduled(specs, pool, evalfn, ondone; onspawn = onspawn)
-    finally
-        lock(_CANCEL_LOCK) do; empty!(_RUNNING_TASKS); end   # belt-and-suspenders: never leak handles
-    end
-    # Normalise each cell's result to a wire: an evaluator that threw OUTSIDE run_capture's own try
-    # (e.g. an interrupt during capture setup) shows up here as an Exception — turn it into an error
-    # wire so the cell renders the failure instead of vanishing. The whole map rides back binary in the
-    # gate REQ/REP `value` field (the stream channel is string-only, so rich results can't ride it).
-    results = Dict{String,Any}()
-    for (id, r) in res
-        results[id] = r isa Exception ? merge(_interrupted_wire(), (; exception = sprint(showerror, r))) : r
-    end
-    @info "slate batch: done" run = run_id cells = length(specs)
-    return (; run_id = run_id, results = results)
 end
 
 "Apply a browser `@bind` value change: coerce against the widget, update the registry,
@@ -2568,16 +2494,18 @@ function __slate_revise()
 end
 
 # GateTools exposed to the KaimonSlate server.
-"The cells this worker is evaluating RIGHT NOW (keys of `_RUNNING_TASKS`) — the authoritative in-flight
-set the hub reconciles its run-registry against. A cell the hub still marks `running` that is absent
-here was orphaned (the worker bounced under it) and can be safely reset. Cheap: a snapshot under the lock."
+"The runs this worker is evaluating RIGHT NOW — the authoritative in-flight set the hub reconciles its
+runs against. `runs` are run ids, `running` the cells they evaluate. A run the hub has dispatched that is
+absent here was orphaned (the worker bounced under it). Cheap: a snapshot under the lock."
 function __slate_running()
     t2 = time_ns()             # monotonic, this machine — the hub pairs it with its own send/receive
     _LAST_HUB_REQ[] = time()   # the supervisor's heartbeat — proof the hub is still driving us; the spin-guard treats staleness as "orphaned"
-    ids = lock(_CANCEL_LOCK) do; String[String(k) for k in keys(_RUNNING_TASKS)]; end
+    runs, cells = lock(_CANCEL_LOCK) do
+        (String[String(k) for k in keys(_RUNNING_TASKS)], String[String(get(_RUN_CELLS, k, k)) for k in keys(_RUNNING_TASKS)])
+    end
     # `mono_recv`/`mono_send` bracket the work done here, so the hub can subtract it out and be left
     # with the network. Monotonic, so this machine's clock being stepped never perturbs the measure.
-    return (; running = ids, ts = time(), mono_recv = t2, mono_send = time_ns())
+    return (; running = cells, runs = runs, ts = time(), mono_recv = t2, mono_send = time_ns())
 end
 
 # Materialize content-addressed blobs into THIS worker's data dir (`datadir()`) — the receiving half
@@ -2782,7 +2710,6 @@ function tools()
         KaimonGate.GateTool("__slate_matrix_render", __slate_matrix_render),
         KaimonGate.GateTool("__slate_eval", __slate_eval),
         KaimonGate.GateTool("__slate_rerender_fig", __slate_rerender_fig),
-        KaimonGate.GateTool("__slate_eval_batch", __slate_eval_batch),
         KaimonGate.GateTool("__slate_running", __slate_running),
         KaimonGate.GateTool("__slate_run_chunks", __slate_run_chunks),
         KaimonGate.GateTool("__slate_chunk_status", __slate_chunk_status),
@@ -3235,7 +3162,7 @@ function _telemetry_loop!(stats_path::String)
         (memo < 0 || tick % 15 == 0) && (memo = _dir_bytes(joinpath(_memo_dir(), "blobs")); disk = disks())
         # The LIVE running-cell ids — the per-eval heartbeat the hub reconciles against (a cell the hub
         # thinks is running but that's absent here is orphaned). Cheap: just the keys under the lock.
-        runids = lock(_CANCEL_LOCK) do; collect(keys(_RUNNING_TASKS)); end
+        runids = lock(_CANCEL_LOCK) do; [get(_RUN_CELLS, k, k) for k in keys(_RUNNING_TASKS)]; end
         evals = length(runids)
         # When this worker last had work, which only it can say: it sees every eval, whatever path
         # brought it. The hub used to infer this from cell dispatch and so missed anything else.

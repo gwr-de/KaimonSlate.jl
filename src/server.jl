@@ -86,12 +86,18 @@ mutable struct LiveNotebook
     # Set the moment the notebook starts closing. Work started for it in the background (a prepare, a
     # placement, a connect) checks it before creating anything for the notebook or running its cells.
     closed::Bool
+    # Run control. `halted`: Stop was pressed, so the runner starts nothing new until a run is asked for
+    # (▶, run all, an edit). `epoch`: bumped when the namespace the cells ran in is thrown away (a
+    # restart, a move to another worker); a runner that started in an earlier epoch hands over to a
+    # fresh one, which re-establishes the namespace before running anything. Both under `lock`.
+    halted::Bool
+    epoch::Int
     # Inner constructor takes the original 13 fields and starts empty scratchpad + frontend/asset/import registries, so
     # every existing positional call site (server + tests) is unchanged; all are populated at runtime.
     LiveNotebook(id, path, report, kernel, version, undo, redo, lock, listeners, llock, agent_id, agent_busy, agents) =
         new(id, path, report, kernel, version, undo, redo, lock, listeners, llock, agent_id, agent_busy, agents,
             Cell[], @NamedTuple{id::String, js::String, esm::Bool, kind::String}[], Dict{String,String}(),
-            Dict{String,String}(), Set{String}(), false)
+            Dict{String,String}(), Set{String}(), false, false, 0)
 end
 
 # ── Notebook-lock protocol (`nb.lock`) ─────────────────────────────────────────────────────────────
@@ -227,7 +233,6 @@ function _wire_callbacks!(nb::LiveNotebook)
                                                    _ws_emit!(nb, channel, payload)
     catch; end))   # slate_emit → push over the page WebSocket (NOT the coalescing SSE); payload is a Julia value, JSON-encoded in _ws_emit!
     register_bin_emit!(nb.report.id, frame -> (try; _ws_broadcast_bin!(nb, frame); catch; end))   # slate_emit_bin → forward the raw binary frame over the page WebSocket as-is
-    register_celldone!(nb.report.id, (run_id, cid, wire) -> server_celldone(nb, run_id, cid, wire))   # parallel-batch result merge
     register_cleanup_cells!(nb.report.id, ids -> (try; _cleanup_deleted_cells(nb, ids); catch; end))   # deleted-cell slate_on_cleanup teardown
     register_toolcall!(nb.report.id, p -> (try; server_toolcall(nb, p); catch; end))   # an agent's tool call → a TOOL cell
     # `set_bind(:name, v)` from cell code → the SAME path the browser POST takes. Async because the
@@ -245,7 +250,7 @@ function _unwire_callbacks!(nb::LiveNotebook)
     lock(_USERPROG_LOCK) do; delete!(_LAST_USERPROG, nb.id); end
     unregister_refresh!(nb.report.id); unregister_srcchange!(nb.report.id)
     unregister_progress!(nb.report.id); unregister_runbatch!(nb.report.id)
-    unregister_userprog!(nb.report.id); unregister_emit!(nb.report.id); unregister_celldone!(nb.report.id)
+    unregister_userprog!(nb.report.id); unregister_emit!(nb.report.id)
     unregister_cellout!(nb.report.id)
     unregister_toolcall!(nb.report.id); unregister_setbind!(nb.report.id)
     unregister_prepare!(nb.report.id); unregister_bin_emit!(nb.report.id); unregister_cleanup_cells!(nb.report.id)
@@ -793,9 +798,7 @@ function _reactive_refresh!(nb::LiveNotebook, seed_predicate)
         seed = String[]
         for c in nb.report.cells
             seed_predicate(c) || continue
-            # Note it BEFORE restaling — `restale!` overwrites RUNNING, so afterwards there is no
-            # way to tell that this cell's in-flight run is now answering a stale question.
-            c.state == RUNNING && push!(get!(Set{String}, _DIRTY_WHILE_RUNNING, nb.id), c.id)
+            # A cell running now keeps its run, which `restale!` marks to run again when it ends.
             ReportEngine.restale!(c) && push!(seed, c.id)
         end
         isempty(seed) && return
@@ -889,7 +892,7 @@ end
 # instead of only when the whole run ends. Best-effort — a push must never disturb evaluation.
 function _broadcast_progress(nb::LiveNotebook, cell)
     try
-        if cell.state == RUNNING
+        if is_running(cell)
             _broadcast(nb, "cellrun:" * cell.id)
         else
             bindref, hostednames = _bind_index(nb.report)
@@ -933,20 +936,6 @@ const _RUNNER_CANCEL = Dict{String,Bool}()
 # leaving a notebook silently wedged until something notices and restarts the whole hub.
 const _RUNNER_STARTED = Dict{String,Float64}()
 const _RUNNER_STALE_HITS = Dict{String,Int}()         # nb.id → consecutive stuck-sweep confirmations
-# nb.id → ids of cells that were RESTALED WHILE RUNNING by a reactive push, and so must run again.
-#
-# A cell's run reads its inputs once, at the start. If a reactive value it reads changes while that
-# run is in flight, the result is already answering a stale question — and `mark_result!` then marks
-# the cell FRESH, overwriting the STALE that `restale!` set mid-run. Nothing restales it again (the
-# push has been and gone), so the cell sits FRESH holding output computed from values that have
-# since moved, indefinitely.
-#
-# `_eval_one!` already handles the SOURCE version of this hazard by comparing `src_hash` across the
-# run; this is the same idea for values, which carry no hash. A handler writing several reactives in
-# a burst (`msg[] = …; result[] = …; busy[] = false`) is the case that hits it, and it hits the LAST
-# write — so the symptom is a progress bar that never clears while every value behind it is correct.
-# Guarded by `nb.lock`: every reader and writer here already holds it.
-const _DIRTY_WHILE_RUNNING = Dict{String,Set{String}}()
 const _RUNNER_STALE_AFTER = 600.0                     # 10 min with pending work + no progress ⇒ suspect
 const _RUNNER_STALE_CONFIRMATIONS = 3                 # consecutive 5s sweeps before self-healing (~15s)
 
@@ -994,7 +983,8 @@ function _self_heal_locked!(nb::LiveNotebook)
     # cell, same as `_run_loop!`'s own `target = lock(nb.lock) do … end` before its `_eval_mutex` step.
     targets = lock(nb.lock) do
         [c for c in nb.report.cells
-         if c.kind == CODE && c.state == STALE && :locked in c.flags && !isempty(ReportEngine._locked_key(c))]
+         if c.kind == CODE && c.state == STALE && c.run === nothing && :locked in c.flags &&
+            !isempty(ReportEngine._locked_key(c))]
     end
     for c in targets
         try
@@ -1007,15 +997,19 @@ function _self_heal_locked!(nb::LiveNotebook)
 end
 
 # Next stale cell to run, in eval_stale!'s order: static markdown (no reads) first, then doc order.
+# A cell with a run in flight is not next, whatever its state: it runs again when that run ends.
 function _next_stale_cell(report)
     for c in report.cells
-        c.kind == MARKDOWN && c.state == STALE && isempty(c.reads) && return c
+        c.kind == MARKDOWN && c.state == STALE && c.run === nothing && isempty(c.reads) && return c
     end
     for c in report.cells
-        c.state == STALE && return c
+        c.state == STALE && c.run === nothing && return c
     end
     return nothing
 end
+
+# Cells waiting or pending for the k/N pill: stale ones and those with a run in flight.
+_pending_count(report) = count(c -> c.state == STALE || c.run !== nothing, report.cells)
 
 # ── Per-cell run statistics (session-scoped) ──────────────────────────────────────────────────────
 # Updated at every cell-completion merge and embedded in cell_json["stats"], so the DAG's heat map
@@ -1201,6 +1195,9 @@ const WAIT_PREPARING = "preparing"
 # A locked cell with no frozen result to restore here. Only its own ▶ computes it; `blocked_host`
 # carries its id, so a cell downstream says which locked cell it waits on.
 const WAIT_LOCKED = "locked"
+# A cell reading a STOPPED one. It would run on whatever the stopped run left behind, so it waits for
+# that cell to run again; `blocked_host` carries the stopped cell's id, here and in cells further down.
+const WAIT_UPSTREAM_STOPPED = "upstream_stopped"
 
 # Why a notebook's first worker on region `r` has to go through preparing it, or `""` when it need not.
 # The machine's answer for this project on the kind of node the region gets (`env_readiness`), the same
@@ -1440,12 +1437,13 @@ end
 # Cells left waiting are picked up by an explicit run of the notebook. Without this a run request
 # skips them, since the runner only takes STALE cells and a waiting cell is BLOCKED.
 function _restale_blocked!(nb::LiveNotebook)
-    # A run of the notebook is a request, so it ends the opening run's restraint even mid-way.
+    # A run of the notebook is a request, so it ends the opening run's restraint even mid-way. It takes
+    # up every wait, and every stopped cell: running the notebook is asking for those too.
     lock(_OPENING_RUN_LOCK) do; delete!(_OPENING_RUN, nb.id); end
     n = lock(nb.lock) do
         k = 0
         for c in nb.report.cells
-            c.state == BLOCKED && ReportEngine.restale!(c) && (k += 1)
+            c.state in (BLOCKED, STOPPED) && ReportEngine.request_run!(c) && (k += 1)
         end
         k > 0 && (nb.version += 1)
         k
@@ -2593,8 +2591,10 @@ function _restale_side!(nb::LiveNotebook, side::AbstractString)
     lock(nb.lock) do
         for cell in nb.report.cells
             (cell.kind == CODE && _cell_side(nb, cell) == side) || continue
-            # Locked cells too: their frozen result restores into the new process, it is not in it.
-            ReportEngine._unblock!(cell); cell.state = STALE; ReportEngine.bump_rev!(cell)
+            # Locked cells too: their frozen result restores into the new process, it is not in it. A
+            # stopped cell stays stopped: a new worker is not a request to run it.
+            cell.state == STOPPED && continue
+            ReportEngine.force_stale!(cell)
             push!(ids, cell.id)
         end
         isempty(ids) || (nb.version += 1)
@@ -2616,26 +2616,14 @@ end
 
 # ── Run supervisor: eval-level self-healing ──────────────────────────────────────────────────
 # Kaimon self-heals at the SESSION/connection level ("is the worker reachable"). This layer works
-# BELOW that, per EVAL: a cell the hub marks RUNNING that no kernel is actually evaluating is an
-# ORPHAN (its worker bounced under it, or a `celldone` was lost) — it wedges the notebook forever.
-# A background sweep reconciles the hub's RUNNING cells against each kernel's authoritative
-# in-flight set (`__slate_running`) and resets confirmed orphans to STALE so the run can proceed.
-# Conservative by construction: a cell is only reset after it's been RUNNING past a grace window AND
-# a SUCCESSFUL query confirms it absent on TWO consecutive sweeps — so a genuinely long-running cell
-# (whose query would simply be slow, or return it as present) is never touched, and a transient
-# dispatch race can't trip it. An unreachable worker yields no confirmation → left to the session layer.
-const _RUN_SINCE = Dict{Tuple{String,String},Float64}()   # (nb id, cell id) → first time observed RUNNING
-const _RUN_ORPHAN_HITS = Dict{Tuple{String,String},Int}()  # consecutive confirmed-absent sweeps
-# Region cells marked RUNNING but not yet handed to a worker — see `_prepare_region_for_cell!`. Held
-# only for that window, and dropped defensively when the cell stops running, so a preparation that
-# dies without reaching its dispatch cannot make a cell permanently unhealable.
-const _REGION_PREPARING = Set{Tuple{String,String}}()
-const _REGION_PREPARING_LOCK = ReentrantLock()
-_region_preparing(nbid, cid) =
-    lock(_REGION_PREPARING_LOCK) do; (String(nbid), String(cid)) in _REGION_PREPARING; end
-_region_prepared!(nbid, cid) =
-    (lock(_REGION_PREPARING_LOCK) do; delete!(_REGION_PREPARING, (String(nbid), String(cid))); end; nothing)
-const _RECONCILE_GRACE = 8.0                               # s a cell must be RUNNING before it's judged
+# BELOW that, per RUN: a run handed to a worker that the worker is not computing is an ORPHAN (the
+# worker bounced under it, or its reply was lost), and it would hold the cell forever. A background
+# sweep compares each dispatched run with the run ids its kernel says it is computing
+# (`__slate_running`) and ends confirmed orphans, leaving the cell STALE so it runs again.
+# Conservative by construction: a run is judged only once it has been dispatched for a grace window,
+# and ended only when a SUCCESSFUL answer from its own kernel leaves it out on TWO consecutive sweeps.
+# A run still being prepared (a region's bring-up) has no worker to ask and is never judged.
+const _RECONCILE_GRACE = 8.0                               # s a run must be dispatched before it's judged
 const _RUN_SUPERVISOR = Ref{Any}(nothing)
 
 # A notebook's live GateKernels — main + any region kernels — for the authoritative in-flight query.
@@ -2773,7 +2761,7 @@ function _host_sample!(k)
     return nothing
 end
 const _LIVENESS_PING_TIMEOUT = 8.0   # per-ping timeout; also how far to BACKDATE first-silence — when a ping first fails the worker has already been silent this long, so the countdown starts at ~8s, not 0
-const _LAST_RUNNING = Dict{String,Tuple{Set{String},Set{String},Set{String}}}()   # nb id → (running ids, sides that answered, sides asked) from the last sweep
+const _LAST_RUNNING = Dict{String,Tuple{Set{String},Set{String},Set{String}}}()   # nb id → (running cell AND run ids, sides that answered, sides asked) from the last sweep
 # Repeat-suppression for the unresponsive log. A wire that stays silent used to write one identical
 # line per sweep — an outage lasting a working day produced hundreds of KB of the same sentence, which
 # buries the events that actually explain it. Log the FIRST failure, one line per interval while it
@@ -2890,10 +2878,12 @@ function _liveness_sweep!(nb::LiveNotebook)
             t1 = time_ns()
             r = ReportEngine._tool(k, "__slate_running", Dict{String,Any}(); timeout = _LIVENESS_PING_TIMEOUT)
             _note_clock!(k, r, t1, time_ns())   # the heartbeat is already a round trip; measure it
-            run = r isa NamedTuple ? get(r, :running, nothing) :
-                  r isa AbstractDict ? get(r, "running", get(r, :running, nothing)) : nothing
+            field(f) = r isa NamedTuple ? get(r, f, nothing) :
+                       r isa AbstractDict ? get(r, String(f), get(r, f, nothing)) : nothing
+            run = field(:running)
             if run !== nothing
                 for id in run; push!(ids, String(id)); end
+                for id in something(field(:runs), ()); push!(ids, String(id)); end
                 push!(answered, _kernel_side_label(nb, k)); ok = true
             end
         catch e
@@ -3074,41 +3064,29 @@ end
 function _reconcile_nb_runs!(nb::LiveNotebook)
     nb.kernel isa ReportEngine.GateKernel || return nothing
     now = time()
-    running = [c for c in nb.report.cells if c.state == RUNNING]
-    ids = Set(c.id for c in running)
-    for c in running; get!(_RUN_SINCE, (nb.id, c.id), now); end   # stamp first-seen-running
-    for key in collect(keys(_RUN_SINCE))                          # drop records for cells no longer running
-        (key[1] == nb.id && !(key[2] in ids)) &&
-            (delete!(_RUN_SINCE, key); delete!(_RUN_ORPHAN_HITS, key); _region_prepared!(key...))
+    suspects = lock(nb.lock) do
+        [(c.id, c.run, isempty(c.run.side) ? "local" : c.run.side) for c in nb.report.cells
+         if c.run !== nothing && c.run.phase === :dispatched && now - c.run.dispatched > _RECONCILE_GRACE]
     end
-    suspects = [c for c in running if now - get(_RUN_SINCE, (nb.id, c.id), now) > _RECONCILE_GRACE]
     isempty(suspects) && return nothing
     actual = _worker_running_ids(nb)
     actual === nothing && return nothing                         # no kernel could confirm → leave to the session layer
-    for c in suspects
-        key = (nb.id, c.id)
-        if c.id in actual.ids                                    # genuinely running → clear any strike
-            delete!(_RUN_ORPHAN_HITS, key); continue
+    for (cid, run, side) in suspects
+        # The kernel lists run ids; a worker on code from before runs had ids lists cell ids.
+        if run.id in actual.ids || cid in actual.ids
+            run.misses = 0; continue
         end
         # Its own kernel was asked and did not answer this sweep: nothing is known about it either way.
-        side = _cell_side(nb, c); side = isempty(side) ? "local" : side
         (side in actual.asked && !(side in actual.answered)) && continue
-        # A region cell is marked RUNNING before it reaches a worker: the spawn, the prime and the
-        # input transfer come first, and until the dispatch nothing can report it as running — which
-        # is indistinguishable from an orphan from here. `_prepare_region_for_cell!` says while that
-        # is happening, so this is exact rather than a guess about how long a bring-up takes.
-        _region_preparing(nb.id, c.id) && continue
-        hits = get(_RUN_ORPHAN_HITS, key, 0) + 1                 # confirmed absent this sweep
-        _RUN_ORPHAN_HITS[key] = hits
-        hits < 2 && continue                                     # need TWO consecutive confirmations
-        idx = _index_of(nb.report.cells, c.id); idx === nothing && continue
-        did = lock(nb.lock) do
-            ReportEngine.revert_running!(c)
+        run.misses += 1
+        run.misses < 2 && continue                               # need TWO consecutive confirmations
+        healed = lock(nb.lock) do
+            _run_cell(nb, cid, run) === nothing && return false
+            _settle!(c -> nothing, nb, cid, run)
+            true
         end
-        did || continue
-        delete!(_RUN_SINCE, key); delete!(_RUN_ORPHAN_HITS, key)
-        ReportEngine._rlog("supervisor: healed orphaned run — $(nb.id)/$(c.id) was RUNNING but no kernel is evaluating it → reset to stale")
-        try; _announce_cell!(nb, idx); catch; end
+        healed || continue
+        ReportEngine._rlog("supervisor: healed orphaned run — $(nb.id)/$(cid) run $(run.id) was dispatched but no kernel is evaluating it → left stale")
     end
     return nothing
 end
@@ -3125,7 +3103,7 @@ function _reconcile_stale_runner!(nb::LiveNotebook)
     active = lock(_RUNNER_LOCK) do; get(_RUNNERS, nb.id, false); end
     active || (delete!(_RUNNER_STALE_HITS, nb.id); return nothing)
     has_pending, any_running = lock(nb.lock) do
-        _next_stale_cell(nb.report) !== nothing, any(c -> c.state == RUNNING, nb.report.cells)
+        _next_stale_cell(nb.report) !== nothing, any(is_running, nb.report.cells)
     end
     if !has_pending || any_running
         delete!(_RUNNER_STALE_HITS, nb.id)
@@ -3364,7 +3342,7 @@ function _reconcile_stranded_readers!(nb::LiveNotebook)
             (c.id in blast && !(c.id in ready)) || continue
             key = (nb.id, c.id)
             c.state == FRESH && (delete!(_READER_REARMED, key); continue)   # a later failure gets its own go
-            (c.state == STALE || c.state == RUNNING) && continue
+            (c.state == STALE || is_running(c)) && continue
             _region_recoverable(c) || continue
             key in _READER_REARMED && continue
             push!(_READER_REARMED, key)
@@ -3476,7 +3454,7 @@ function _regions_in_use(h)
                 let v = get!(Vector{LiveNotebook}, nbs_of, r); nb in v || push!(v, nb); end
                 # A cell that is RUNNING on the region means the region is in use whatever the clock
                 # says.
-                c.state == RUNNING && (push!(busy, r); _region_used!(r))
+                is_running(c) && (push!(busy, r); _region_used!(r))
             end
             # So does a cell waiting for one, which may be a cell on another region, or on none,
             # reading a value this one produces.
@@ -3934,7 +3912,7 @@ function _watchdog_scan!(nb::LiveNotebook)
     nb.kernel isa ReportEngine.GateKernel || return nothing   # in-process kernels have no worker to watch
     now = time()
     alerts = Any[]
-    code = Set(c.id for c in nb.report.cells if c.state == RUNNING && c.kind == CODE)
+    code = Set(c.id for c in nb.report.cells if is_running(c) && c.kind == CODE)
     for (side, latest, hist) in _nb_kernel_stats(nb)
         append!(alerts, _kernel_alerts(side, hist; now, quiet_cells = [id for id in latest.running if id in code]))
     end
@@ -4455,7 +4433,8 @@ function _allocation_gone!(side::AbstractString, kernel = nothing)
     return true
 end
 
-function _prepare_region_for_cell!(nb::LiveNotebook, cell::Cell, kernel, side::AbstractString)
+function _prepare_region_for_cell!(nb::LiveNotebook, cell::Cell, run::ReportEngine.Run, kernel,
+                                   side::AbstractString)
     isempty(side) && return true
     # Reconnect-hold policy (manual mode). A cell EXPLICITLY run (▶ force marker) reconnects a region that
     # was dropped as dead; a reactive cascade must not. Peek the force marker WITHOUT consuming it (the
@@ -4472,31 +4451,20 @@ function _prepare_region_for_cell!(nb::LiveNotebook, cell::Cell, kernel, side::A
         # a session that was signed out from under a perfectly healthy one. Only the first is the
         # worker's fault, and only the second is fixed with the padlock.
         sh = ReportEngine.session_host(kernel)
-        lock(nb.lock) do
-            ReportEngine.mark_errored!(cell,
-                (!isempty(sh) && !ReportEngine.Sweep.connected(sh)) ?
-                    "region '$side' needs $sh, which is signed out — use the padlock at the top of the page" :
-                    "region '$side' is disconnected — a previous worker went unresponsive; press ▶ (or re-run) to reconnect")
-            _broadcast_progress(nb, cell)
-        end
+        msg = (!isempty(sh) && !ReportEngine.Sweep.connected(sh)) ?
+            "region '$side' needs $sh, which is signed out — use the padlock at the top of the page" :
+            "region '$side' is disconnected — a previous worker went unresponsive; press ▶ (or re-run) to reconnect"
+        _settle!(c -> ReportEngine.mark_errored!(c, msg), nb, cell.id, run)
         return false
     end
     # A cell running on a REGION needs the notebook's environment established there first — its own
     # `using`/scaffold cells may live on the main kernel (they aren't cross-boundary READS, so a presync
     # won't ship them). Bring the kernel up and prime it (idempotent, once per kernel) so the package's
     # functions, the theme, … all resolve instead of an UndefVarError on the far side. Bringing up a
-    # region worker can be SLOW — a COLD remote spawn boots Julia + KaimonGate (~90s) — so mark the cell
-    # RUNNING now and push the worker list so the region PILL appears immediately as a pulsing "starting".
+    # region worker can be SLOW — a COLD remote spawn boots Julia + KaimonGate (~90s). The cell already
+    # shows running (its run is in the `:preparing` phase until the dispatch); push the worker list so
+    # the region PILL appears immediately as a pulsing "starting".
     host = _side_label(nb, side)
-    # From here the cell is RUNNING but is NOT yet on a worker: the spawn, the namespace prime and
-    # its input transfer all still have to happen, and only then is it dispatched. Nothing can report
-    # it as running during that window, which is exactly what the orphan reconciler looks for — so
-    # say that it is being prepared and let it skip this cell. Cleared at the dispatch itself.
-    lock(_REGION_PREPARING_LOCK) do; push!(_REGION_PREPARING, (nb.id, cell.id)); end
-    lock(nb.lock) do
-        ReportEngine.mark_running!(cell)
-        _broadcast_progress(nb, cell)
-    end
     try; facts_changed!(); catch; end   # pill appears NOW as "starting", not after the run completes
     stop_narrating = _narrate_region_bringup!(nb, kernel, side, host)
     # Every region cell passes through here, so what belongs to a worker COMING UP (seeding its clock,
@@ -4522,21 +4490,16 @@ function _prepare_region_for_cell!(nb::LiveNotebook, cell::Cell, kernel, side::A
         if !isempty(side) && _allocation_gone!(side, kernel)
             r = ReportEngine.region_get(String(side))
             withdrawn = _withdrawn_since_asked(nb, side)
-            lock(nb.lock) do
-                ReportEngine.mark_blocked!(cell, withdrawn ? WAIT_NOT_REQUESTED : WAIT_QUEUED, r.host, r.name)
-                _broadcast_progress(nb, cell)
-            end
+            _settle!(c -> ReportEngine.mark_blocked!(c, withdrawn ? WAIT_NOT_REQUESTED : WAIT_QUEUED, r.host, r.name),
+                     nb, cell.id, run)
             withdrawn || _place_in_background!(String(side), nb; by_run = true)
             try; facts_changed!(); catch; end
             return false
         end
         # The region worker couldn't come up — surface it AS the cell's error and STOP. Running on the
         # dead kernel just errors anyway, but leaving the cell unresolved let the runner re-arm and churn.
-        lock(nb.lock) do
-            ReportEngine.mark_errored!(cell, "region worker on $host could not start: " *
-                first(sprint(showerror, e), 160))
-            _broadcast_progress(nb, cell)
-        end
+        msg = "region worker on $host could not start: " * first(sprint(showerror, e), 160)
+        _settle!(c -> ReportEngine.mark_errored!(c, msg), nb, cell.id, run)
         try; facts_changed!(); catch; end   # push the failure → pill goes amber/disconnected, not stuck "starting"
         return false
     end
@@ -4557,16 +4520,11 @@ function _side_up(nb::LiveNotebook, side::AbstractString)
 end
 
 # Hold a locked cell that had nothing to restore. It keeps whatever it showed, cells reading it wait
-# on it, and its own ▶ computes it.
-function _hold_locked!(nb::LiveNotebook, cell::Cell)
-    lock(nb.lock) do
-        i = _index_of(nb.report.cells, cell.id)
-        i === nothing && return
-        c = nb.report.cells[i]
-        pop!(get!(Set{String}, _DIRTY_WHILE_RUNNING, nb.id), c.id, nothing)
-        ReportEngine.mark_blocked!(c, WAIT_LOCKED, c.id)
-        _broadcast_progress(nb, c)
-    end
+# on it, and its own ▶ computes it. A change to its inputs while it was being looked at changes
+# nothing: it is held either way.
+function _hold_locked!(nb::LiveNotebook, cid::AbstractString, run::ReportEngine.Run)
+    run.rerun = false
+    _settle!(c -> ReportEngine.mark_blocked!(c, WAIT_LOCKED, c.id), nb, cid, run)
     return nothing
 end
 
@@ -4648,55 +4606,144 @@ end
 # Cells whose force was passed to the upstream they wait on (`_eval_one_run!`), under `nb.lock`.
 const _PASSED_ON = Set{Tuple{String,String}}()
 
-function _eval_one!(nb::LiveNotebook, cell::Cell)
-    passed_on = false
-    try
-        passed_on = _eval_one_run!(nb, cell) === :passed_on
-    finally
-        lock(nb.lock) do; (passed_on || cell.state == BLOCKED) || _take_force!(nb.id, cell.id); end
+# The one place a run's outcome reaches its cell.
+#
+# The cell is looked up by id, because an edit replaces the Cell object and a restart clears every
+# run: a result is applied only if `run` is still that cell's run. The run is ended first, so `f` sees
+# a cell with nothing in flight and may restale it. An input that changed while the run was out
+# (`run.rerun`) leaves the cell STALE after `f`, keeping what it produced on screen until the next run
+# lands. Cells held on this one while it was stopped are let go once it has run again. Pushes the
+# cell; returns `f`'s value, or `nothing` when the run was no longer the cell's. Takes `nb.lock`.
+function _settle!(f, nb::LiveNotebook, cid::AbstractString, run::ReportEngine.Run)
+    lock(nb.lock) do
+        i = _index_of(nb.report.cells, cid)
+        i === nothing && return nothing
+        c = nb.report.cells[i]
+        ReportEngine.end_run!(c, run) || return nothing
+        v = f(c)
+        run.rerun && c.state in (FRESH, ERRORED, BLOCKED) && ReportEngine.restale!(c)
+        c.state == STOPPED || _release_held_on!(nb, c.id)
+        _broadcast_progress(nb, c)
+        v
     end
 end
 
-function _eval_one_run!(nb::LiveNotebook, cell::Cell)
+# The namespace the runs in flight compute into is being thrown away (a restart, a move to another
+# worker): end them all, so whatever their workers still send back is dropped, and move the epoch so the
+# runner that dispatched them hands over to one that re-establishes the namespace. Caller holds nb.lock.
+function _drop_runs!(nb::LiveNotebook)
+    for c in nb.report.cells
+        c.run === nothing || ReportEngine.end_run!(c, c.run)
+    end
+    nb.epoch += 1
+    return nothing
+end
+
+# Cells waiting on `cid` because it was stopped go back to stale, now that it has run again.
+function _release_held_on!(nb::LiveNotebook, cid::AbstractString)
+    for c in nb.report.cells
+        (c.state == BLOCKED && c.blocked == WAIT_UPSTREAM_STOPPED && c.blocked_host == cid) || continue
+        ReportEngine.restale!(c) && _broadcast_progress(nb, c)
+    end
+    return nothing
+end
+
+# The kernel a run was dispatched to, as the kernel it stands for (a boot placeholder forwards to the
+# real one), and that kernel's namespace generation, or -1 when it has none to read yet.
+_resolved_kernel(k) = (k isa PendingKernel && k.real !== nothing) ? k.real : k
+_kernel_gen(k) = (k = _resolved_kernel(k); k isa ReportEngine.GateKernel ? k.ns_gen : (k isa PendingKernel ? -1 : 0))
+
+# Whether a run's result belongs in the cell: its side's kernel is still the one it was dispatched to,
+# with the namespace it ran in. A worker replaced mid-run took that namespace with it.
+function _run_current(nb::LiveNotebook, run::ReportEngine.Run)
+    run.kernel === nothing && return true
+    cur = isempty(run.side) ? nb.kernel :
+          lock(() -> get(_REGION_KERNELS, (nb.id, run.side), nothing), _REGION_LOCK)
+    _resolved_kernel(cur) === _resolved_kernel(run.kernel) || return false
+    return run.gen < 0 || _kernel_gen(run.kernel) == run.gen
+end
+
+# Run one cell: start its run, carry it to an outcome, and end it whatever happens on the way. A cell
+# that is not stale (it ran, or was stopped) or already has a run in flight is left alone.
+function _eval_one!(nb::LiveNotebook, cell::Cell)
+    cid = cell.id
+    run = lock(nb.lock) do
+        i = _index_of(nb.report.cells, cid)
+        i === nothing && return nothing
+        c = nb.report.cells[i]
+        (c.run === nothing && c.state == STALE) || return nothing
+        r = ReportEngine.begin_run!(c)
+        _broadcast_progress(nb, c)
+        r
+    end
+    run === nothing && return nothing
+    passed_on = false
+    try
+        passed_on = _eval_one_run!(nb, cid, run) === :passed_on
+    finally
+        lock(nb.lock) do
+            i = _index_of(nb.report.cells, cid)
+            c = i === nothing ? nothing : nb.report.cells[i]
+            # An exit that settled nothing (an exception on the way) ends the run here. The cell is
+            # still STALE, so the runner comes back to it.
+            c === nothing || (ReportEngine.end_run!(c, run) && _broadcast_progress(nb, c))
+            (passed_on || (c !== nothing && c.state == BLOCKED)) || _take_force!(nb.id, cid)
+        end
+    end
+end
+
+# The cell as it stands now, by id (an edit replaces the object), or `nothing` if it is gone or its
+# run is no longer `run`.
+function _run_cell(nb::LiveNotebook, cid::AbstractString, run::ReportEngine.Run)
+    lock(nb.lock) do
+        i = _index_of(nb.report.cells, cid)
+        (i === nothing || nb.report.cells[i].run !== run) ? nothing : nb.report.cells[i]
+    end
+end
+
+function _eval_one_run!(nb::LiveNotebook, cid::AbstractString, run::ReportEngine.Run)
+    cell = _run_cell(nb, cid, run)
+    cell === nothing && return nothing
     # Code that does not parse fails now, with the parser's message. Its analysis is opaque, so it
     # waits on every cell above it, and a wait there would hide the one thing wrong with it.
     if cell.kind == CODE && :opaque in cell.flags
         msg = ReportEngine.parse_error_text(cell.source)
-        isempty(msg) || return lock(nb.lock) do
-            ReportEngine.mark_errored!(cell, msg)
-            _broadcast_progress(nb, cell)
-            nothing
-        end
+        isempty(msg) || return _settle!(c -> ReportEngine.mark_errored!(c, msg), nb, cid, run)
     end
-    # A cell whose input is waiting waits too, for the same thing. Run now it could only fail on a
-    # name its upstream has not produced. Whatever re-runs the upstream re-runs this cell with it:
-    # a granted node re-arms the region's dependents, and a run of the notebook takes up every wait.
-    # Checked and marked under one hold of the lock, so a grant re-arming the region's cells cannot
-    # land between the two and leave this cell marked after its re-arm.
+    # A cell whose input is waiting waits too, for the same thing, and a cell whose input was stopped
+    # waits for that cell to run again. Run now it could only fail on a name its upstream has not
+    # produced, or compute from what a stopped run left behind. Whatever re-runs the upstream re-runs
+    # this cell with it: a granted node re-arms the region's dependents, a stopped cell that runs again
+    # lets its readers go, and a run of the notebook takes up every wait. Checked and marked under one
+    # hold of the lock, so a grant re-arming the region's cells cannot land between the two.
     waits, passed_on = lock(nb.lock) do
         u = nothing
         for d in cell.deps
             j = _index_of(nb.report.cells, d)
-            (j !== nothing && nb.report.cells[j].state == BLOCKED) && (u = nb.report.cells[j]; break)
+            (j !== nothing && nb.report.cells[j].state in (BLOCKED, STOPPED)) && (u = nb.report.cells[j]; break)
         end
-        again = pop!(_PASSED_ON, (nb.id, cell.id), nothing) !== nothing
+        again = pop!(_PASSED_ON, (nb.id, cid), nothing) !== nothing
         u === nothing && return (false, false)
+        if u.state == STOPPED
+            _settle!(c -> ReportEngine.mark_blocked!(c, WAIT_UPSTREAM_STOPPED, u.id), nb, cid, run)
+            _take_force!(nb.id, cid)
+            return (true, false)
+        end
         # A ▶ on this cell asks for what it waits on. A node nobody has asked for yet, or a prepare
         # nobody has been offered, comes from running the cell that needs it, so the force passes there.
         # This cell then runs again after it, still forced, and waits on what the upstream's run left,
         # which is also what the caller of this run is told. Passed on once per run of this cell: an
         # upstream that still waits after its own run is waiting on something this run cannot give.
-        if !again && cell.id in get(_FORCE_RUN, nb.id, ()) &&
+        if !again && cid in get(_FORCE_RUN, nb.id, ()) &&
            u.blocked in (WAIT_NOT_REQUESTED, WAIT_NEEDS_PREPARE) && ReportEngine.restale!(u)
             push!(get!(Set{String}, _FORCE_RUN, nb.id), u.id)
-            push!(_PASSED_ON, (nb.id, cell.id))
-            ReportEngine.restale!(cell)
+            push!(_PASSED_ON, (nb.id, cid))
+            _settle!(ReportEngine.restale!, nb, cid, run)
             nb.version += 1
             return (true, true)
         end
-        ReportEngine.mark_blocked!(cell, u.blocked, u.blocked_host, u.blocked_region)
-        _broadcast_progress(nb, cell)
-        _take_force!(nb.id, cell.id)
+        _settle!(c -> ReportEngine.mark_blocked!(c, u.blocked, u.blocked_host, u.blocked_region), nb, cid, run)
+        _take_force!(nb.id, cid)
         (true, false)
     end
     passed_on && (_ensure_runner!(nb); return :passed_on)
@@ -4704,7 +4751,7 @@ function _eval_one_run!(nb::LiveNotebook, cell::Cell)
     # A locked cell computes only on its own ▶. Any other run restores the result it froze on, and only
     # where its worker is already up: it does not start one, since a region worker can mean a queue wait.
     cell.kind == CODE && _restore_only(nb, cell) && !_side_up(nb, _cell_region(cell)) &&
-        return _hold_locked!(nb, cell)
+        return _hold_locked!(nb, cid, run)
     # Region dispatch: the `region=` tag decides the kernel; a mutation auto-follows its data (see
     # _region_route). Markdown honors its tag too — its `$(…)` interpolation runs on that region's worker.
     #
@@ -4721,34 +4768,38 @@ function _eval_one_run!(nb::LiveNotebook, cell::Cell)
         # and is re-run by the thing it is waiting for (`_restale_region_cells!`) — so it must not be
         # left looking like broken code, and must not be retried in a loop by the runner.
         wait = e isa RegionWaiting
-        ReportEngine._rlog("region: " * (wait ? "holding " : "cannot route ") * cell.id * ": " * msg)
-        lock(nb.lock) do
-            wait ? ReportEngine.mark_blocked!(cell, e.why, e.host, e.region) :
-                   ReportEngine.mark_errored!(cell, msg)
-            _broadcast_progress(nb, cell)
-        end
+        ReportEngine._rlog("region: " * (wait ? "holding " : "cannot route ") * cid * ": " * msg)
+        _settle!(c -> wait ? ReportEngine.mark_blocked!(c, e.why, e.host, e.region) :
+                             ReportEngine.mark_errored!(c, msg), nb, cid, run)
         # The region's pill says what it is waiting for too (queued, prepare needed, preparing).
         wait && (try; facts_changed!(); catch; end)
         return nothing
     end
+    lock(nb.lock) do; run.side = String(side); end
     if cell.kind == MARKDOWN
         # Tagged markdown interpolates on its region (bring the kernel up first, like a code cell); an
         # untagged md (side=="") stays on main. Presync pulls any cross-boundary names it interpolates.
-        _prepare_region_for_cell!(nb, cell, kernel, side) || return nothing
-        _region_active(nb) && !isempty(side) && _stats_ran_on!(nb, cell.id, _side_label(nb, side))
-        try; _region_presync!(nb, cell, kernel; dst_side = side); catch e; @warn "slate region: md presync failed" cell = cell.id exception = e; end
-        # `eval_cell!` runs the md `$(…)` interpolation on the worker — a kernel round-trip — so it runs
-        # OFF nb.lock (protocol; mirrors the code-cell branch below). Re-take the lock only to push state.
-        ReportEngine.eval_cell!(nb.report, cell, kernel)
-        isempty(side) || lock(nb.lock) do; _broadcast_progress(nb, cell); end   # region md set RUNNING above → push the final state
+        _prepare_region_for_cell!(nb, cell, run, kernel, side) || return nothing
+        _region_active(nb) && !isempty(side) && _stats_ran_on!(nb, cid, _side_label(nb, side))
+        try; _region_presync!(nb, cell, kernel; dst_side = side); catch e; @warn "slate region: md presync failed" cell = cid exception = e; end
+        # The `$(…)` interpolation is a kernel round-trip, so it runs OFF nb.lock (protocol; mirrors the
+        # code-cell branch below). The lock is taken again only to settle the cell.
+        exprs = ReportEngine._md_interp_exprs(cell.source)
+        interp = isempty(exprs) ? ReportEngine.CellOutput[] :
+                 ReportEngine.with_run_id(() -> ReportEngine.interpolate(kernel, nb.report, exprs), run.id)
+        _settle!(nb, cid, run) do c
+            c.src_hash == run.src_hash || return nothing   # edited meanwhile: stays STALE for the new text
+            c.interp = interp
+            ReportEngine.mark_fresh!(c)
+        end
         return nothing
     end
     # The cell's cross-boundary inputs ship over after the kernel is primed. A presync failure is the
     # CELL's error — surfaced in place instead of a mystery UndefVarError on the other side.
-    _prepare_region_for_cell!(nb, cell, kernel, side) || return nothing
+    _prepare_region_for_cell!(nb, cell, run, kernel, side) || return nothing
     # Provenance for the DAG/stats: which kernel this run executes on (only meaningful — and
     # only recorded — while a region is active; users otherwise know where cells run).
-    _region_active(nb) && _stats_ran_on!(nb, cell.id, _side_label(nb, side))
+    _region_active(nb) && _stats_ran_on!(nb, cid, _side_label(nb, side))
     presync_err = try
         _region_presync!(nb, cell, kernel; dst_side = side)
         nothing
@@ -4761,43 +4812,52 @@ function _eval_one_run!(nb::LiveNotebook, cell::Cell)
         # from the transfer rather than from the run. Reported as a failure it puts the spurious
         # red back on the DOWNSTREAM cell, which is the symptom BLOCKED exists to remove.
         wait = presync_err isa RegionWaiting
-        wait && ReportEngine._rlog("region: holding " * cell.id * " (input transfer): " *
+        wait && ReportEngine._rlog("region: holding " * cid * " (input transfer): " *
                                    sprint(showerror, presync_err))
-        lock(nb.lock) do
-            wait ? ReportEngine.mark_blocked!(cell, presync_err.why, presync_err.host, presync_err.region) :
-                   ReportEngine.mark_errored!(cell, "region boundary transfer failed: " *
-                                                    sprint(showerror, presync_err))
-            _broadcast_progress(nb, cell)
-        end
+        msg = "region boundary transfer failed: " * sprint(showerror, presync_err)
+        _settle!(c -> wait ? ReportEngine.mark_blocked!(c, presync_err.why, presync_err.host, presync_err.region) :
+                             ReportEngine.mark_errored!(c, msg), nb, cid, run)
         return nothing
     end
-    # Everything a region cell had to wait for is done; from here it is on a worker like any other,
-    # and the orphan reconciler should judge it normally again.
-    _region_prepared!(nb.id, cell.id)
     let rg = _cell_region(cell)
         if !isempty(rg)
             _region_used!(rg)              # the idle clock runs from region CELLS, not worker traffic
             try; facts_changed!(); catch; end   # …and the panel is showing that clock
         end
     end
-    src, srchash, memo, locked = lock(nb.lock) do
-        ReportEngine.mark_running!(cell)
-        _broadcast_progress(nb, cell)
-        s = (:trace in cell.flags) ? string("@trace begin ", cell.source, "\nend") : cell.source
-        frc = _take_force!(nb.id, cell.id)   # consume a one-shot ▶ force marker
-        locked = :locked in cell.flags
-        m = _memo_spec(nb, cell; forced = frc)
-        (s, cell.src_hash, m, locked)
+    # Hand it to the worker: from here the run is dispatched, and judged by what the worker says it is
+    # running. Read from the cell as it is now. A Stop asked during the bring-up ends the run here,
+    # without dispatching it; an edit made during it leaves the cell for the runner to take up again.
+    spec = lock(nb.lock) do
+        i = _index_of(nb.report.cells, cid)
+        i === nothing && return nothing
+        c = nb.report.cells[i]
+        c.run === run || return nothing
+        c.src_hash == run.src_hash || return :edited
+        run.stop_at > 0 && return :stopped
+        run.phase = :dispatched
+        run.dispatched = time()
+        run.kernel = kernel
+        run.gen = _kernel_gen(kernel)
+        s = (:trace in c.flags) ? string("@trace begin ", c.source, "\nend") : c.source
+        frc = _take_force!(nb.id, cid)   # consume a one-shot ▶ force marker
+        (; src = s, memo = _memo_spec(nb, c; forced = frc), locked = :locked in c.flags)
     end
+    spec === nothing && return nothing
+    spec === :edited && return _settle!(c -> nothing, nb, cid, run)
+    spec === :stopped && return _settle!(c -> ReportEngine.mark_stopped!(c, c.output), nb, cid, run)
+    src, memo, locked = spec.src, spec.memo, spec.locked
     # Nothing to restore from: a locked cell with no key is held without asking the worker.
-    (memo.restore_only && isempty(memo.key)) && return _hold_locked!(nb, cell)
+    (memo.restore_only && isempty(memo.key)) && return _hold_locked!(nb, cid, run)
     armed = _arm_requested_profile!(nb, cell, kernel, side)   # server_profile.jl: a profile asked of this run
     out = try
         # `region`/`regions` seed the cell's task-local Slate execution context (`slate_context()`): the
         # effective side it runs on ("" = main) + the notebook's declared regions. Generic — a region-aware
         # package reads it to default its own args; no package-specific knowledge lives here.
-        ReportEngine.eval_capture(kernel, nb.report, src, "cell:" * cell.id, memo;
-                                  region = side, regions = _nb_region_names(nb))
+        ReportEngine.with_run_id(run.id) do
+            ReportEngine.eval_capture(kernel, nb.report, src, "cell:" * cid, memo;
+                                      region = side, regions = _nb_region_names(nb))
+        end
     catch e
         ReportEngine.CellOutput("", ReportEngine.MimeChunk[], Any[], Any[], ReportEngine.BindSpec[],
                                 "", sprint(showerror, e), nothing, 0.0)
@@ -4807,7 +4867,7 @@ function _eval_one_run!(nb::LiveNotebook, cell::Cell)
     # in play — region cells need the same modules loaded. Mirrors run on main + each region any
     # cell references, except the side that just ran. Results discarded (the main run's output
     # stands); a failure logs rather than erroring the cell (that side surfaces it on first use).
-    out.memo == "absent" && return _hold_locked!(nb, cell)   # restore-only, and nothing was stored
+    out.memo == "absent" && return _hold_locked!(nb, cid, run)   # restore-only, and nothing was stored
     if _region_active(nb) && ReportEngine._is_pure_using(cell.source) && out.exception === nothing
         sides = Set{String}([""])
         for c in nb.report.cells
@@ -4817,36 +4877,27 @@ function _eval_one_run!(nb::LiveNotebook, cell::Cell)
         for sd in sides
             try
                 other = _side_kernel!(nb, sd)
-                r2 = ReportEngine.eval_capture(other, nb.report, src, "cell:" * cell.id * "#mirror", nothing)
+                r2 = ReportEngine.eval_capture(other, nb.report, src, "cell:" * cid * "#mirror", nothing)
                 r2.exception === nothing ||
-                    ReportEngine._rlog("region: `using` mirror of $(cell.id) failed on $(_side_label(nb, sd)): $(first(String(r2.exception), 200))")
+                    ReportEngine._rlog("region: `using` mirror of $(cid) failed on $(_side_label(nb, sd)): $(first(String(r2.exception), 200))")
             catch e
-                ReportEngine._rlog("region: `using` mirror of $(cell.id) errored on $(_side_label(nb, sd)): $(first(sprint(showerror, e), 200))")
+                ReportEngine._rlog("region: `using` mirror of $(cid) errored on $(_side_label(nb, sd)): $(first(sprint(showerror, e), 200))")
             end
         end
     end
-    relock = lock(nb.lock) do
-        i = _index_of(nb.report.cells, cell.id)
-        i === nothing && return nothing                  # deleted mid-run → drop
-        c = nb.report.cells[i]
-        if c.src_hash != srchash
-            # Edited mid-run: the in-flight result is for the OLD source — discard it AND mark the
-            # cell STALE so the runner re-runs it with the new source (it may have been left RUNNING).
-            ReportEngine.revert_running!(c)
-            return nothing
-        end
-        # …and the same for VALUES: a reactive push restaled this cell while it was running, so the
-        # result in hand was computed from inputs that have since changed. KEEP it (a stale answer
-        # still beats a blank cell while the re-run lands) but leave the cell STALE afterwards so the
-        # runner comes back to it — the state is what decides whether anything ever recomputes.
-        _dirty = pop!(get!(Set{String}, _DIRTY_WHILE_RUNNING, nb.id), c.id, nothing) !== nothing
-        ReportEngine.mark_result!(c, out)
-        _dirty && ReportEngine.restale!(c)
+    relock = _settle!(nb, cid, run) do c
+        # A result computed for source that has since changed, or in a namespace that has since been
+        # replaced, is not this cell's: it stays STALE and runs again.
+        c.src_hash == run.src_hash || return nothing
+        _run_current(nb, run) || (ReportEngine.restale!(c); return nothing)
+        # A run Stop was asked of that came back with an error ended at the stop; one that finished
+        # before the stop reached it keeps its result.
+        stopped = run.stop_at > 0 && out.exception !== nothing
+        stopped ? ReportEngine.mark_stopped!(c, out) : ReportEngine.mark_result!(c, out)
         c.binds = out.binds
         _apply_cell_effects!(nb, c, out)                 # code→Slate declarations (e.g. :everywhere classification)
         _stats_record!(nb, c; profiled = armed !== nothing)   # before the broadcast — the push carries fresh stats
         _run_log!(nb, isempty(side) ? "local" : side, c; profile = profiled)   # the side as `_kernel_side_label` names it
-        _broadcast_progress(nb, c)
         # A successful `locked` run freezes ON this key: persist it (surviving a restart — the `.jl`
         # footer round-trips `c.flags`) and swap the durable-store pin, outside the lock (a gate RPC —
         # see `memo_pin!`). A forced re-run or the first freeze also bumps the FREEZE STAMP (code-key +
@@ -4923,7 +4974,7 @@ _emit_pending(nb::LiveNotebook, pending::Integer; fresh::Bool = false) =
 # When enabled and a gate worker backs the notebook, the runner hands ALL stale code cells to the
 # worker AT ONCE; the worker schedules them (par_blockers) so independent cells run concurrently in
 # its one warm namespace while any conflicting pair serialises, and streams each result back as it
-# lands (slate_celldone → server_celldone). This is the genuine novelty: notebooks have never run
+# lands. This is the genuine novelty: notebooks have never run
 # cells in parallel. Off by default — the proven serial path is untouched unless the flag is set.
 # Default for notebooks that haven't explicitly set meta["parallel"]. That per-notebook flag is
 # IN-MEMORY and resets whenever the notebook is re-opened/rebuilt from its .jl (every extension restart
@@ -4978,11 +5029,6 @@ function _runon_source(report)
     return "default"   # local
 end
 
-# Per-(notebook,run) snapshot of each batched cell's src_hash at launch — the version guard for a
-# streamed result (a cell edited mid-batch has its in-flight result discarded; see server_celldone).
-const _BATCH_SNAPS = Dict{String,Dict{String,UInt64}}()
-const _BATCH_SEQ = Threads.Atomic{Int}(0)
-
 # Does a code cell DEFINE methods / types / macros? Such cells mutate the worker's method & type
 # tables, which is unsafe to do concurrently with other evals — so they run as a serial barrier
 # (sent `opaque`, which par_blockers treats two-way). def→use is ALSO already serialised by dataflow
@@ -5000,10 +5046,6 @@ function _cell_defines(cell::Cell)
     return false
 end
 
-# Per-notebook flag: a stop request sets it so the scheduler short-circuits cells that haven't started
-# yet (in-flight cells are interrupted via the worker's __slate_cancel). Keyed by nb.id.
-const _PARALLEL_CANCEL = Dict{String,Bool}()
-
 # Cell ids whose NEXT eval must skip the memo restore (nb.id → ids). The explicit ▶ play button is a
 # re-evaluation request — restoring the cached result there reads as "the button does nothing" — but
 # the fresh result is still STORED, so the entry stays warm. Registered by edit_cell!(force=true),
@@ -5020,32 +5062,41 @@ function _take_force!(nbid::AbstractString, cid::AbstractString)
     return true
 end
 
-# Preempt superseded in-flight cells: an edit/delete of a RUNNING cell makes the computation in
-# flight worthless — its result is already version-guarded away on completion (the src_hash compare
-# in `_eval_one!`/`server_celldone`) — so all it can do is burn worker time and delay the fresh
-# run. Best-effort interrupt of just those cells' evaluator tasks; NEVER a correctness dependency
-# (a tight allocation-free loop has no safepoint and won't stop — discard-on-completion remains the
-# backstop). Exclusions: a method/type/macro-DEFINING cell is never preempted (a half-applied
-# method table is worse than a wasted run), nor a graphics cell (an interrupt mid-plot can wedge
-# Makie's display stack). Callers hold nb.lock and pass the PRE-EDIT cells (in-flight source/state).
-_preempt_victims(cells) = String[c.id for c in cells
-                                 if c.kind == CODE && c.state == RUNNING &&
-                                    !_cell_defines(c) && !_uses_shared_graphics(c.source)]
+# Preempt superseded in-flight cells: an edit/delete of a running cell makes the computation in
+# flight worthless — its result is dropped when it lands (`_settle!` compares the run's source with the
+# cell's) — so all it can do is burn worker time and delay the fresh run. Best-effort: each run is asked
+# to stop on the worker it was dispatched to, never a correctness dependency (a loop with no checkpoint
+# runs on until it ends, and its result is dropped then). Exclusions: a method/type/macro-DEFINING cell
+# is never preempted (a half-applied method table is worse than a wasted run), nor a graphics cell (an
+# interrupt mid-plot can wedge Makie's display stack). Callers hold nb.lock and pass the PRE-EDIT cells
+# (in-flight source); the cancels are sent from a task of their own, since a worker round-trip must
+# never be made under nb.lock.
+_preempt_victims(cells) = [c for c in cells
+                           if c.kind !== MARKDOWN && c.run !== nothing && c.run.phase === :dispatched &&
+                              !_cell_defines(c) && !_uses_shared_graphics(c.source)]
 function _preempt_superseded!(nb::LiveNotebook, cells)
     victims = _preempt_victims(cells)
     isempty(victims) && return nothing
-    n = 0
-    # Each on the worker it runs on: a region cell's evaluator is in its region's worker.
-    for (_, k, ids) in _running_kernels(nb, [c for c in cells if c.id in victims])
-        n += try
+    targets = _run_kernels([c.run for c in victims])
+    @info "slate: preempting superseded in-flight cells" notebook = nb.id cells = join((c.id for c in victims), ",")
+    Threads.@spawn for (k, ids) in targets
+        try
             ReportEngine.cancel_cells(k, nb.report, ids)
         catch e
-            @debug "slate: preempt failed (discard-on-completion still applies)" exception = e
-            0
+            @debug "slate: preempt failed (the result is dropped when it lands)" exception = e
         end
     end
-    n > 0 && @info "slate: preempted superseded in-flight cells" notebook = nb.id cells = join(victims, ",")
     return nothing
+end
+
+# Dispatched runs grouped by the kernel each was handed to: `[(kernel, run ids)]`.
+function _run_kernels(runs)
+    by = IdDict{Any,Vector{String}}()
+    for r in runs
+        (r !== nothing && r.phase === :dispatched && r.kernel !== nothing) || continue
+        push!(get!(Vector{String}, by, r.kernel), r.id)
+    end
+    return [(k, ids) for (k, ids) in by]
 end
 
 # The cells a parallel drain will evaluate, in document order — EVERY one of them, which is what
@@ -5058,7 +5109,7 @@ end
 # MARKDOWN is excluded because the serial path renders it (static prose first, interpolating prose
 # after its deps); TOOL because it never runs automatically, so deferring its readers would strand
 # them rather than order them.
-_batch_cells(cells) = [c for c in cells if c.state == STALE && c.kind !== MARKDOWN &&
+_batch_cells(cells) = [c for c in cells if c.state == STALE && c.run === nothing && c.kind !== MARKDOWN &&
                        ReportEngine.runs_automatically(c.kind)]
 
 # Build the parallel-batch scheduler specs for the cells about to run (document order). Plotting cells share
@@ -5095,7 +5146,7 @@ function _run_code_batch!(nb::LiveNotebook)
         runnable = _batch_cells(nb.report.cells)
         length(runnable) < 2 && return (nothing, 0)
         ss = _batch_specs(runnable)
-        (ss, count(c -> c.state in (STALE, RUNNING), nb.report.cells))
+        (ss, _pending_count(nb.report))
     end
     specs === nothing && return false
     # Bring the worker up ONCE (prepare! is locked + idempotent, so the concurrent per-cell evals just
@@ -5106,7 +5157,6 @@ function _run_code_batch!(nb::LiveNotebook)
         @warn "slate parallel: worker not ready — falling back to serial" notebook = nb.id exception = e
         return false
     end
-    _PARALLEL_CANCEL[nb.id] = false
     _emit_pending(nb, npending)
     pool = something(tryparse(Int, get(ENV, "KAIMONSLATE_PARALLEL_POOL", "")), 8)
     run_scheduled(specs, pool, function (id)
@@ -5115,18 +5165,10 @@ function _run_code_batch!(nb::LiveNotebook)
             i === nothing ? nothing : nb.report.cells[i]
         end
         cell === nothing && return nothing
-        if get(_PARALLEL_CANCEL, nb.id, false)
-            # Cancelled before this cell started → mark it interrupted, don't run.
-            lock(nb.lock) do
-                (cell.state in (STALE, RUNNING)) || return
-                ReportEngine.mark_errored!(cell, "InterruptException: run cancelled")
-                _broadcast_progress(nb, cell)
-            end
-            return nothing
-        end
-        _eval_one!(nb, cell)   # marks RUNNING + broadcasts, evals OFF-lock, merges version-guarded + broadcasts
+        # Stopped before this cell started: it is not started, and stays stale for the next run asked for.
+        lock(() -> nb.halted, nb.lock) && return nothing
+        _eval_one!(nb, cell)   # starts its run, evals OFF-lock, settles it + broadcasts
     end)
-    delete!(_PARALLEL_CANCEL, nb.id)
     return true
 end
 
@@ -5194,36 +5236,23 @@ function server_toolcall(nb::LiveNotebook, p)
     return nothing
 end
 
-# Merge one streamed parallel-batch result (from the worker's slate_celldone) into the notebook,
-# version-guarded against a mid-batch edit, and push the single-cell live patch — mirrors _eval_one!'s
-# merge so a parallel cell lands in the UI exactly like a serial one.
-function server_celldone(nb::LiveNotebook, run_id::AbstractString, cid::AbstractString, wire)
-    out = ReportEngine._wire_to_output(wire)
+# A live (session-bound) output re-rendered for a browser that just connected (see
+# `_run_live_rerender_loop!`). It replaces only what the cell displays: the run that produced the cell
+# stands, and so do its state, binds, printed output and effects. A cell with a run in flight, or one
+# that is not up to date, keeps what it has; its run will produce a fresh view anyway.
+function apply_live_rerender!(nb::LiveNotebook, cid::AbstractString, wire)
+    fresh = ReportEngine._wire_to_output(wire)
     lock(nb.lock) do
         i = _index_of(nb.report.cells, cid)
-        i === nothing && return                          # deleted mid-batch → drop
+        i === nothing && return
         c = nb.report.cells[i]
-        snap = get(_BATCH_SNAPS, string(nb.report.id, "|", run_id), nothing)
-        expect = snap === nothing ? nothing : get(snap, String(cid), nothing)
-        if expect !== nothing && c.src_hash != expect
-            ReportEngine.revert_running!(c)                # edited mid-batch → re-run with new source
-            return
-        end
-        # Restaled by a reactive push mid-batch → keep the result, but stay STALE so it runs again
-        # (see `_DIRTY_WHILE_RUNNING`; the same hazard as the src_hash check above, for values).
-        _dirty = pop!(get!(Set{String}, _DIRTY_WHILE_RUNNING, nb.id), c.id, nothing) !== nothing
-        ReportEngine.mark_result!(c, out)
-        _dirty && ReportEngine.restale!(c)
-        # A live re-render (`run_id == "reconnect"`) delivers only the fresh fragment for a browser
-        # that just connected. Its wire carries no binds, because it is not a cell evaluation
-        # result — so assigning them here DELETES the controls of any cell that both declares
-        # `@bind`s and returns a session-bound output. That is exactly the shape of a figure drawn
-        # with its own controls: they stayed declared in Julia but vanished from the page the
-        # moment a browser connected, so nothing on the client could drive them.
-        run_id == "reconnect" || (c.binds = out.binds)
-        _apply_cell_effects!(nb, c, out)                 # code→Slate declarations (e.g. :everywhere classification)
-        _stats_record!(nb, c)                            # before the broadcast — the push carries fresh stats
-        run_id == "reconnect" || _run_log!(nb, "local", c)   # a parallel batch runs on the main kernel
+        (c.run === nothing && c.state == FRESH && c.output !== nothing) || return
+        o = c.output
+        c.output = ReportEngine.CellOutput(o.stdout, fresh.display, o.echarts, o.tables, o.binds, o.value_repr,
+                                           o.exception, o.backtrace, o.duration_ms, o.trace, o.stderr, o.overflow,
+                                           o.animations, o.memo, o.memo_why, o.effects,
+                                           isempty(fresh.assets) ? o.assets : fresh.assets, true)
+        ReportEngine.bump_rev!(c)
         _broadcast_progress(nb, c)
     end
     return nothing
@@ -5289,6 +5318,7 @@ function _reestablish_fresh_namespace!(nb::LiveNotebook)
 end
 
 function _run_loop!(nb::LiveNotebook)
+    epoch = lock(() -> nb.epoch, nb.lock)
     try
         _reestablish_fresh_namespace!(nb)   # a swapped/fresh worker → seed binds from host + re-stale (before draining)
         # Resolve bare-`using` exports BEFORE the first eval of a session, so the dependency graph —
@@ -5327,6 +5357,10 @@ function _run_loop!(nb::LiveNotebook)
                 ReportEngine._rlog("slate: runner for $(nb.id) stopped — notebook was closed mid-drain")
                 break
             end
+            # Stop starts nothing new; a namespace thrown away under this runner is re-established by a
+            # fresh one (the `finally` below hands over), not run into.
+            halted, moved = lock(nb.lock) do; (nb.halted, nb.epoch != epoch); end
+            (halted || moved) && break
             # Parallel fast-path: hand all stale code cells to the worker at once (opt-in). Falls through
             # to the serial step for markdown, reactive restales, and the 0/1-code-cell case. Held under
             # the eval mutex so a concurrent slate.eval scratch poke can't race the batch.
@@ -5335,7 +5369,7 @@ function _run_loop!(nb::LiveNotebook)
             end
             target, pending = lock(nb.lock) do
                 t = _next_stale_cell(nb.report)
-                t, count(c -> c.state in (STALE, RUNNING), nb.report.cells)
+                t, _pending_count(nb.report)
             end
             target === nothing && break
             _emit_pending(nb, pending)          # k/N pill: PENDING (stale+running); frontend adds done
@@ -5383,7 +5417,7 @@ function _run_loop!(nb::LiveNotebook)
             c
         end
         if !was_cancelled
-            again = lock(nb.lock) do; _next_stale_cell(nb.report) !== nothing; end
+            again = lock(nb.lock) do; !nb.halted && _next_stale_cell(nb.report) !== nothing; end
             # Give up re-arming after too many consecutive failures — the work is wedged (a dead region, a cell
             # that can't resolve). A user edit / explicit re-run clears the counter (the drain path above) and
             # revives it. Without this cap a permanently-failing pass spins forever.
@@ -5427,7 +5461,11 @@ function _eval!(nb::LiveNotebook; wait_for::AbstractString = "", wait_all::Bool 
     # run in progress and says so; making that the explicit case rather than the default means a new
     # call site is counted as a run rather than silently folded into the previous one.
     fresh && _run_asked!(nb)
-    p = lock(nb.lock) do; count(c -> c.state in (STALE, RUNNING), nb.report.cells); end
+    # A run asked for (rather than a reactive cascade continuing one) ends a Stop's halt.
+    p = lock(nb.lock) do
+        fresh && (nb.halted = false)
+        _pending_count(nb.report)
+    end
     p > 0 && _emit_pending(nb, p; fresh = fresh)
     _ensure_runner!(nb)
     (isempty(wait_for) && !wait_all) && return nb
@@ -5438,11 +5476,16 @@ function _eval!(nb::LiveNotebook; wait_for::AbstractString = "", wait_all::Bool 
         done = lock(nb.lock) do
             if !isempty(wait_for)
                 i = _index_of(nb.report.cells, wait_for)
-                # BLOCKED counts as settled: the cell is not going to progress on its own, and the
-                # thing it waits for re-runs it later. Without it, a caller waiting on a cell queued
-                # for a cluster node spins until its own timeout.
-                return i === nothing || nb.report.cells[i].state in (FRESH, ERRORED, BLOCKED)
+                i === nothing && return true
+                c = nb.report.cells[i]
+                c.run === nothing || return false
+                # Anything but STALE is settled. BLOCKED too: the cell is not going to progress on its
+                # own, and the thing it waits for re-runs it later — without it, a caller waiting on a
+                # cell queued for a cluster node spins until its own timeout. A STALE cell is settled
+                # once Stop has halted the notebook, since nothing will start it.
+                return c.state != STALE || nb.halted
             end
+            nb.halted && return !any(is_running, nb.report.cells)
             return _next_stale_cell(nb.report) === nothing
         end
         if done
@@ -5475,8 +5518,7 @@ const _USERPROG_LOCK = ReentrantLock()
 # left, and whatever the cell last reported through `slate_progress`.
 function _note_run_progress(nb::LiveNotebook, wait_for::AbstractString, t0::Float64)
     running, pending = lock(nb.lock) do
-        ([c.id for c in nb.report.cells if c.state == RUNNING],
-         count(c -> c.state in (STALE, RUNNING), nb.report.cells))
+        ([c.id for c in nb.report.cells if is_running(c)], _pending_count(nb.report))
     end
     parts = String[isempty(running) ?
                    (isempty(wait_for) ? "draining" : "waiting on $wait_for") :

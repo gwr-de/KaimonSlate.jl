@@ -155,7 +155,6 @@ function refresh_live_watches!(nb::LiveNotebook)
         # is the whole reason for writing one instead of pointing at a cell.
         run_src = startswith(spec, "cell:") ? src : _wrap_frame_scope(src, names)
         cell = Cell(string("__dbglive", i), CODE, src)   # show what was WRITTEN, not the wrapper
-        ReportEngine.mark_running!(cell)
         out = try
             lock(_eval_mutex(nb)) do
                 ReportEngine.eval_capture(nb.kernel, nb.report, run_src, "dbglive")

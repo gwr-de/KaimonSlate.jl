@@ -208,7 +208,7 @@ function profile_now!(nb::LiveNotebook, cid::AbstractString; mode::AbstractStrin
     t0 = time()
     try
         # A run already under way is not the profiled one: it finishes first.
-        lock(nb.lock) do; cell.state == RUNNING; end && _eval!(nb; wait_for = cid, fresh = false)
+        lock(nb.lock) do; is_running(cell); end && _eval!(nb; wait_for = cid, fresh = false)
         lock(_PROF_HUB_LOCK) do; _PROF_ASKED[key] = (; mode = String(mode), opts...); end
         lock(nb.lock) do; _force_cell!(nb, cid); end || error("the cell is running; profile it again once it is done")
         _eval!(nb; wait_for = cid)

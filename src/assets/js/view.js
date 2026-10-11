@@ -365,7 +365,7 @@ function _cellRegionSet() {
 // itself rather than as nothing, so a new one is visible instead of silently blank.
 const BLOCKED_TEXT = { queued: 'queued', not_signed_in: 'not signed in', connecting: 'connecting',
                        not_requested: 'run to request a node', needs_prepare: 'prepare the region',
-                       preparing: 'preparing', locked: 'locked' };
+                       preparing: 'preparing', locked: 'locked', upstream_stopped: 'upstream stopped' };
 // The waits something is working through. The rest wait for a person (a run, a prepare, a sign-in),
 // and a clock on those reads as if they would end by themselves.
 const BLOCKED_TICKS = new Set(['queued', 'connecting', 'preparing']);
@@ -386,6 +386,12 @@ function cellRegionChip(c) {
                     : 'Reads ' + c.blockedHost + ', a locked cell not computed yet. Its ▶ computes it.';
     return `<span class="cregion blocked" data-bkey="${_esc(_blockedKey(c))}" title="${_esc(tip)}">🔒` +
       ` <span class="cregst">${own ? '▶ to compute' : 'waits on ' + _esc(c.blockedHost)}</span></span>`;
+  }
+  // A cell reading one that was stopped: it waits for that cell to run again, not on a machine.
+  if (blocked && c.blocked === 'upstream_stopped') {
+    const tip = 'Reads ' + c.blockedHost + ', which was stopped. Running it again runs this one.';
+    return `<span class="cregion blocked" data-bkey="${_esc(_blockedKey(c))}" title="${_esc(tip)}">■` +
+      ` <span class="cregst">waits on ${_esc(c.blockedHost)}</span></span>`;
   }
   if (!blocked && set.size < 2 && set.has('local')) return '';
   const loc = _cellRunLoc(c);

@@ -103,93 +103,60 @@ function _cell_locals(code::AbstractString)
     return out
 end
 
-# Restart a notebook's kernel: kill its worker (a gate worker is a real subprocess;
-# no-op in-process), then re-evaluate from a fresh namespace. The gate kernel
-# respawns a worker on the next `prepare!`.
-# Graceful stop: ask the running cells to stop WITHOUT killing any namespace, on every worker that has
-# one running: the main kernel and each region's. The stopped cells stream back as errors and every
-# already-finished result survives. With nothing running it only keeps the scheduler from starting
-# more. A full restart is the fallback only when cells are running and no worker answered.
-# `cancel(kernel, ids)` asks one kernel's running cells to stop and returns how many, or -1 for no
-# answer.
-function cancel_run!(nb::LiveNotebook; cancel = _cancel_kernel)
-    _PARALLEL_CANCEL[nb.id] = true            # stop the parallel scheduler from starting not-yet-run cells
-    running = lock(nb.lock) do; _running_kernels(nb); end
-    isempty(running) && return nb
-    acked = [(side, ids, cancel(k, ids)) for (side, k, ids) in running]
-    if any(a -> a[3] >= 0, acked)
-        n = sum((c for (_, _, c) in acked if c >= 0); init = 0)
-        missed = [isempty(side) ? "main" : side for (side, _, c) in acked if c < 0]
-        @info "slate: asked running cells to stop (namespace preserved)" notebook = nb.id cells = n unanswered = join(missed, ", ")
-        # What was asked, and when: a cell still running some seconds later is shown as not stopping.
+# Stop. Every run in flight is asked to stop, and the runner starts nothing new until a run is asked
+# for (▶, run all, an edit). A run still being prepared (a region coming up) ends before it is
+# dispatched. A dispatched run is asked on the worker it was handed to, by its run id, and ends at its
+# next checkpoint, progress report or log record, or where it waits; the namespace and every finished
+# result stay. Nothing is restarted here: a run that does not stop shows as still running, with its
+# worker's restart beside it. `cancel(kernel, run ids)` asks one kernel and returns how many of them it
+# had running, or -1 for no answer.
+function cancel_run!(nb::LiveNotebook; cancel = (k, ids) -> _cancel_kernel(k, nb.report, ids))
+    targets = lock(nb.lock) do
+        nb.halted = true
         t = time()
-        lock(_STOP_ASKED_LOCK) do
-            for (side, ids, c) in acked
-                c >= 0 && (_STOP_ASKED[(nb.id, side)] = (t, ids))
-            end
-        end
-        try; facts_changed!(); catch; end
-        try; _broadcast(nb, "cancelled:$n"); catch; end
-        return nb
+        runs = [c.run for c in nb.report.cells if c.run !== nothing]
+        for r in runs; r.stop_at == 0 && (r.stop_at = t); end
+        _run_kernels(runs)
     end
-    return restart_kernel!(nb)
+    acked = [(k, cancel(k, ids)) for (k, ids) in targets]
+    n = sum((c for (_, c) in acked if c >= 0); init = 0)
+    missed = count(a -> a[2] < 0, acked)
+    isempty(targets) || @info "slate: asked running cells to stop (namespace preserved)" notebook = nb.id cells = n unanswered = missed
+    try; facts_changed!(); catch; end
+    try; _broadcast(nb, "cancelled:$n"); catch; end
+    return nb
 end
 
-# A worker still starting has nothing running yet: its cells show as stopping, and as still running
-# if they start before the stop can reach them.
-_cancel_kernel(k, ids) = k isa ReportEngine.GateKernel ? (k.conn === nothing ? 0 : ReportEngine.cancel_eval(k)) :
-                         k isa ReportEngine.InProcessKernel ? ReportEngine.request_stop!(ids) : -1
+# A worker still starting has nothing running yet. Its runs show as stopping, and as still running if
+# they start before the stop can reach them.
+_cancel_kernel(k, report, ids) = (k = _resolved_kernel(k);
+    k isa ReportEngine.GateKernel ? ReportEngine.cancel_cells(k, report, ids) :
+    k isa ReportEngine.InProcessKernel ? ReportEngine.request_stop!(ids) : -1)
 
-# Stops asked of each worker: (nb id, side) → (when, the cells). Read by the worker's facts while any
-# of those cells still runs.
-const _STOP_ASKED = Dict{Tuple{String,String},Tuple{Float64,Vector{String}}}()
-const _STOP_ASKED_LOCK = ReentrantLock()
-
-# The stop asked of this worker that its cells have not yet honoured: (when, cells still running), or
-# nothing. A record whose cells have all finished is dropped.
+# The stop asked of this side's runs that they have not yet honoured: (when it was asked, the cells
+# still running), or nothing.
 function _stop_pending(nb::LiveNotebook, side::AbstractString)
-    key = (nb.id, String(side))
-    rec = lock(() -> get(_STOP_ASKED, key, nothing), _STOP_ASKED_LOCK)
-    rec === nothing && return nothing
-    still = String[c.id for c in nb.report.cells if c.id in rec[2] && c.state == RUNNING]
-    if isempty(still)
-        lock(() -> (get(_STOP_ASKED, key, nothing) === rec && delete!(_STOP_ASKED, key)), _STOP_ASKED_LOCK)
-        return nothing
+    lock(nb.lock) do
+        still = [c for c in nb.report.cells if c.run !== nothing && c.run.stop_at > 0 && c.run.side == side]
+        isempty(still) ? nothing : (minimum(c.run.stop_at for c in still), String[c.id for c in still])
     end
-    return (rec[1], still)
-end
-
-# The kernels running a cell now, as (side, kernel, cell ids): the main kernel ("") and each region
-# kernel, by the side each running cell executes on. A region with no kernel is skipped: nothing of it
-# is running. Callers hold nb.lock.
-function _running_kernels(nb::LiveNotebook, cells = nb.report.cells)
-    bySide = Dict{String,Vector{String}}()
-    for c in cells
-        c.kind == CODE && c.state == RUNNING && push!(get!(Vector{String}, bySide, _cell_side(nb, c)), c.id)
-    end
-    out = Tuple{String,Any,Vector{String}}[]
-    for (side, ids) in sort!(collect(bySide); by = first)
-        k = isempty(side) ? nb.kernel : lock(() -> get(_REGION_KERNELS, (nb.id, side), nothing), _REGION_LOCK)
-        k === nothing || push!(out, (side, k, ids))
-    end
-    return out
 end
 
 # Interrupt whatever is evaluating RIGHT NOW, without restarting or clearing the namespace — used just
-# before we tear the kernel down for a run-location / worker switch. `shutdown!` grabs the kernel lock
-# and an in-flight `eval_batch` blocks in its gate round-trip, so WITHOUT this the switch waits for the
-# current cell to finish; `cancel_eval` lands while the batch is in flight and makes it return promptly.
-# No restart fallback (unlike `cancel_run!`) — the caller re-picks the kernel next. Must be called
-# OUTSIDE nb.lock (it does a gate round-trip). Returns the number of cells interrupted.
+# before we tear the kernel down for a run-location / worker switch, so `shutdown!` doesn't wait behind
+# the current cell. No restart fallback (unlike a full restart) — the caller re-picks the kernel next.
+# Must be called OUTSIDE nb.lock (it does a gate round-trip). Returns the number of cells interrupted.
 function _interrupt_inflight!(nb::LiveNotebook)
-    _PARALLEL_CANCEL[nb.id] = true            # stop the scheduler starting not-yet-run cells
     k = nb.kernel
-    hasrunning = lock(nb.lock) do; any(c -> c.state == RUNNING, nb.report.cells); end
+    hasrunning = lock(nb.lock) do; any(is_running, nb.report.cells); end
     (k isa ReportEngine.GateKernel && hasrunning) || return 0
     n = ReportEngine.cancel_eval(k)
     return n < 0 ? 0 : n
 end
 
+# Restart a notebook's kernel: kill its worker (a gate worker is a real subprocess;
+# no-op in-process), then re-evaluate from a fresh namespace. The gate kernel
+# respawns a worker on the next `prepare!`.
 function restart_kernel!(nb::LiveNotebook)
     # Tear down + reset synchronously (fast), mark a background re-run underway, and RETURN — the
     # full re-eval (which respawns the worker on prepare! and streams cells back) runs async, so the
@@ -205,6 +172,8 @@ function restart_kernel!(nb::LiveNotebook)
     try; ReportEngine.shutdown!(nb.kernel; kill_remote = true); catch; end
     _teardown_region!(nb; kill = true)       # region kernels restart fresh too (+ sync state reset)
     with_report(nb) do report                # lock only for the report reset/mutate (no round-trip)
+        _drop_runs!(nb)                      # a late answer from the worker that is going is nobody's
+        nb.halted = false                    # a restart is a run asked for
         ReportEngine.reset!(nb.kernel, report)
         build_dependencies!(report)
         report.meta["hydrating"] = true
@@ -254,6 +223,7 @@ function set_remote_worker!(nb::LiveNotebook, spec::AbstractString)
         build_dependencies!(report)
         # New worker → empty namespace → re-run every cell (this is what drives prepare!→attach). Cells
         # left FRESH would give the runner nothing to do and the worker would never be reached. See reset!.
+        _drop_runs!(nb)
         ReportEngine.reset_all!(report)
         report.meta["hydrating"] = true
         nb.version += 1
@@ -322,6 +292,7 @@ function set_run_on!(nb::LiveNotebook, spec::AbstractString; scope::Symbol = :se
         build_dependencies!(report)
         # The new worker has an EMPTY namespace → every cell must re-run on it. Invalidate all cells so
         # `_drain!` re-evaluates them; mirrors ReportEngine.reset!.
+        _drop_runs!(nb)
         ReportEngine.reset_all!(report)
         delete!(report.meta, "hydrate_error")
         report.meta["hydrating"] = true
@@ -357,7 +328,8 @@ function set_run_on!(nb::LiveNotebook, spec::AbstractString; scope::Symbol = :se
             msg = sprint(showerror, e)
             lock(nb.lock) do
                 nb.report.meta["hydrate_error"] = msg
-                for c in nb.report.cells; c.output = nothing; ReportEngine.revert_running!(c); end  # nothing ran → no per-cell errors
+                _drop_runs!(nb)
+                for c in nb.report.cells; c.output = nothing; end  # nothing ran → no per-cell errors
             end
             @warn "KaimonSlate: run-on bring-up failed" host = remotehost exception = (e, catch_backtrace())
         finally
@@ -418,7 +390,7 @@ function worker_log(nb::LiveNotebook; maxbytes::Int = 100_000)
         c.kind == CODE || continue
         o = c.output; o === nothing && continue
         ran = true
-        println(io, "[$(c.id)]  $(lowercase(string(c.state)))  ·  $(round(o.duration_ms; digits = 1))ms")
+        println(io, "[$(c.id)]  $(lowercase(string(shown_state(c))))  ·  $(round(o.duration_ms; digits = 1))ms")
         st = rstrip(o.stdout)
         isempty(st) || println(io, "  " * replace(st, "\n" => "\n  "))
         o.exception === nothing || println(io, "  ERROR: " * replace(o.exception, "\n" => "\n  "))
@@ -1055,8 +1027,6 @@ function _register_diag_gauges!(h)
     reg("release_warned",   () -> length(_REGION_RELEASE_WARNED))
     reg("reader_rearmed",   () -> length(_READER_REARMED))
     reg("released_notice",  () -> length(_RELEASED_NOTICE))
-    reg("region_preparing", () -> length(_REGION_PREPARING))
-    reg("run_since",        () -> length(_RUN_SINCE))
     reg("force_run",        () -> length(_FORCE_RUN))
     reg("placing",          () -> length(_PLACING))
     reg("kernel_stats",     () -> length(RE._KERNEL_STATS))
@@ -3206,7 +3176,7 @@ function _make_router(h::Hub)
     # option after a /src hot-reload when our guess at affected cells may be incomplete.
     HTTP.register!(router, "POST", "/api/{id}/rerun-all", req -> _withnb(h, req, nb -> begin
         lock(nb.lock) do
-            for c in nb.report.cells; c.state = STALE; end
+            for c in nb.report.cells; ReportEngine.force_stale!(c); end
             _eval!(nb)
         end
         _json(state_json(nb))
@@ -4395,11 +4365,9 @@ function close_notebook!(h::Hub, id::AbstractString)
         ReportEngine._rlog("slate: closing $(id) with its runner still draining — signalling it to stop")
         lock(_RUNNER_LOCK) do; _RUNNER_CANCEL[id] = true; end
     end
-    # An id is REUSED when the same file is reopened, so a leftover re-run marker would make the
-    # reopened notebook restale a cell once for no reason (see `_DIRTY_WHILE_RUNNING`).
-    delete!(_DIRTY_WHILE_RUNNING, id)
-    # …and the ▶ force markers of cells that were still waiting: one left over would make the reopen
-    # look like a run someone asked for, and its region cells would request their nodes.
+    # An id is REUSED when the same file is reopened: the ▶ force markers of cells that were still
+    # waiting, left over, would make the reopen look like a run someone asked for, and its region cells
+    # would request their nodes.
     lock(nb.lock) do; delete!(_FORCE_RUN, id); end
     # …and the session-state digests, for the same reason: the reopened notebook's reactives are back
     # at their declared initial values, so last session's identities describe values that no longer

@@ -314,7 +314,8 @@
     if (errored && !revealed) reveal();   // always surface errors (the pill's count is derived at render, not accumulated)
     if (revealed) {
       setLive(id, cell.state);            // clear the transient running → real state
-      activity(errored ? 'err' : 'done', id, errored ? 'errored' : (wasRestored ? '♻ restored' : (t ? fmt(now() - t) : 'done')));
+      activity(errored ? 'err' : 'done', id, errored ? 'errored' : cell.state === 'stopped' ? 'stopped' :
+               (wasRestored ? '♻ restored' : (t ? fmt(now() - t) : 'done')));
       prog = { frac: 0, msg: '' };
       renderChip();
     }
