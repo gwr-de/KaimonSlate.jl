@@ -4167,6 +4167,28 @@ function _xfer_trace_push!(meta, started, total, ts, bs, err)
 end
 xfer_traces() = lock(_XFER_TRACE_LOCK) do; copy(_XFER_TRACES); end
 
+# A bulk read a worker asked for (`Sweep.fetch_to`), written into its cache by this process and shown
+# in the transfers view beside the region transfers.
+function fetch_viewed(host::AbstractString, script::AbstractString, dest::AbstractString,
+                      part::AbstractString; input = nothing, name::AbstractString = "", total::Integer = -1)
+    vid = Threads.atomic_add!(_XFER_VIEW_SEQ, 1)
+    t0 = time()
+    _xfer_view_prune!()
+    lock(_XFER_VIEW_LOCK) do
+        _XFER_VIEWS[vid] = XferView("local", String(host), String(name), "ssh", 0, Int(total), t0, 0.0, "")
+    end
+    upd(f) = lock(_XFER_VIEW_LOCK) do; v = get(_XFER_VIEWS, vid, nothing); v === nothing || f(v); end
+    ok, n = false, 0
+    try
+        ok, n = Sweep.fetch_to(host, script, dest; input, part, on_bytes = b -> upd(v -> (v.done = b)))
+    finally
+        upd(v -> (v.done = n; v.finished = time(); ok || (v.err = "stopped or failed")))
+        _xfer_trace_push!((; src = String(host), dst = "local", name = String(name), via = "ssh"),
+                          t0, n, [t0, time()], [0, n], ok ? "" : "stopped or failed")
+    end
+    return (ok, n)
+end
+
 # Drive a peer pull on `dst_k` OVER ITS BLOB CHANNEL (not the gate): send the `X` request to the dst's
 # blob endpoint (hub-vantage — reuses the relay reach), then poll `S` to completion. The actual pull runs
 # on the dst's dedicated executor task, so the gate loop never blocks. `spec` is the newline-framed body
@@ -4868,13 +4890,23 @@ function probe_transfer!(src_k, dst_k; bytes::Int = _probe_bytes())
     end
 end
 
-# The host this hub reaches a kernel's files through over ssh: the login node of the allocation a
-# worker runs in, else the worker's own host. Empty for a kernel on this machine.
+# The host this hub reaches a kernel's files through over ssh: the data transfer host of the region's
+# machine when it names one (`transfer_host`), else the login node of the allocation the worker runs
+# in, else the worker's own host. Empty for a kernel on this machine.
 function _files_host(k)
     t = hasproperty(k, :target) ? k.target : nothing
     t isa RemoteTarget || return ""
+    th = _transfer_host(t.region)
+    isempty(th) || return th
     v = via(t.ssh_host)
     return v === nothing ? t.ssh_host : v.host
+end
+
+function _transfer_host(region::AbstractString)
+    r = isempty(region) ? nothing : region_get(String(region))
+    (r === nothing || isempty(r.machine)) && return ""
+    m = cluster_get(r.machine)
+    return m === nothing ? "" : String(get(m, "transfer_host", ""))
 end
 
 function transfer_binding!(src_k, dst_k, name::AbstractString; zc::Bool = false, mode::Symbol = :relay,

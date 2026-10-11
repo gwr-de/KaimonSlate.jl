@@ -443,11 +443,22 @@ end
 # read took the socket's data first.
 const _TRANSPORT_ERRS = (Cint(-7), Cint(-13), Cint(-30), Cint(-43), EAGAIN)
 
-# Reads one stream to its end: `:eof`, `:timeout` (past the deadline, or the session is closing), or
-# `:lost` (a read failed, so what arrived is not all the command wrote).
+"""
+    stop_requested(sink) -> Bool
+
+Whether whoever reads a command's output has stopped wanting it. A sink that can be stopped (a
+transfer a cell abandoned) defines a method; the command's channel is then closed, which ends the
+command on the far side.
+"""
+stop_requested(::IO) = false
+
+# Reads one stream to its end: `:eof`, `:timeout` (past the deadline, or the session is closing),
+# `:lost` (a read failed, so what arrived is not all the command wrote) or `:stopped` (the sink's
+# reader stopped wanting it).
 function _drain(s::Session, ch, stream::Cint, sink::IO, deadline::Float64)
     buf = Vector{UInt8}(undef, 65536)
     while true
+        stop_requested(sink) && return :stopped
         n = lock(() -> ccall((:libssh2_channel_read_ex, LIB), Cssize_t,
                              (Ptr{Cvoid}, Cint, Ptr{UInt8}, Csize_t), ch, stream, buf, length(buf)), s.lk)
         # -1 is libssh2 still waiting on data another channel's read took off the socket: not yet, the
@@ -474,6 +485,8 @@ const LOST = Cint(-2)
 function _finish(s::Session, ch, out::IO, err::IO, timeout::Real)
     deadline = time() + timeout
     a = _drain(s, ch, Cint(0), out, deadline)
+    # Stderr only after a whole stdout: a stopped reader closes the channel at once, since draining
+    # stderr would wait for the command to end.
     b = a === :eof ? _drain(s, ch, Cint(1), err, deadline) : a
     _again(s, () -> ccall((:libssh2_channel_close, LIB), Cint, (Ptr{Cvoid},), ch); timeout = 10.0)
     status = lock(s.lk) do
@@ -602,7 +615,7 @@ end
 # Run `cmd`, streaming `input` to its stdin and collecting stdout. This is what replaces rsync: the
 # metadata directories are small text files, so `tar` over the channel moves them in one round trip.
 function _exec_io(s::Session, cmd::AbstractString, input::Union{Vector{UInt8},IO,Nothing};
-                  timeout::Real = 300.0)
+                  timeout::Real = 300.0, sink::Union{IO,Nothing} = nothing)
     ch, why = _open_started(s, cmd; merge = false)
     ch == C_NULL && return (false, UInt8[], why)
     if input !== nothing
@@ -636,9 +649,10 @@ function _exec_io(s::Session, cmd::AbstractString, input::Union{Vector{UInt8},IO
         @label sent
         _again(s, () -> ccall((:libssh2_channel_send_eof, LIB), Cint, (Ptr{Cvoid},), ch); timeout = 10.0)
     end
-    out = IOBuffer(); err = IOBuffer()
+    # With a `sink`, stdout goes there as it arrives (a file, for bulk data) and none of it is kept.
+    out = sink === nothing ? IOBuffer() : sink; err = IOBuffer()
     status = _finish(s, ch, out, err, timeout)
-    return (status == 0, take!(out), String(take!(err)))
+    return (status == 0, sink === nothing ? take!(out) : UInt8[], String(take!(err)))
 end
 
 # ── port forwarding ──────────────────────────────────────────────────────────────────────────
@@ -972,7 +986,7 @@ function _serve(s::Session, ask)
             Threads.@spawn try
                 put!(reply, try
                     Base.acquire(s.slots) do
-                        kind === :io ? _exec_io(s, arg[1], arg[2]) :
+                        kind === :io ? _exec_io(s, arg[1], arg[2]; timeout = arg[4], sink = arg[3]) :
                         kind === :reach ? _reach(s, arg[1], arg[2]) :
                         arg isa AbstractString ? _exec(s, arg) : _exec(s, arg.cmd; timeout = arg.timeout, online = arg.online)
                     end
@@ -1141,13 +1155,16 @@ exec(host::AbstractString, cmd::AbstractString; ask, timeout::Real = 120.0, onli
              (false, "session for $host is gone", :not_started); ask = ask)
 
 """
-    exec_io(host, cmd, input) -> (ok, stdout::Vector{UInt8}, stderr::String)
+    exec_io(host, cmd, input; sink = nothing, timeout = 300) -> (ok, stdout::Vector{UInt8}, stderr::String)
 
 Like `exec`, but streams `input` to the command's stdin and returns stdout as bytes. This is what
-carries a tar archive in either direction without a second authenticated transport.
+carries a tar archive in either direction without a second authenticated transport. With `sink`,
+stdout is written there as it arrives and the returned bytes are empty: how bulk data reaches a file
+without being held in memory.
 """
-exec_io(host::AbstractString, cmd::AbstractString, input::Union{Vector{UInt8},IO,Nothing}; ask) =
-    _request(String(host), :io, (String(cmd), input),
+exec_io(host::AbstractString, cmd::AbstractString, input::Union{Vector{UInt8},IO,Nothing}; ask,
+        sink::Union{IO,Nothing} = nothing, timeout::Real = 300.0) =
+    _request(String(host), :io, (String(cmd), input, sink, Float64(timeout)),
              (false, UInt8[], "session for $host is gone"); ask = ask)
 
 """

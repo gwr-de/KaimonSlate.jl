@@ -971,19 +971,28 @@ const MS = RE.MemoStore
             write(f, "second"); RE.Sweep.adopt_into(store, ST.adopt(f))
             @test reads[] == 2
 
-            # Moved to another machine, the same reads go over ssh (an empty host runs them here),
-            # split into requests no larger than READ_REQUEST_BYTES.
+            # Moved to another machine, the same reads go over ssh (an empty host runs them here): a
+            # selection is one stream of its byte ranges, landed as one file in the blob cache.
             far = RE.Sweep.relocate(ds, "")
             q = far[:cube][1]
             @test q.src isa RE.Sweep.SshSource && q.src.root == abspath(store)
-            old = RE.Sweep.READ_REQUEST_BYTES[]
-            try
-                RE.Sweep.READ_REQUEST_BYTES[] = 40
-                @test q[:, :, 2:4] == A[:, :, 2:4]
-                @test q[2:3, :, 5] == A[2:3, :, 5]
-            finally
-                RE.Sweep.READ_REQUEST_BYTES[] = old
-            end
+            @test q[:, :, 2:4] == A[:, :, 2:4]
+            @test q[2:3, :, 5] == A[2:3, :, 5]
+            @test q[:, 2, :] == A[:, 2, :]               # five runs, one stream
+            @test q[:, :, 1:2:5] == A[:, :, 1:2:5]       # every other frame
+            @test q[2:3, 1:2:3, 2:2:4] == A[2:3, 1:2:3, 2:2:4]
+            @test p[:, :, 1:2:5] == A[:, :, 1:2:5]       # …and locally
+            @test q[1:7] == A[1:7]
+            cached() = filter(startswith("range-"), readdir(RE.Sweep._blob_cache_dir()))
+            before = cached()
+            @test q[:, 2, :] == A[:, 2, :]               # the same selection again: no new fetch
+            @test cached() == before
+            # The host side reads the ranges given on stdin, back to back.
+            blob = p.index["blob"]; off = p.index["offset"]
+            script = RE.Sweep.ranges_command(abspath(store), blob)
+            out = IOBuffer()
+            run(pipeline(`sh -c $script`; stdin = IOBuffer("$(off) 8\n$(off + 16) 8\n"), stdout = out))
+            @test reinterpret(Float64, take!(out)) == [A[1], A[3]]
             @test RE.Sweep.relocate(far, "elsewhere")[:cube][1].src.host == ""   # already remote: kept
 
             # Another notebook opens the newest adoption of the file by region and path, from the

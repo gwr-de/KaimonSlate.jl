@@ -330,6 +330,80 @@ function run_io(host::AbstractString, script::AbstractString, input::Union{Vecto
     return (ok, data)
 end
 
+# Counts what passes through to a file, so a transfer can report its progress as it lands, and can be
+# stopped: a set `stop` closes the command's channel (`SshTransport.stop_requested`).
+mutable struct _CountingSink <: IO
+    io::IO
+    n::Int
+    f::Any
+    stop::Threads.Atomic{Bool}
+end
+function Base.unsafe_write(c::_CountingSink, p::Ptr{UInt8}, n::UInt)
+    w = unsafe_write(c.io, p, n)
+    c.n += Int(w)
+    c.f === nothing || (try; c.f(c.n); catch; end)
+    return w
+end
+Base.write(c::_CountingSink, b::UInt8) = (unsafe_write(c, Ref(b), UInt(1)); 1)
+SshTransport.stop_requested(c::_CountingSink) = c.stop[]
+
+# The fetches running in this process, by the file they write, so one can be stopped from elsewhere.
+const _FETCHES = Dict{String,Threads.Atomic{Bool}}()
+const _FETCHES_LOCK = ReentrantLock()
+
+"""
+    fetch_to(host, script, dest; input, part, on_bytes, timeout = 3600) -> (ok, bytes)
+
+Run `script` on `host` ("" for this machine), `input` on its stdin, and write its stdout to the file
+`dest` as it arrives. How bulk data comes back: none of it is held in memory, and in a worker none of
+it crosses the gate, because the hub writes the file and the two share this machine's filesystem. The
+bytes land in `part` and are moved onto `dest` when complete, so a reader never sees half a file.
+`on_bytes(n)` is called with the count so far. `cancel_fetch!(part)` stops it.
+"""
+function fetch_to(host::AbstractString, script::AbstractString, dest::AbstractString;
+                  input::Union{Vector{UInt8},Nothing} = nothing,
+                  part::AbstractString = string(dest, ".part.", getpid()), on_bytes = nothing,
+                  timeout::Real = 3600.0, name::AbstractString = "", total::Integer = -1)
+    if !isempty(host) && has_delegate()
+        r = _via(() -> (false, 0), :fetch, (; host = String(host), script = String(script), input,
+                                           dest = String(dest), part = String(part),
+                                           name = String(name), total = Int(total)))
+        return r === nothing ? (false, 0) : r
+    end
+    mkpath(dirname(String(dest)))
+    stop = Threads.Atomic{Bool}(false)
+    lock(_FETCHES_LOCK) do; _FETCHES[String(part)] = stop; end
+    ok = false
+    try
+        open(String(part), "w") do io
+            sink = _CountingSink(io, 0, on_bytes, stop)
+            ok = if isempty(host)
+                cmd = pipeline(`sh -c $script`; stdin = input === nothing ? devnull : IOBuffer(input),
+                               stdout = sink, stderr = devnull)
+                try; run(cmd); true; catch; false; end
+            else
+                connect!(host) && first(SshTransport.exec_io(String(host), String(script), input;
+                                                             ask = _ask, sink, timeout))
+            end
+        end
+        ok = ok && !stop[]
+        ok && mv(String(part), String(dest); force = true)
+    finally
+        lock(_FETCHES_LOCK) do; delete!(_FETCHES, String(part)); end
+        rm(String(part); force = true)
+    end
+    return (ok, ok ? Int(filesize(dest)) : 0)
+end
+
+"Stop the fetch writing `part`, here or in the process that holds the sessions."
+function cancel_fetch!(part::AbstractString)
+    has_delegate() && return _via(() -> false, :fetch_cancel, (; part = String(part)))
+    f = lock(_FETCHES_LOCK) do; get(_FETCHES, String(part), nothing); end
+    f === nothing && return false
+    f[] = true
+    return true
+end
+
 "Write `data` to `path` on the host, creating its directory."
 function put_file(host::AbstractString, data::Vector{UInt8}, path::AbstractString)
     script = "mkdir -p " * shq_path(dirname(String(path))) * " && cat > " * shq_path(String(path))

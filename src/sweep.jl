@@ -2474,74 +2474,170 @@ function _explain_missing(p::DatasetPart, e)
           "sweep to rebuild the data.")
 end
 
-function Base.getindex(p::DatasetPart, i::AbstractUnitRange)
-    t0 = time()
-    v = try
-        if p.src isa LocalSource
-            # Local: mmap the window, so the pages outside it are never faulted in.
-            SlateTask.dataset_elements(p.root, p.index, i)
-        else
-            # Remote: the same window as exact byte ranges, reinterpreted on arrival. An array's
-            # layout is what makes this a few requests rather than a search; a long window is split
-            # so no one reply has to carry all of it.
-            blob, off, nb, _ = SlateTask.array_range(p.index, i)
-            T = SlateTask.eltype_of(String(p.index["eltype"]))
-            buf = Vector{UInt8}(undef, nb)
-            at = 0
-            while at < nb
-                len = min(READ_REQUEST_BYTES[], nb - at)
-                copyto!(buf, at + 1, read_range(p.src, blob, off + at, len), 1, len)
-                at += len
-            end
-            collect(reinterpret(T, buf))
-        end
-    catch e
-        _explain_missing(p, e)
-    end
-    _record!(p.label, p.root, :elements, length(i) * Int(p.index["elsize"]), 1,
-             (time() - t0) * 1000)
-    return v
-end
+Base.getindex(p::DatasetPart, i::AbstractUnitRange) = _read_runs(p, UnitRange{Int}[UnitRange{Int}(i)])
 Base.getindex(p::DatasetPart, i::Integer) = p[i:i][1]
 Base.length(p::DatasetPart) = p.rows
 "An array part's dimensions, from its index."
 Base.size(p::DatasetPart) = Tuple(Int(d) for d in get(p.index, "dims", Int[]))
 
-"The most bytes one remote read asks for. A larger window is read as several."
-const READ_REQUEST_BYTES = Ref(32 * 1024^2)
+# The elements of `runs` (linear ranges) of an array part, back to back. Locally each is an mmap of its
+# window, so the pages outside it are never faulted in. From a remote store all of them are one stream
+# written into this machine's blob cache (`_fetch_runs`), however many runs there are.
+function _read_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
+    t0 = time()
+    T = SlateTask.eltype_of(String(p.index["eltype"]))
+    n = sum(length, runs; init = 0)
+    out = Vector{T}(undef, n)
+    n == 0 && return out
+    try
+        if p.src isa LocalSource
+            at = 0
+            for r in runs
+                copyto!(out, at + 1, SlateTask.dataset_elements(p.root, p.index, r), 1, length(r))
+                at += length(r)
+            end
+        else
+            open(io -> read!(io, out), _fetch_runs(p, runs))
+        end
+    catch e
+        e isa InterruptException && rethrow()
+        _explain_missing(p, e)
+    end
+    _record!(p.label, p.root, :elements, n * Int(p.index["elsize"]), length(runs), (time() - t0) * 1000)
+    return out
+end
+
+"""
+    ranges_command(root, blob) -> String
+
+The shell that writes byte ranges of one blob back to back, given as `offset length` lines on its
+stdin: one python3 process for any number of ranges where the host has it, else a `dd` per range
+(`tail` and `head` where `dd` cannot take a byte offset). Pure, so it is testable without a host.
+"""
+function ranges_command(root::AbstractString, blob::AbstractString)
+    p = shq(joinpath(root, "blobs", "sha256", String(blob)[1:2], String(blob)))
+    return string("if command -v python3 >/dev/null 2>&1; then python3 -c ", shq(_RANGES_PY), " ", p, "; ",
+                  "elif dd --version >/dev/null 2>&1; then while read off len; do dd if=", p,
+                  " bs=1M iflag=skip_bytes,count_bytes skip=\$off count=\$len 2>/dev/null; done; ",
+                  "else while read off len; do tail -c +\$((off + 1)) ", p, " | head -c \$len; done; fi")
+end
+const _RANGES_PY = """
+import sys
+f = open(sys.argv[1], "rb"); o = sys.stdout.buffer
+for line in sys.stdin:
+    a, b = line.split(); f.seek(int(a)); n = int(b)
+    while n > 0:
+        d = f.read(min(n, 1 << 22))
+        if not d: sys.exit(3)
+        o.write(d); n -= len(d)
+"""
+
+# The bytes of `runs` of a part in a remote store, as one file in the blob cache. Adjacent runs merge
+# into one range; the file is named by the host, store, blob and ranges, so reading the same selection
+# again opens what is already here.
+function _fetch_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
+    spans = Tuple{Int,Int}[]
+    blob = ""
+    for r in runs
+        b, off, nb, _ = SlateTask.array_range(p.index, r)
+        blob = b
+        if !isempty(spans) && spans[end][1] + spans[end][2] == off
+            spans[end] = (spans[end][1], spans[end][2] + nb)
+        else
+            push!(spans, (off, nb))
+        end
+    end
+    total = sum(last, spans; init = 0)
+    ranges = join((string(o, ' ', l, '\n') for (o, l) in spans))
+    key = bytes2hex(SHA.sha256(string(p.src.host, '\n', p.src.root, '\n', blob, '\n', ranges)))
+    dir = _blob_cache_dir(); mkpath(dir)
+    dest = joinpath(dir, "range-" * key[1:40])
+    if isfile(dest) && filesize(dest) == total
+        try; touch(dest); catch; end
+        return dest
+    end
+    part = string(dest, ".part.", getpid(), ".", string(rand(UInt32); base = 16))
+    ok, n = _await_fetch(part, total, p.label) do
+        fetch_to(p.src.host, ranges_command(p.src.root, blob), dest; input = Vector{UInt8}(ranges),
+                 part, name = p.label, total)
+    end
+    (ok && n == total) ||
+        error("reading $(_bytes(total)) of $(p.label) from $(p.src.host) failed" * (ok ? " (got $(_bytes(n)))" : ""))
+    _BLOB_FETCHED[] += total
+    if _BLOB_FETCHED[] > blob_cap() ÷ 8
+        _BLOB_FETCHED[] = 0
+        try; trim_blob_cache!(dir); catch; end
+    end
+    return dest
+end
+
+"""
+How a long read reports on the running cell and hears its Stop: `(; progress(frac, msg, done),
+checkpoint())`, set by a worker. `nothing` elsewhere, where a read just waits.
+"""
+const READ_HOOKS = Ref{Any}(nothing)
+
+# Run the fetch `f` while reporting how much of `total` has landed in `part`, and stop it when the
+# cell is stopped. The wait is on the cell's own task, which is where its Stop is visible.
+function _await_fetch(f, part::AbstractString, total::Integer, label::AbstractString)
+    h = READ_HOOKS[]
+    h === nothing && return f()
+    t = Threads.@spawn f()
+    t0 = time()
+    shown = false
+    try
+        while !istaskdone(t)
+            timedwait(() -> istaskdone(t), 0.25)
+            h.checkpoint()
+            if !istaskdone(t) && time() - t0 > 1.0
+                got = isfile(part) ? Int(filesize(part)) : 0
+                h.progress(total > 0 ? got / total : 0.0, "reading $(label): $(_bytes(got)) of $(_bytes(total))", false)
+                shown = true
+            end
+        end
+    catch e
+        e isa InterruptException && (try; cancel_fetch!(part); catch; end)
+        rethrow()
+    finally
+        shown && (try; h.progress(1.0, "", true); catch; end)
+    end
+    return fetch(t)
+end
 
 """
     part[i, j, k, …]   -> the selection, shaped as the same indices would shape an Array
 
-An array part indexed by its dimensions, with integers, ranges and `:`. The selection is read as the
-contiguous runs it covers: whole leading dimensions and a range of the next one are one run, so a
-block of frames along the last dimension is a single read, and a slab in an inner dimension is one
-run per index of the dimensions after it.
+An array part indexed by its dimensions, with integers, ranges (a positive step, `1:2:100`, included)
+and `:`. The selection is read as the contiguous runs it covers: whole leading dimensions and a range
+of the next one are one run, so a block of frames along the last dimension is a single read, and a slab
+in an inner dimension, or a stepped range, is one run per index of the dimensions after it. From a
+remote store all the runs arrive as one stream.
 """
-function Base.getindex(p::DatasetPart, I::Vararg{Union{Colon,Integer,AbstractUnitRange},N}) where {N}
+function Base.getindex(p::DatasetPart, I::Vararg{Union{Colon,Integer,AbstractRange{<:Integer}},N}) where {N}
     dims = Int[d for d in get(p.index, "dims", Int[])]
     N == length(dims) ||
         throw(DimensionMismatch("this part has $(length(dims)) dimensions ($(join(dims, "×"))), " *
                                 "indexed with $(N)"))
-    rs = ntuple(d -> I[d] isa Colon ? (1:dims[d]) : I[d] isa Integer ? (I[d]:I[d]) : UnitRange{Int}(I[d]), N)
+    rs = ntuple(d -> I[d] isa Colon ? (1:dims[d]) : I[d] isa Integer ? (I[d]:I[d]) : I[d], N)
     for d in 1:N
-        isempty(rs[d]) || (first(rs[d]) >= 1 && last(rs[d]) <= dims[d]) ||
+        (isempty(rs[d]) || (step(rs[d]) > 0 && first(rs[d]) >= 1 && last(rs[d]) <= dims[d])) ||
             throw(BoundsError("dimension $(d) of a $(join(dims, "×")) part indexed with $(I[d])"))
     end
-    T = SlateTask.eltype_of(String(p.index["eltype"]))
-    out = Array{T}(undef, map(length, rs))
-    if !isempty(out)
-        # `f` is the first dimension not taken whole: everything before it, and its range, is one run.
+    runs = UnitRange{Int}[]
+    if all(!isempty, rs)
+        # `f` is the first dimension not taken whole: everything before it, and its range when it has
+        # no gaps, is one run. A stepped range makes each of its indices a run of its own.
         f = something(findfirst(d -> length(rs[d]) != dims[d], 1:N), N)
         strides = cumprod([1; dims[1:end-1]])
-        runlen = strides[f] * length(rs[f])
-        at = 0
-        for c in CartesianIndices(rs[f+1:end])
-            start = 1 + (first(rs[f]) - 1) * strides[f] + sum(((c[k] - 1) * strides[f+k] for k in 1:N-f); init = 0)
-            copyto!(out, at + 1, p[start:start+runlen-1], 1, runlen)
-            at += runlen
+        g = step(rs[f]) == 1 ? f + 1 : f                 # the first dimension iterated over runs
+        runlen = g == f ? strides[f] : strides[f] * length(rs[f])
+        base = g == f ? 0 : (first(rs[f]) - 1) * strides[f]
+        for c in CartesianIndices(rs[g:end])
+            start = 1 + base + sum(((c[k] - 1) * strides[g+k-1] for k in 1:N-g+1); init = 0)
+            push!(runs, start:start+runlen-1)
         end
     end
+    out = reshape(_read_runs(p, runs), map(length, rs))
     all(i -> i isa Integer, I) && return out[1]
     return reshape(out, Tuple(length(rs[d]) for d in 1:N if !(I[d] isa Integer)))
 end
@@ -2592,7 +2688,9 @@ slices over ssh through its login host, so nothing on the region has to be runni
 function adopted(region::AbstractString, path::AbstractString)
     e = get(_ctx_clusters(), region_target_name(region), nothing)
     e === nothing && error("no region `$(region)` with a data root is known to this notebook")
-    host = String(get(e, "host", ""))
+    # Bulk reads go through the machine's data transfer host when it names one, else its login host.
+    host = String(get(e, "transfer_host", ""))
+    isempty(host) && (host = String(get(e, "host", "")))
     dr = String(get(e, "data_root", ""))
     isempty(dr) && error("region `$(region)` has no data root, so `adopt` there stores under the " *
                          "project and `adopted` cannot find it; give the region a data root")

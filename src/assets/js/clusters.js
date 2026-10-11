@@ -45,14 +45,15 @@ const kName = signal(''), kKind = signal('slurm'), kHost = signal(''), kRootRemo
       kProject = signal(''), kPayload = signal(''), kPartition = signal(''), kWalltime = signal(''),
       kCpus = signal(''), kMem = signal(''), kChunk = signal(''), kAccount = signal(''),
       kRoot = signal(''), kPrologue = signal(''), kNote = signal(''), kProcs = signal(''),
-      kDepot = signal(''), kJulia = signal(''), kTestQos = signal(''), kCompile = signal('node');
+      kDepot = signal(''), kJulia = signal(''), kTestQos = signal(''), kCompile = signal('node'),
+      kTransfer = signal('');
 const kOpts = signal([]), kOptMenu = signal(-1);   // scheduler options, as the region form edits them
 // Every key the form above collects. The registry is deliberately schema-light — the fields a
 // scheduler wants are the scheduler's business — so anything NOT in here is carried through a save
 // untouched rather than dropped by an editor that has not heard of it.
 const FORM_KEYS = ['name', 'kind', 'host', 'root', 'root_remote', 'project', 'payload', 'partition',
                    'walltime', 'cpus', 'mem', 'chunk', 'account', 'prologue', 'note', 'procs',
-                   'depot', 'julia', 'test_qos', 'compile', 'options', 'directives', 'qos'];
+                   'depot', 'julia', 'test_qos', 'compile', 'options', 'directives', 'qos', 'transfer_host'];
 
 export function loadClusters() {
   return fetch('/api/clusters').then(r => r.json())
@@ -77,6 +78,7 @@ function seed(c) {
   kMem.value = g('mem'); kChunk.value = g('chunk'); kAccount.value = g('account');
   kPrologue.value = g('prologue'); kNote.value = g('note'); kProcs.value = g('procs');
   kDepot.value = g('depot'); kJulia.value = g('julia'); kTestQos.value = g('test_qos');
+  kTransfer.value = g('transfer_host');
   kCompile.value = g('compile') === 'login' ? 'login' : 'node';
   kOpts.value = optionRows(c && c.options); kOptMenu.value = -1;
   if (c && c.host) loadMachine(c.name);
@@ -86,7 +88,7 @@ function seed(c) {
 // How many of the folded-away fields this target actually uses. Shown on the disclosure so a
 // collapsed section never hides a setting you would not have guessed was there.
 const filledExtras = () =>
-  [kChunk, kAccount, kPrologue, kPayload, kNote, kJulia, kTestQos].filter(s => (s.value || '').trim()).length +
+  [kChunk, kAccount, kPrologue, kPayload, kNote, kJulia, kTestQos, kTransfer].filter(s => (s.value || '').trim()).length +
   (kCompile.value === 'login' ? 1 : 0);
 
 // One line saying where the work goes, for the list and for the job cell's summary.
@@ -118,6 +120,7 @@ function save() {
   put('mem', kMem.value); put('chunk', kChunk.value); put('account', kAccount.value);
   put('prologue', kPrologue.value); put('note', kNote.value);
   put('depot', kDepot.value); put('julia', kJulia.value); put('test_qos', kTestQos.value);
+  put('transfer_host', kTransfer.value);
   if (!isExecKind(kKind.value)) put('compile', kCompile.value);
   const om = optionsMap(kOpts.value);
   if (Object.keys(om).length) body.options = om;
@@ -333,7 +336,9 @@ export function Clusters() {
           <div class="rpprow"><label>Task script</label>
             <input class="rpppre" autocomplete="off" spellcheck="false" placeholder="task runner path on the cluster; blank = shipped" value=${kPayload.value} onInput=${ev => kPayload.value = ev.target.value}/></div>`}
         ${kHost.value.trim() ? html`<div class="rpprow"><label>Julia</label>
-          <input class="rpppre" autocomplete="off" spellcheck="false" placeholder="blank = juliaup at this hub's version" value=${kJulia.value} onInput=${ev => kJulia.value = ev.target.value}/></div>` : null}
+          <input class="rpppre" autocomplete="off" spellcheck="false" placeholder="blank = juliaup at this hub's version" value=${kJulia.value} onInput=${ev => kJulia.value = ev.target.value}/></div>
+          <div class="rpprow"><label>Transfer host</label>
+            <input class="rpppre" autocomplete="off" spellcheck="false" placeholder="data transfer node for bulk reads; blank = the login host" value=${kTransfer.value} onInput=${ev => kTransfer.value = ev.target.value}/></div>` : null}
         <div class="rpprow"><label>Note</label>
           <input class="rppname" autocomplete="off" placeholder="note" value=${kNote.value} onInput=${ev => kNote.value = ev.target.value}/></div>`}
       <div class="rppact"><button class="rppsavereg" onClick=${save}>${e ? 'Save' : 'Create'}</button></div>

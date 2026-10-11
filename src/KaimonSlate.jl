@@ -2505,10 +2505,11 @@ function create_tools(GateTool::Type)
     `action="set"` creates or updates one from the arguments given (`host`, `kind` = slurm | pbs |
     exec, `account`, `root_remote` (its batch store, on scratch), `depot`, `julia`, `prologue`, the
     batch defaults `partition`, `walltime`, `cpus`, `mem`, `gpus`, `qos`, `directives` (scheduler
-    flags, one per line or `;`-separated), `test_qos`, and `compile` (`node`, the default, compiles
+    flags, one per line or `;`-separated), `test_qos`, `compile` (`node`, the default, compiles
     packages on the granted node; `login` compiles them on the login node first, as NERSC asks, and a
-    node of the same CPU architecture reuses that); an empty argument leaves that field as it is.
-    `action="delete"` removes it.
+    node of the same CPU architecture reuses that), and `transfer_host`, the site's data transfer node
+    (e.g. `dtn01.nersc.gov`) that bulk reads go through instead of the login host; an empty argument
+    leaves that field as it is. `action="delete"` removes it.
 
     `action="list"` lists them; `"show"` gives one with what preparing found on its host (Julia,
     depot, the site's module fix, staleness) and the project environments that passed a test task
@@ -2524,7 +2525,7 @@ function create_tools(GateTool::Type)
                      depot::String = "", julia::String = "", prologue::String = "", partition::String = "",
                      walltime::String = "", cpus::String = "", mem::String = "", gpus::String = "",
                      qos::String = "", directives::String = "", test_qos::String = "",
-                     compile::String = "")::String
+                     compile::String = "", transfer_host::String = "")::String
         a = strip(action); n = strip(name)
         if a == "set"
             isempty(n) && return "Give the machine's name."
@@ -2537,7 +2538,7 @@ function create_tools(GateTool::Type)
                            "depot" => depot, "julia" => julia, "prologue" => prologue, "partition" => partition,
                            "walltime" => walltime, "cpus" => cpus, "mem" => mem, "gpus" => gpus, "qos" => qos,
                            "directives" => replace(directives, r"\s*;\s*" => "\n"), "test_qos" => test_qos,
-                           "compile" => lowercase(compile))
+                           "compile" => lowercase(compile), "transfer_host" => transfer_host)
                 isempty(strip(v)) || (d[k] = String(strip(v)))
             end
             haskey(d, "kind") || (d["kind"] = "slurm")
