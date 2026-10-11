@@ -2583,6 +2583,45 @@ function adopt_into(root::AbstractString, a::SlateTask.AdoptedFile; label::Abstr
 end
 
 """
+    adopted(region, path) -> Dataset
+
+The dataset a cell's `adopt(path)` stored on `region`, opened from any notebook. `path` is relative to
+the region's `datadir()`, or absolute there. The index is read from the region's dataset store and the
+slices over ssh through its login host, so nothing on the region has to be running.
+"""
+function adopted(region::AbstractString, path::AbstractString)
+    e = get(_ctx_clusters(), region_target_name(region), nothing)
+    e === nothing && error("no region `$(region)` with a data root is known to this notebook")
+    host = String(get(e, "host", ""))
+    dr = String(get(e, "data_root", ""))
+    isempty(dr) && error("region `$(region)` has no data root, so `adopt` there stores under the " *
+                         "project and `adopted` cannot find it; give the region a data root")
+    if startswith(dr, "~")
+        ok, out = run_there(host, "echo \$HOME")
+        ok || error("could not resolve the home directory on $(host)")
+        dr = String(strip(out)) * dr[2:end]
+    end
+    dr = rstrip(dr, '/')
+    return _open_adopted(host, dr * "/.datasets", isabspath(path) ? String(path) : dr * "/" * String(path))
+end
+
+# The newest adoption of `file` in the dataset store at `root` on `host` ("" for this machine).
+function _open_adopted(host::AbstractString, root::AbstractString, file::AbstractString)
+    script = string("cd ", shq(String(root) * "/manifests"), " 2>/dev/null || exit 3; ",
+                    "for f in \$(ls -t adopt-*.toml 2>/dev/null); do ",
+                    "grep -qF ", shq("\"" * file * "\""), " \"\$f\" && { cat \"\$f\"; exit 0; }; done; exit 4")
+    ok, out = run_there(String(host), script)
+    ok || error("$(file) has not been adopted" * (isempty(host) ? "" : " on $(host)") *
+                " — run `adopt` on it in a cell there first")
+    m = TOML.parse(out)
+    idx = Dict{String,Any}(String(k) => v for (k, v) in m["dataset"])
+    src = isempty(host) ? LocalSource(String(root)) : SshSource(String(host), String(root))
+    lbl = basename(file)
+    return Dataset(:group, [DatasetPart(String(root), :indexed, idx, NamedTuple(), _NOFACTS, 0,
+                                        Int(get(idx, "bytes", 0)), lbl, src)], 0, lbl)
+end
+
+"""
     relocate(ds, host) -> Dataset
 
 `ds` as another machine sees it: parts read from a store on this machine are read over ssh through

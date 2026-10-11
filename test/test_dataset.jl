@@ -985,6 +985,19 @@ const MS = RE.MemoStore
                 RE.Sweep.READ_REQUEST_BYTES[] = old
             end
             @test RE.Sweep.relocate(far, "elsewhere")[:cube][1].src.host == ""   # already remote: kept
+
+            # Another notebook opens the newest adoption of the file by region and path, from the
+            # region's dataset store; an empty host is this machine.
+            ctx = (; clusters = Dict("region:r1" => Dict("host" => "", "data_root" => dir)))
+            task_local_storage(:slate_ctx, ctx) do
+                other = RE.Sweep.adopted("r1", "a.cube")
+                @test keys(other) == ["cube"] && RE.Sweep.attributes(other)["note"] == "second"
+                @test other[:cube][1][:, 2, 3:4] == A[:, 2, 3:4]
+                e = try; RE.Sweep.adopted("r1", "nope.cube"); "" catch x; sprint(showerror, x); end
+                @test occursin("has not been adopted", e)
+                e2 = try; RE.Sweep.adopted("r2", "a.cube"); "" catch x; sprint(showerror, x); end
+                @test occursin("no region `r2`", e2)
+            end
         end
     end
 

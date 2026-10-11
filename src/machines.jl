@@ -148,6 +148,7 @@ function clusters_resolved(; tested::Bool = true, only::Union{Nothing,AbstractSt
         e = Dict{String,Any}(base === nothing ? Dict{String,Any}("host" => r.host) : base)
         e["name"] = Sweep.region_target_name(r.name)
         e["kind"] = "region"; e["root_remote"] = store; e["_region"] = r.name
+        isempty(r.data_root) || (e["data_root"] = r.data_root)   # where `Sweep.adopted` looks
         push!(out, _resolved_entry(e; options = merge(machine_options(e), r.options), tested))
     end
     return out
