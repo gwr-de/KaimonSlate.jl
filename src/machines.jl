@@ -105,19 +105,25 @@ function _shape_into_entry!(e::AbstractDict, opts::AbstractDict)
 end
 
 """
-    clusters_resolved() -> Vector{Dict}
+    clusters_resolved(; tested = true, only = nothing) -> Vector{Dict}
 
 Every machine entry with what Julia started there needs added: `_setup`, the machine's shell
 (`machine_setup`), and `_depot`. Entries go to a notebook's worker this way because a worker has no
 registry or host facts of its own, and batch tasks it submits must start in the same shell.
+
+`tested = false` leaves out `_tested`, the environments ready on each machine's nodes. That is the
+expensive part, a readiness check of every tested environment, and only a submission reads it.
+`only` keeps the one entry of that name.
 """
-function clusters_resolved()
-    out = Dict{String,Any}[_resolved_entry(d) for d in clusters_all()]
+function clusters_resolved(; tested::Bool = true, only::Union{Nothing,AbstractString} = nothing)
+    want(name) = only === nothing || String(name) == only
+    all = clusters_all()
+    out = Dict{String,Any}[_resolved_entry(d; tested) for d in all if want(d["name"])]
     # A region on a machine is a target too: the machine's entry with the region's shape over it, so
     # `cluster=gpu_shared` sends a sweep where `region=gpu_shared` sends a worker.
-    have = Set(String(d["name"]) for d in out)
+    have = Set(String(d["name"]) for d in all)
     for r in regions()
-        (isempty(r.machine) || r.name in have) && continue
+        (isempty(r.machine) || r.name in have || !want(r.name)) && continue
         base = cluster_get(r.machine); base === nothing && continue
         e = Dict{String,Any}(base)
         e["name"] = r.name
@@ -127,12 +133,13 @@ function clusters_resolved()
         r.cpus > 0 && (e["cpus"] = string(r.cpus))
         # The region's options over the machine's, before they become fields: once one is a field,
         # an option naming the same setting no longer replaces it.
-        push!(out, _resolved_entry(e; options = merge(machine_options(base), r.options)))
+        push!(out, _resolved_entry(e; options = merge(machine_options(base), r.options), tested))
     end
     # …and `region:<name>`, the region's held node: a job cell with `region=<name>` and no `cluster=`
     # runs its units there, in the hub's task workers (`Sweep.RegionLauncher`). Its store is its own,
     # so the scheduler's view of the machine's store and the region's queue never describe one store.
     for r in regions()
+        want(Sweep.region_target_name(r.name)) || continue
         base = isempty(r.machine) ? nothing : cluster_get(r.machine)
         store = base !== nothing && !isempty(String(get(base, "root_remote", ""))) ?
                 rstrip(String(base["root_remote"]), '/') * "/regions/" * r.name :
@@ -141,19 +148,20 @@ function clusters_resolved()
         e = Dict{String,Any}(base === nothing ? Dict{String,Any}("host" => r.host) : base)
         e["name"] = Sweep.region_target_name(r.name)
         e["kind"] = "region"; e["root_remote"] = store; e["_region"] = r.name
-        push!(out, _resolved_entry(e; options = merge(machine_options(e), r.options)))
+        push!(out, _resolved_entry(e; options = merge(machine_options(e), r.options), tested))
     end
     return out
 end
 cluster_get_resolved(name::AbstractString) = (d = cluster_get(name); d === nothing ? nothing : _resolved_entry(d))
 
-function _resolved_entry(d::AbstractDict; options = machine_options(d))
+function _resolved_entry(d::AbstractDict; options = machine_options(d), tested::Bool = true)
     m = machine_from(d)
     isempty(m.host) && return Dict{String,Any}(d)            # this machine: nothing to set up
     e = _shape_into_entry!(Dict{String,Any}(d), options)
-    return merge(e, Dict{String,Any}("_setup" => machine_setup(m), "_depot" => machine_depot(m),
-        # The environments ready on this machine's nodes (`env_readiness`): a sweep submits only these.
-        "_tested" => join(ready_envs(m.host; depot = machine_depot(m)), ",")))
+    extra = Dict{String,Any}("_setup" => machine_setup(m), "_depot" => machine_depot(m))
+    # The environments ready on this machine's nodes (`env_readiness`): a sweep submits only these.
+    tested && (extra["_tested"] = join(ready_envs(m.host; depot = machine_depot(m)), ","))
+    return merge(e, extra)
 end
 
 # ── Environments tested on a machine ────────────────────────────────────────────────────────
@@ -197,9 +205,14 @@ function record_env_test!(host::AbstractString, project::AbstractString, nodetyp
     return rec
 end
 
-"The direct packages of `project` and the versions its manifest resolves them to (`\"\"` unresolved)."
+"""
+The direct packages of `project` and the versions its manifest resolves them to (`\"\"` unresolved).
+Parsed again only when the project file or its manifest changes.
+"""
 function env_packages(project::AbstractString)
     pf = project_file_in(String(project)); isempty(pf) && return Dict{String,Any}()
+    c = lock(() -> get(_ENV_PACKAGES, pf, nothing), _ENV_PACKAGES_LOCK)
+    c !== nothing && Sweep.stat_key(c.inputs) == c.stamp && return copy(c.packages)
     man = _manifest_for(pf)
     mdeps = isempty(man) ? Dict{String,Any}() : get(_toml(man), "deps", Dict{String,Any}())
     out = Dict{String,Any}()
@@ -207,8 +220,12 @@ function env_packages(project::AbstractString)
         e = get(mdeps, n, nothing)
         out[n] = (e isa Vector && !isempty(e) && e[1] isa AbstractDict) ? string(get(e[1], "version", "")) : ""
     end
-    return out
+    inputs = String[pf, man]
+    lock(() -> (_ENV_PACKAGES[pf] = (; inputs, stamp = Sweep.stat_key(inputs), packages = out)), _ENV_PACKAGES_LOCK)
+    return copy(out)
 end
+const _ENV_PACKAGES = Dict{String,NamedTuple{(:inputs, :stamp, :packages),Tuple{Vector{String},String,Dict{String,Any}}}}()
+const _ENV_PACKAGES_LOCK = ReentrantLock()
 
 _and(xs) = length(xs) <= 1 ? join(xs) : join(xs[1:end-1], ", ") * " and " * xs[end]
 _was(xs) = _and(xs) * (length(xs) == 1 ? " was" : " were")
@@ -251,7 +268,13 @@ was running before.
 function env_readiness(host::AbstractString, project::AbstractString, nodetype::AbstractString;
                        depot::AbstractString = "", by::AbstractString = "")
     envs = tested_envs(host)   # first: it moves older records into the host's facts
-    hf = host_facts(host)
+    return _env_readiness(host, project, nodetype, host_facts(host), envs; depot, by)
+end
+
+# `env_readiness` with the host's facts and tested environments already read, so a pass over every
+# environment on a host (`ready_envs`) reads them once.
+function _env_readiness(host::AbstractString, project::AbstractString, nodetype::AbstractString,
+                        hf::AbstractDict, envs::AbstractDict; depot::AbstractString = "", by::AbstractString = "")
     stale = String(get(hf, "stale", ""))
     if !isempty(stale)
         m = match(r"^changed since prepared: (.+)$", stale)
@@ -269,7 +292,7 @@ function env_readiness(host::AbstractString, project::AbstractString, nodetype::
     end
     # Another environment with the same contents that passed there answers for this one: a copied
     # notebook's own environment, or two notebooks that use the same packages.
-    tested_twin(host, project, nodetype; depot) === nothing || return ""
+    tested_twin(host, project, nodetype; depot, envs) === nothing || return ""
     now = env_packages(project)
     if e isa AbstractDict
         before = get(e, "packages", nothing)
@@ -306,10 +329,10 @@ The record of an environment that passed its test on `host`'s `nodetype` nodes w
 as `project`'s now, by the fingerprint, which covers what decides the resolve and not where it lives.
 """
 function tested_twin(host::AbstractString, project::AbstractString, nodetype::AbstractString;
-                     depot::AbstractString = "")
+                     depot::AbstractString = "", envs::AbstractDict = tested_envs(host))
     isdir(project) || return nothing
     fp = _env_fingerprint(String(project), _infra_spec(); depot = String(depot))
-    for (_, e) in tested_envs(host)
+    for (_, e) in envs
         (e isa AbstractDict && get(e, "node_type", "") == nodetype &&
          get(e, "status", "") in ("ok", "warn") && String(get(e, "fingerprint", "")) == fp) && return e
     end
@@ -317,10 +340,13 @@ function tested_twin(host::AbstractString, project::AbstractString, nodetype::Ab
 end
 
 "The tested environments that are ready now on `host`, as `Sweep.env_key`s."
-ready_envs(host::AbstractString; depot::AbstractString = "") =
-    sort!([k for (k, e) in tested_envs(host)
-           if e isa AbstractDict && env_readiness(host, String(get(e, "project", "")),
-                                                  String(get(e, "node_type", "")); depot) == ""])
+function ready_envs(host::AbstractString; depot::AbstractString = "")
+    envs = tested_envs(host)
+    hf = host_facts(host)
+    return sort!([k for (k, e) in envs
+                  if e isa AbstractDict && _env_readiness(host, String(get(e, "project", "")),
+                                                          String(get(e, "node_type", "")), hf, envs; depot) == ""])
+end
 
 # Records written before there was one per machine: a region kept its own, keyed by project alone,
 # and a test task kept another without a fingerprint. Moved here once; a test task's record takes the
@@ -397,17 +423,31 @@ end
 _host_facts_path() = joinpath(_slate_config_dir(), "host_facts.json")
 const _HOST_FACTS_LOCK = ReentrantLock()
 
+# The file is parsed again only when it changes; readiness asks for a host's facts once per tested
+# environment. `host_facts` hands out its own copy of the dictionaries and vectors (`_copy_tree`;
+# strings are immutable and shared), so a caller editing a record never edits the cached parse.
 function _host_facts_all()
     p = _host_facts_path()
     isfile(p) || return Dict{String,Any}()
-    d = try; JSON.parsefile(p); catch; return Dict{String,Any}(); end
-    return d isa AbstractDict ? Dict{String,Any}(d) : Dict{String,Any}()
+    stamp = Sweep.stat_key((p,))
+    c = _HOST_FACTS_PARSED[]
+    if c.stamp != stamp
+        d = try; JSON.parsefile(p); catch; return Dict{String,Any}(); end
+        c = (; stamp, all = d isa AbstractDict ? Dict{String,Any}(d) : Dict{String,Any}())
+        _HOST_FACTS_PARSED[] = c
+    end
+    return Dict{String,Any}(c.all)
 end
+const _HOST_FACTS_PARSED = Ref((stamp = "", all = Dict{String,Any}()))
+
+_copy_tree(x::AbstractDict) = Dict{String,Any}(String(k) => _copy_tree(v) for (k, v) in x)
+_copy_tree(x::AbstractVector) = Any[_copy_tree(v) for v in x]
+_copy_tree(x) = x
 
 "What preparing found on `host`; empty when it has not been prepared."
 function host_facts(host::AbstractString)
     d = get(_host_facts_all(), String(host), nothing)
-    return d isa AbstractDict ? Dict{String,Any}(d) : Dict{String,Any}()
+    return d isa AbstractDict ? _copy_tree(d) : Dict{String,Any}()
 end
 
 "Merge `kv` into what is recorded for `host`."

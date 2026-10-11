@@ -263,7 +263,15 @@ const _LOCAL_SEB  = normpath(joinpath(@__DIR__, "..", "lib", "SlateExtensionsBas
 # package and the SDK side by side, as `SlateWorker` includes `../../worker.jl`. Hubs on different
 # versions keep a copy each, and a running worker's code is never replaced under it. A worker's own
 # files (its script, log, manifest and state) stay in `_REMOTE_WORKER`, where the roster finds them.
-_runtime_key() = bytes2hex(_SHA.sha1(string(_payload_sha(), "\n", _seb_sha())))[1:16]
+# Checked again at most every `_SEB_RECHECK_S`: every environment fingerprint names it.
+function _runtime_key()
+    c = _RUNTIME_KEY[]
+    (!isempty(c.key) && time() - c.at < _SEB_RECHECK_S) && return c.key
+    key = bytes2hex(_SHA.sha1(string(_payload_sha(), "\n", _seb_sha())))[1:16]
+    _RUNTIME_KEY[] = (at = time(), key)
+    return key
+end
+const _RUNTIME_KEY = Ref((at = 0.0, key = ""))
 _runtime_dir(key::AbstractString = _runtime_key()) = "$_REMOTE_WORKER/payload/$key"
 _remote_seb(key::AbstractString = _runtime_key()) = _runtime_dir(key) * "/SlateExtensionsBase"
 _remote_worker_pkg(key::AbstractString = _runtime_key()) = _runtime_dir(key) * "/SlateWorker"
@@ -1090,10 +1098,38 @@ end
 # Project of each dev'd dependency (a dependency it adds changes the resolve), the worker packages
 # added beside them, the extension SDK, and the Julia that resolves it all. A host that recorded
 # this after its last successful build already holds this environment.
+#
+# Cached per environment, infra, depot and worker code: hashed again only when one of the files it
+# reads changes size or modification time.
 function _env_fingerprint(envdir::AbstractString, infra::AbstractString; depot::AbstractString = "")
+    dev = _worker_develop()
+    key = (String(envdir), String(infra), String(depot), dev)
+    files = _env_fingerprint_inputs(envdir)
+    stamp = Sweep.stat_key(files)
+    c = lock(() -> get(_ENV_FP, key, nothing), _ENV_FP_LOCK)
+    c !== nothing && c.stamp == stamp && return c.fp
+    fp = _env_fingerprint_hash(envdir, infra, dev; depot)
+    lock(() -> (_ENV_FP[key] = (; stamp, fp)), _ENV_FP_LOCK)
+    return fp
+end
+const _ENV_FP = Dict{NTuple{4,String},NamedTuple{(:stamp, :fp),Tuple{String,String}}}()
+const _ENV_FP_LOCK = ReentrantLock()
+
+# The files `_env_fingerprint_hash` reads.
+function _env_fingerprint_inputs(envdir::AbstractString)
+    files = String[joinpath(_LOCAL_SEB, "Project.toml"), joinpath(@__DIR__, "SlateWorker", "Project.toml")]
+    if !isempty(envdir) && isdir(envdir)
+        append!(files, joinpath.(envdir, sort!(filter(Sweep._is_env_file, readdir(envdir)))))
+        append!(files, [joinpath(lpath, "Project.toml") for (_, lpath) in Sweep.local_dev_deps(envdir)])
+    end
+    return files
+end
+
+function _env_fingerprint_hash(envdir::AbstractString, infra::AbstractString, dev::AbstractString;
+                               depot::AbstractString = "")
     ctx = _SHA.SHA1_CTX()
     add(s) = _SHA.update!(ctx, codeunits(String(s)))
-    add("julia $VERSION\n"); add(infra); add(_worker_develop())
+    add("julia $VERSION\n"); add(infra); add(dev)
     # Where it is installed: a different depot holds none of it.
     isempty(depot) || add("depot $depot\n")
     for p in (joinpath(_LOCAL_SEB, "Project.toml"), joinpath(@__DIR__, "SlateWorker", "Project.toml"))
@@ -1249,16 +1285,27 @@ _versions_prune_sh(root::AbstractString, keep::AbstractString) =
 _runtime_prune_sh(keep::AbstractString) = _versions_prune_sh(_REMOTE_WORKER * "/payload", keep)
 const _SEB_EXCLUDES  = [".git", "*.cov"]
 
-# The SDK source as it is sent, hashed by path and content.
+# The SDK source as it is sent, hashed by path and content. The content is hashed again only when a
+# file's size or modification time changes, and the tree is walked for that at most every
+# `_SEB_RECHECK_S`: every environment fingerprint includes this, and a resolve takes dozens of them.
+const _SEB_SHA = Ref((at = 0.0, stamp = "", sha = ""))
+const _SEB_RECHECK_S = 2.0
 function _seb_sha()
     isdir(_LOCAL_SEB) || return ""
-    ctx = _SHA.SHA1_CTX()
-    for rel in _files_under(_LOCAL_SEB; descend = r -> basename(r) != ".git")
-        endswith(rel, ".cov") && continue
-        _SHA.update!(ctx, codeunits(rel))
-        _SHA.update!(ctx, read(joinpath(_LOCAL_SEB, rel)))
+    c = _SEB_SHA[]
+    (!isempty(c.sha) && time() - c.at < _SEB_RECHECK_S) && return c.sha
+    files = [rel for rel in _files_under(_LOCAL_SEB; descend = r -> basename(r) != ".git") if !endswith(rel, ".cov")]
+    stamp = Sweep.stat_key(joinpath.(_LOCAL_SEB, files))
+    if stamp != c.stamp || isempty(c.sha)
+        ctx = _SHA.SHA1_CTX()
+        for rel in files
+            _SHA.update!(ctx, codeunits(rel))
+            _SHA.update!(ctx, read(joinpath(_LOCAL_SEB, rel)))
+        end
+        c = (at = 0.0, stamp, sha = bytes2hex(_SHA.digest!(ctx))[1:16])
     end
-    return bytes2hex(_SHA.digest!(ctx))[1:16]
+    _SEB_SHA[] = (at = time(), stamp, sha = c.sha)
+    return c.sha
 end
 
 # Everything a start needs to know about the host, read in ONE command. On a scheduler node each
@@ -2218,17 +2265,25 @@ end
 
 # Does the USER use Revise locally (it's in their global default env)? If so we mirror it onto the remote
 # worker so hot-reload matches their setup; if they don't use Revise, we don't force it into the worker env.
+# Scanned again only when that manifest changes.
 function _local_has_revise()
     mf = joinpath(first(Base.DEPOT_PATH), "environments", "v$(VERSION.major).$(VERSION.minor)", "Manifest.toml")
-    isfile(mf) || return false
-    try
-        for line in eachline(mf)
-            occursin(r"^\[\[deps\.Revise\]\]\s*$", line) && return true
+    stamp = Sweep.stat_key((mf,))
+    c = _HAS_REVISE[]
+    c.stamp == stamp && return c.has
+    has = false
+    if isfile(mf)
+        try
+            for line in eachline(mf)
+                occursin(r"^\[\[deps\.Revise\]\]\s*$", line) && (has = true; break)
+            end
+        catch
         end
-    catch
     end
-    return false
+    _HAS_REVISE[] = (; stamp, has)
+    return has
 end
+const _HAS_REVISE = Ref((stamp = "", has = false))
 
 # Emit the classifier's `@@SLATE_PREP total=<n>` marker so a REMOTE bring-up shows a real k/N precompile
 # bar (not just "k done") — the same structured "Preparing packages" experience as a local open. Same

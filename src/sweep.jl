@@ -1512,17 +1512,21 @@ one `readdir` per cluster per tick and never touches the network.
 """
 # The cluster registry and the remote log live in the hub's module. Looked up at call time because
 # this file also loads on a worker, which has neither.
-_hub_clusters() = isdefined(P, :clusters_resolved) ? P.clusters_resolved() :
-                  isdefined(P, :clusters_all) ? P.clusters_all() : Dict{String,Any}[]
+_hub_clusters(; kw...) = isdefined(P, :clusters_resolved) ? P.clusters_resolved(; kw...) :
+                         isdefined(P, :clusters_all) ? P.clusters_all() : Dict{String,Any}[]
 _hub_log(msg::AbstractString) = (isdefined(P, :_rlog) && P._rlog(msg); nothing)
+
+_cluster_from(c) = cluster(Dict{String,String}(String(k) => String(v) for (k, v) in c))
 
 function advance_started!(; every::Real = 30.0)
     n = 0
-    for c in _hub_clusters()
+    # Without `_tested` while looking for started runs: almost every tick finds none, and readiness is a
+    # check of every environment tested on the machine. The cluster that has some is resolved again
+    # below, with it.
+    for c in _hub_clusters(; tested = false)
         name = String(get(c, "name", ""))
         isempty(name) && continue
-        spec = Dict{String,String}(String(k) => String(v) for (k, v) in c)
-        t = try; cluster(spec); catch; continue; end      # a definition we cannot build is not ours to fix
+        t = try; _cluster_from(c); catch; continue; end      # a definition we cannot build is not ours to fix
         root = store_root(t)
         runs = started_runs(root)
         isempty(runs) && continue
@@ -1532,6 +1536,8 @@ function advance_started!(; every::Real = 30.0)
         # the only thing a sign-in gates, and it goes out on the next tick after one lands.
         _reachable(t) || continue
         try; sync_in!(t); catch; continue; end
+        full = _hub_clusters(; only = name)
+        isempty(full) || (t = try; _cluster_from(first(full)); catch; t; end)
         # Fold the MIRROR's log. A pull merges and never deletes, so a store compacted over there
         # leaves this side holding the originals; folding here is what keeps the mirror from growing
         # for the life of the store. Local files only, and never required for correctness.

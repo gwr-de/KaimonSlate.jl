@@ -85,7 +85,9 @@ workers to match. Runs on the supervisor's tick, one pass per region at a time (
 """
 function _drive_region_sweeps!(h)
     now = time()
-    for e in ReportEngine.clusters_resolved()
+    # Without `_tested`: driving a region's queue never reads it, and computing it each tick is a
+    # readiness check of every environment tested anywhere.
+    for e in ReportEngine.clusters_resolved(; tested = false)
         String(get(e, "kind", "")) == "region" || continue
         name = String(get(e, "_region", ""))
         r = ReportEngine.region_get(name)

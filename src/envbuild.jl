@@ -115,23 +115,50 @@ function run_julia_there(host::AbstractString, code::AbstractString; setup::Abst
 end
 
 """
+    stat_key(paths) -> String
+
+A key that changes when any of `paths` is written, created or removed: each path with its size and
+modification time (zeros for one that does not exist). What the caches of derived facts about an
+environment compare, so an unchanged environment costs a stat per file rather than a read and parse.
+"""
+function stat_key(paths)
+    io = IOBuffer()
+    for p in paths
+        st = stat(p)
+        print(io, p, ' ', st.size, ' ', st.mtime, '\n')
+    end
+    return String(take!(io))
+end
+
+"""
     local_dev_deps(env) -> Vector{Pair{String,String}}
 
 Every package the environment in `env` develops from a local directory, as `name => directory`:
 the `[sources]` paths of its project, followed through the packages they name (`env_path_deps`),
 and the path entries of the manifest that resolves it. Before a first resolve writes a manifest the
 `[sources]` are all there is. The project itself is left out.
+
+Cached per environment until its project file, the manifest that resolves it or a developed package's
+own project file changes.
 """
 function local_dev_deps(env::AbstractString)
     isempty(env) && return Pair{String,String}[]
+    key = String(env)
+    c = lock(() -> get(_DEV_DEPS, key, nothing), _DEV_DEPS_LOCK)
+    c !== nothing && stat_key(c.inputs) == c.stamp && return copy(c.deps)
     devs = Dict{String,String}(env_path_deps(env))
     mf = parent_manifest(env)
     for (name, dir) in dev_deps(mf, isempty(mf) ? env : dirname(abspath(mf)))
         haskey(devs, name) || (devs[name] = dir)
     end
     self = strip_trailing_sep(normpath(abspath(env)))
-    return sort!([n => d for (n, d) in devs if strip_trailing_sep(normpath(abspath(d))) != self]; by = first)
+    deps = sort!([n => d for (n, d) in devs if strip_trailing_sep(normpath(abspath(d))) != self]; by = first)
+    inputs = String[project_file_in(env); mf; [joinpath(d, "Project.toml") for (_, d) in deps]]
+    lock(() -> (_DEV_DEPS[key] = (; inputs, stamp = stat_key(inputs), deps)), _DEV_DEPS_LOCK)
+    return copy(deps)
 end
+const _DEV_DEPS = Dict{String,NamedTuple{(:inputs, :stamp, :deps),Tuple{Vector{String},String,Vector{Pair{String,String}}}}}()
+const _DEV_DEPS_LOCK = ReentrantLock()
 
 """
     devsources_script(projects, rewrites) -> String

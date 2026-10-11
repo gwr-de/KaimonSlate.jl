@@ -166,6 +166,22 @@ const RE = KaimonSlate.ReportEngine
                 @test RE._env_fingerprint(env, "i"; depot = "/a") != RE._env_fingerprint(env, "i"; depot = "/b")
                 @test RE._env_fingerprint(env, "i") == RE._env_fingerprint(env, "i"; depot = "")
             end
+            # The fingerprint and the developed packages are kept until a file they were read from
+            # changes: the environment's own files, or a developed package's project.
+            mktempdir() do env
+                dep = mktempdir()
+                write(joinpath(dep, "Project.toml"), "name = \"Dep\"\n")
+                write(joinpath(env, "Project.toml"),
+                      "[deps]\nDep = \"00000000-0000-0000-0000-000000000001\"\n\n[sources]\nDep = {path = \"$dep\"}\n")
+                fp0 = RE._env_fingerprint(env, "i")
+                @test first.(RE.Sweep.local_dev_deps(env)) == ["Dep"]
+                @test RE._env_fingerprint(env, "i") == fp0
+                write(joinpath(dep, "Project.toml"), "name = \"Dep\"\n\n[deps]\nZ = \"00000000-0000-0000-0000-000000000002\"\n")
+                fp1 = RE._env_fingerprint(env, "i")
+                @test fp1 != fp0
+                write(joinpath(env, "Manifest.toml"), "julia_version = \"$VERSION\"\n")
+                @test RE._env_fingerprint(env, "i") != fp1
+            end
         end
 
         @testset "batch tasks start in their machine's shell" begin
@@ -174,6 +190,11 @@ const RE = KaimonSlate.ReportEngine
                                  "root_remote" => "/scratch/store", "depot" => "/scratch/jd"))
             d = only(filter(c -> c["name"] == "pmb", RE.clusters_resolved()))
             @test d["_depot"] == "/scratch/jd" && occursin("JULIA_DEPOT_PATH='/scratch/jd':", d["_setup"])
+            # Readiness only when asked for, and one entry when one is named.
+            @test haskey(d, "_tested")
+            lite = only(filter(c -> c["name"] == "pmb", RE.clusters_resolved(; tested = false)))
+            @test !haskey(lite, "_tested") && lite["_setup"] == d["_setup"]
+            @test [c["name"] for c in RE.clusters_resolved(; only = "pmb")] == ["pmb"]
             @test RE.cluster_get_resolved("pmb")["_setup"] == d["_setup"]
             # The entry a cell receives is flat strings; the target it builds carries the shell.
             t = S.cluster(Dict(String(k) => string(v) for (k, v) in d))
@@ -277,6 +298,8 @@ const RE = KaimonSlate.ReportEngine
             bare = mktempdir(); write(joinpath(bare, "Project.toml"), "")
             RE.record_env_test!("twinhost", bare, "cpu/"; by = "old", status = "ok", depot = "/d")
             fx = RE.host_facts("twinhost"); delete!(fx["envs"][RE.Sweep.env_key(bare, "cpu/")], "packages")
+            # Editing what `host_facts` returned is not editing the facts: only writing them back is.
+            @test haskey(RE.host_facts("twinhost")["envs"][RE.Sweep.env_key(bare, "cpu/")], "packages")
             RE.host_facts_merge!("twinhost", Dict{String,Any}("envs" => fx["envs"]))
             @test RE.env_readiness("twinhost", other, "cpu/"; depot = "/d", by = "old") == "Since the last prepare, Y was added."
             @test RE.package_change(Dict("A" => "1.0", "B" => "2.0"), Dict("A" => "1.1", "B" => "2.0", "C" => "", "D" => "")) ==

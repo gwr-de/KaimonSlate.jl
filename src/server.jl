@@ -4065,10 +4065,25 @@ end
 
 # One shared 5 s sweeper for the whole hub (started once at serve). Timer catches its own errors so a
 # transient failure can't kill the loop.
+#
+# The pass runs on a task of its own rather than in the timer's callback. That callback is sticky to the
+# thread that made the timer, and so are a page socket's reader, its calls and its writer: a pass run
+# there holds every one of them until it ends, which a page sees as calls that hang for the length of
+# the pass. A tick that finds the last pass still running skips, so a slow pass cannot pile up behind
+# itself, and one over a second is logged.
+const _SUPERVISING = Threads.Atomic{Bool}(false)
 function _ensure_run_supervisor!(h)   # NOTE: `Hub` defined later (server_hub.jl) — untyped so this loads
     _RUN_SUPERVISOR[] === nothing || return nothing
     _RUN_SUPERVISOR[] = Timer(_SUPERVISOR_TICK_S; interval = _SUPERVISOR_TICK_S) do _
-        try; _supervise_runs!(h); catch; end
+        Threads.atomic_cas!(_SUPERVISING, false, true) && return
+        Threads.@spawn try
+            t0 = time()
+            _supervise_runs!(h)
+            (dt = time() - t0) > 1.0 && ReportEngine._rlog("supervisor: a pass took $(round(dt; digits = 1))s")
+        catch
+        finally
+            _SUPERVISING[] = false
+        end
     end
     # Its own timer, at the workers' sampling rate: a supervisor tick waits on each worker's liveness
     # reply, so on the tick it would see a silent worker only every so often.
