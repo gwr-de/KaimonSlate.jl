@@ -884,9 +884,22 @@ function cancel!(l::RegionLauncher, root::AbstractString, names)
     return ok ? length(names) : 0
 end
 
-# A chunk's output is in its task worker's log, which the region's worker panel shows.
-log_files(::RegionLauncher, ::AbstractString, ::AbstractVector) = NamedTuple[]
-logs(::RegionLauncher, ::AbstractString, ::AbstractString; lines::Int = 200) = ""
+# A task worker writes each chunk's output to `logs/<submission>.<element>.log` in the store, as a
+# batch job's elements do, so the reads are the remote ones every launcher on a host uses.
+_there(l::RegionLauncher) = sc -> l.runner(l.host, sc)
+log_files(l::RegionLauncher, ::AbstractString, names::AbstractVector) =
+    _remote_log_files(_there(l), l.root, names; ext = "log")
+log_tail(l::RegionLauncher, path::AbstractString; lines::Int = 500) = _remote_log_tail(_there(l), path, lines)
+log_stat(l::RegionLauncher, path::AbstractString) = _remote_log_stat(_there(l), path)
+log_slice(l::RegionLauncher, path::AbstractString; offset::Integer = -(1 << 16), nbytes::Integer = 1 << 16) =
+    _remote_log_slice(_there(l), path, offset, nbytes)
+log_search(l::RegionLauncher, path::AbstractString, pattern::AbstractString; ignorecase::Bool = false,
+           regex::Bool = false, limit::Integer = 1000) =
+    _remote_log_search(_there(l), path, pattern, ignorecase, regex, limit)
+function logs(l::RegionLauncher, root::AbstractString, name::AbstractString; lines::Int = 200)
+    ok, txt = l.runner(l.host, "tail -n $(lines) $(_shq(joinpath(l.root, "logs")))/$(name).*.log 2>/dev/null")
+    return ok ? String(txt) : ""
+end
 
 # ── SLURM ────────────────────────────────────────────────────────────────────────────────────
 # One array job per submission: the scheduler sees a single entry with N elements, which is what

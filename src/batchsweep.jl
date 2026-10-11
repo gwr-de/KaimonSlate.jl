@@ -31,6 +31,8 @@ module BatchSweep
 
 import SHA
 import TOML
+import Logging
+import Dates
 
 const P = parentmodule(@__MODULE__)
 const MemoStore = P.MemoStore
@@ -976,19 +978,23 @@ function take_claim!(q::AbstractString, chunk::AbstractString, owner::AbstractSt
     end
 end
 
-# The chunks named by the queue's wants, read from the files, so a chunk handed to a worker is
-# dropped when its want is cancelled.
-function wanted_chunks(q::AbstractString)
-    out = Set{String}()
+# The queue's wants, read from the files: submission name → (region, chunks). Read before each chunk,
+# so a chunk handed to a worker is dropped when its want is cancelled.
+function queue_wants(q::AbstractString)
+    out = Dict{String,NamedTuple{(:region, :chunks),Tuple{String,Vector{String}}}}()
     isdir(q) || return out
     for f in readdir(q)
         endswith(f, ".want") || continue
+        region = ""; chunks = String[]
         for line in eachline(joinpath(q, f))
-            startswith(line, "chunks=") && union!(out, split(line[8:end]))
+            startswith(line, "region=") && (region = line[8:end])
+            startswith(line, "chunks=") && (chunks = String.(split(line[8:end])))
         end
+        out[f[1:end-5]] = (; region, chunks)
     end
     return out
 end
+wanted_chunks(q::AbstractString) = Set{String}(c for w in values(queue_wants(q)) for c in w.chunks)
 
 """
     run_queued_chunks(root, chunks; owner = "", beat = 20, on_chunk = c -> nothing) -> Int
@@ -1004,13 +1010,21 @@ function run_queued_chunks(root::AbstractString, chunks; owner::AbstractString =
     q = joinpath(String(root), "queue"); mkpath(q)
     n = 0
     for c in String.(chunks)
-        (c in wanted_chunks(q) && !isfile(joinpath(q, c * ".done"))) || continue
+        wants = queue_wants(q)
+        at = findfirst(w -> c in w.chunks, wants)
+        (at !== nothing && !isfile(joinpath(q, c * ".done"))) || continue
         take_claim!(q, c, String(owner)) || continue
         on_chunk(c)
         claim = joinpath(q, c * ".claim")
         t = Timer(_ -> (try; touch(claim); catch; end), beat; interval = beat)
         try
-            SlateTask.run_chunk(String(root), c)
+            # Named as a batch job's output is, `<submission>.<element>.log`, so the card's log viewer
+            # finds it the same way and knows which chunk it holds.
+            w = wants[at]
+            _chunk_logged(joinpath(String(root), "logs", "$(at).$(something(findfirst(==(c), w.chunks), 0)).log");
+                          chunk = c, region = w.region, owner = String(owner)) do
+                SlateTask.run_chunk(String(root), c)
+            end
         finally
             close(t)
             try; write(joinpath(q, c * ".done"), ""); catch; end
@@ -1019,6 +1033,36 @@ function run_queued_chunks(root::AbstractString, chunks; owner::AbstractString =
         n += 1
     end
     return n
+end
+
+# Run `f`, one chunk, with everything it prints going to `path`, between a line saying where and when it
+# ran and one saying how it ended. A body that prints nothing still leaves a record that it ran, on
+# which node, in which job, on which GPU.
+function _chunk_logged(f, path::AbstractString; chunk::AbstractString, region::AbstractString,
+                       owner::AbstractString)
+    mkpath(dirname(path))
+    open(path, "a") do io
+        redirect_stdio(stdout = io, stderr = io) do
+            Logging.with_logger(SlateTask._task_logger(io)) do
+                t0 = time()
+                @info "chunk starting" chunk region host = gethostname() job = get(ENV, "SLURM_JOB_ID", get(ENV, "PBS_JOBID", "")) worker = owner gpu = get(ENV, "CUDA_VISIBLE_DEVICES", "") julia = string(VERSION) threads = Threads.nthreads() pid = getpid() at = Dates.format(Dates.now(), "yyyy-mm-dd HH:MM:SS")
+                r = try
+                    f()
+                catch e
+                    @error "chunk stopped" chunk exception = (e, catch_backtrace())
+                    rethrow()
+                end
+                secs = round(time() - t0; digits = 1)
+                if r.failed > 0
+                    @error "chunk finished with failures" chunk ran = r.ran skipped = r.skipped failed = r.failed total = r.total secs
+                else
+                    @info "chunk finished" chunk ran = r.ran skipped = r.skipped failed = r.failed total = r.total secs
+                end
+                SlateTask._flush_output()
+                r
+            end
+        end
+    end
 end
 
 end # module BatchSweep

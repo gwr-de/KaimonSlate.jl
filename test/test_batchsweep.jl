@@ -3726,6 +3726,11 @@ end
             @test BS.run_queued_chunks(root, chunks[1:1]; owner = "w0") == 1
             q = BL.read_queue(l.runner, "", root)
             @test chunks[1] in q.done && !haskey(q.claims, chunks[1])
+            # Its output is kept as a batch job's element would be, with where and when it ran.
+            lf = BL.log_files(l, root, names)
+            @test length(lf) == 1 && endswith(only(lf).path, "$(only(names)).$(findfirst(==(chunks[1]), w.chunks)).log")
+            txt = read(only(lf).path, String)
+            @test occursin("chunk starting", txt) && occursin("chunk finished", txt) && occursin(gethostname(), txt)
             @test BL.queue_state(q, only(names)) == :pending          # the other chunk is still to run
             # A fresh claim reads as running; one left by a worker that died is pending again.
             write(joinpath(root, "queue", chunks[2] * ".claim"), "w1")
