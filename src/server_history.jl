@@ -1101,13 +1101,13 @@ function cell_json(c::Cell, bindref::Dict{String,Tuple{Cell,BindSpec}} = Dict{St
         end
         d["output"] = _bib_card_html(file, n, es, nbid, cited, labs; by)  # card instead of raw BibTeX
     end
-    # All user-facing tags (known behaviour tags + free-form) for the cell-header tag editor;
-    # `:opaque` is inferred each eval, not a user tag, so it's excluded from tags — but shipped
+    # All user-facing tags (known behaviour tags + free-form) for the cell-header tag editor. The
+    # flags Slate derives itself (`_INTERNAL_FLAGS`) are not tags and are left out. `:opaque` is shipped
     # as its own field: an opaque cell (parse error / barrier expr) has FABRICATED barrier deps
     # (all prior cells + all later cells depend on it), and the DAG must not draw those as real
     # dataflow edges.
     (:opaque in c.flags) && (d["opaque"] = true)
-    d["tags"] = sort!(String[string(f) for f in c.flags if f !== :opaque])
+    d["tags"] = sort!(String[string(f) for f in c.flags if !(f in ReportEngine._INTERNAL_FLAGS)])
     # Declared cell EFFECTS (the code→Slate channel): a compact list for the effect chip + the
     # cell-metadata popup — what the cell announced it did to Slate (e.g. a everywhere op registration),
     # which names it registered, and the statement that did it (deparse line-markers stripped for display).

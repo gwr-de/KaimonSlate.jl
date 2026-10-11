@@ -1701,6 +1701,14 @@ end
 function _apply_cell_effects!(nb::LiveNotebook, c::Cell, out)
     (out === nothing || isempty(out.effects)) && return nothing
     recs = [_effect_record(e) for e in out.effects]
+    # A cell that declares an identity for its value (a sweep, whose value is what has landed in its
+    # store) is tracked, not volatile. The `:volatile` its run picked up on the way (the sweep's own
+    # sign-in checks and scheduler polls) does not apply to it, and is dropped before anything reads it.
+    if any(r -> r.kind === :value_identity, recs)
+        keep = [r.kind !== :volatile for r in recs]
+        recs = recs[keep]
+        keepat!(out.effects, findall(keep))
+    end
     for (r, e) in zip(recs, out.effects)
         if r.kind === :everywhere
             :everywhere_declared in c.flags || push!(c.flags, :everywhere_declared)

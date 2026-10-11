@@ -132,6 +132,39 @@ end
     @test NS.cell_json(RE.Cell("p", RE.CODE, "2+2"))["blocked"] == ""
 end
 
+@testset "a cell that declares its value's identity is not volatile" begin
+    nb = NS.LiveNotebook("vid", joinpath(mktempdir(), "vid.jl"),
+        RE.parse_report("#%% code id=ask\nok = check()\n#%% job id=sw\nv = run()\n"; title = "vid"),
+        RE.InProcessKernel(), 1, String[], String[], ReentrantLock(), Channel{String}[],
+        ReentrantLock(), "", false, Dict{String,String}())
+    ask, sw = nb.report.cells
+    out() = RE.CellOutput("", RE.MimeChunk[], Any[], Any[], RE.BindSpec[], "", nothing, nothing, 0.0)
+    volatile = (kind = :volatile, names = Symbol[], stmt_src = "connected(h)", data = nothing)
+    # A sweep's run reaches sign-in checks and scheduler polls, and declares an identity for its value.
+    o = out(); push!(o.effects, volatile, (kind = :value_identity, names = [:v], stmt_src = "v = run()", data = (; digest = "d1")))
+    NS._apply_cell_effects!(nb, sw, o)
+    @test !(:volatile_declared in sw.flags) && [e.kind for e in o.effects] == [:value_identity]
+    # A cell that only asked a host something stays volatile.
+    o2 = out(); push!(o2.effects, volatile)
+    NS._apply_cell_effects!(nb, ask, o2)
+    @test :volatile_declared in ask.flags && length(o2.effects) == 1
+end
+
+@testset "flags Slate derives are not tags" begin
+    nb = NS.LiveNotebook("tags", joinpath(mktempdir(), "tags.jl"), RE.parse_report("#%% code id=a\nok = 1\n"; title = "tags"),
+        RE.InProcessKernel(), 1, String[], String[], ReentrantLock(), Channel{String}[],
+        ReentrantLock(), "", false, Dict{String,String}())
+    nb.closed = true
+    c = only(nb.report.cells)
+    union!(c.flags, (:volatile_declared, :macrocall, :hidecode))
+    @test NS.cell_json(c)["tags"] == ["hidecode"]
+    # A tag edit, from the page or an agent, sets the author's tags and leaves Slate's own alone.
+    NS.set_cell_tags!(nb, "a", ["nocache", "volatile_declared"])
+    @test c.flags ⊇ Set([:nocache, :volatile_declared, :macrocall]) && !(:hidecode in c.flags)
+    NS.set_cell_tags!(nb, "a", String[])
+    @test :volatile_declared in c.flags && !(:nocache in c.flags)
+end
+
 @testset "a granted node re-arms cells nobody is watching" begin
     # The task that queued the allocation re-runs the waiting cells when the node lands — but only
     # while it is still watching. It gives up after KAIMONSLATE_ALLOC_WAIT, and a hub restart takes

@@ -1219,7 +1219,9 @@ function _key_poisoned(byid, closure)
     for id in closure
         c = byid[id]
         :resource in c.flags && continue
-        (:nocache in c.flags || :volatile in c.flags) && return true
+        # The classifier, not the raw tag: a cell a library declared volatile at run time (asking a
+        # host whether it is signed in) poisons its readers as well as one tagged so by its author.
+        (:nocache in c.flags || _cell_effect(c) == VOLATILE) && return true
         (:opaque in c.flags && !_is_pure_using(c.source) && !_is_tracked_include(c.source)) && return true
     end
     return false

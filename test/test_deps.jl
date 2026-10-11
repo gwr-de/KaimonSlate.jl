@@ -70,6 +70,9 @@ ReportEngine.module_help(::CountingKernel, ::ReportEngine.Report, ::AbstractStri
         @test ReportEngine._memo_status(vrep, vdec) ==
               ("uncacheable", "reads live state (e.g. whether a host is signed in) — a cached answer would be stale")
         @test ReportEngine._memo_key(vrep, vdec) == ""      # no key ⇒ nothing to store, nothing to restore
+        # …and nor does a cell reading it, which would restore a result computed from a stale answer.
+        rd = Cell("rd", CODE, "msg = ok ? 1 : 0"); push!(vrep.cells, rd); build_dependencies!(vrep)
+        @test "vd" in rd.deps && ReportEngine._memo_key(vrep, rd) == ""
         # …and it survives a pin, for the same reason the tag does.
         vpin = Cell("vp", CODE, "ok = Sweep.connected(host)")
         push!(vpin.flags, Symbol("region=gpu")); push!(vpin.flags, :volatile_declared)

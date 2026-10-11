@@ -771,7 +771,7 @@ function agent_add_cell!(nb::LiveNotebook, source::AbstractString;
         end
         i = isempty(after) ? length(cells) : something(_index_of(cells, after), length(cells))
         cell = Cell(nid, _cellkind(kind), String(source))
-        union!(cell.flags, _parse_tag_symbols(tags))   # optional user tags on the fresh cell
+        union!(cell.flags, setdiff(_parse_tag_symbols(tags), ReportEngine._INTERNAL_FLAGS))   # optional user tags on the fresh cell
         _snapshot!(nb)
         insert!(cells, i + 1, cell)
         # announce=true → push the new cell to the browser BEFORE eval, so a long-running
@@ -1282,8 +1282,9 @@ function set_cell_tags!(nb::LiveNotebook, id::AbstractString, tags)
         had_needs = sort!(ReportEngine._manual_needs(c.flags))
         had_mut = sort!(ReportEngine._manual_mutates(c.flags))
         had_region = _cell_region(c)
-        want = _parse_tag_symbols(tags)
-        keep = Set(f for f in c.flags if f === :opaque)        # re-derived each eval — keep it
+        # The flags Slate derives (`_INTERNAL_FLAGS`) are not the author's to set or clear: kept as they are.
+        want = setdiff(_parse_tag_symbols(tags), ReportEngine._INTERNAL_FLAGS)
+        keep = Set(f for f in c.flags if f in ReportEngine._INTERNAL_FLAGS)
         empty!(c.flags); union!(c.flags, keep); union!(c.flags, want)
         # A tag says how the cell is treated from now on, so changing one does not run it: `trace`
         # shows on the next run, `nocache` stops the next run storing. A tag that asks for the result
