@@ -83,12 +83,19 @@ dir = joinpath(STORE, key); envdir = joinpath(dir, "env"); target = joinpath(dir
 mkpath(dir)
 
 # Written when an image is about to be built: that part of the notebook's Manifest, paths made
-# absolute, and a Project naming the roots. Its packages are all in the depot already.
+# absolute, and a Project naming the roots. Its packages are all in the depot already. Deps and weakdeps
+# are written by uuid: Pkg looks a name up among the Manifest's entries, and a weakdep the image leaves
+# out has none.
+byuuid(names) = Dict{String,Any}(n => nbdeps[n]["uuid"] for n in names if haskey(nbdeps, n))
 function write_env()
     mkpath(envdir)
     m = Dict{String,Any}(k => v for (k, v) in nbm if k != "deps" && k != "project_hash")
     m["deps"] = Dict{String,Any}(n => [let e = deepcopy(nbdeps[n])
-                                           haskey(e, "path") && (e["path"] = abspath_of(e["path"])); e
+                                           haskey(e, "path") && (e["path"] = abspath_of(e["path"]))
+                                           for f in ("deps", "weakdeps")
+                                               get(e, f, nothing) isa AbstractVector && (e[f] = byuuid(e[f]))
+                                           end
+                                           e
                                        end] for n in closure)
     open(io -> TOML.print(io, m; sorted = true), joinpath(envdir, "Manifest.toml"), "w")
     open(io -> TOML.print(io, Dict("deps" => Dict(n => nbdeps[n]["uuid"] for n in roots)); sorted = true),

@@ -414,6 +414,9 @@ const RE = KaimonSlate.ReportEngine
                     git-tree-sha1 = "aaaa"
                     uuid = "00000000-0000-0000-0000-00000000000a"
                     version = "1.0.0"
+                    weakdeps = ["C"]
+                    [deps.A.extensions]
+                    ACExt = "C"
                     [[deps.B]]
                     git-tree-sha1 = "bbbb"
                     uuid = "00000000-0000-0000-0000-00000000000b"
@@ -448,6 +451,15 @@ const RE = KaimonSlate.ReportEngine
                 manifest("2.1.0", "3.0.0")
                 @test RE._sysimage_outcome(run_script(; minfree = 1e9), true, 3)[3]["key"] != key
                 manifest("2.0.0", "3.0.0")
+                # The environment the image is built from reads as a Manifest, though A's weakdep C is not in it.
+                let f = joinpath(home, "env.jl"), s = RE._sysimage_build_script(r, "env", spec; infra = ("A",))
+                    write(f, first(s, findfirst("image() =", s).start - 1) *
+                             "\nwrite_env(); import Pkg; m = Pkg.Types.read_manifest(joinpath(envdir, \"Manifest.toml\"))\n" *
+                             "print(sort!([e.name for e in values(m.deps)]), \" \", m[Base.UUID(\"00000000-0000-0000-0000-00000000000a\")].weakdeps)\n")
+                    out = read(setenv(`$(Base.julia_cmd()) --startup-file=no $f`, merge(ENV, Dict("HOME" => home))), String)
+                    @test occursin("[\"A\", \"B\"]", out) && occursin("\"C\" => UUID(\"00000000-0000-0000-0000-00000000000c\")", out)
+                    rm(joinpath(store, key, "env"); recursive = true)
+                end
                 # A build of the same image already running elsewhere holds it; the lock names its region.
                 write(joinpath(dir, ".building-" * cpu), "simg otherhost 1")
                 st, why, _ = RE._sysimage_outcome(run_script(r2), true, 3)
