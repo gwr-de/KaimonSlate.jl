@@ -347,6 +347,9 @@ end
 Base.write(c::_CountingSink, b::UInt8) = (unsafe_write(c, Ref(b), UInt(1)); 1)
 SshTransport.stop_requested(c::_CountingSink) = c.stop[]
 
+# A fetch at least this large opens a connection of its own rather than sharing the host's session.
+const BULK_BYTES = 8 * 1024 * 1024
+
 # The fetches running in this process, by the file they write, so one can be stopped from elsewhere.
 const _FETCHES = Dict{String,Threads.Atomic{Bool}}()
 const _FETCHES_LOCK = ReentrantLock()
@@ -382,8 +385,10 @@ function fetch_to(host::AbstractString, script::AbstractString, dest::AbstractSt
                                stdout = sink, stderr = devnull)
                 try; run(cmd); true; catch; false; end
             else
+                # Large or unknown amounts go on a connection of their own (`SshTransport._with_bulk`).
                 connect!(host) && first(SshTransport.exec_io(String(host), String(script), input;
-                                                             ask = _ask, sink, timeout))
+                                                             ask = _ask, sink, timeout,
+                                                             bulk = total < 0 || total >= BULK_BYTES))
             end
         end
         ok = ok && !stop[]

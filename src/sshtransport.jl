@@ -21,7 +21,7 @@ module SshTransport
 import LibSSH2_jll
 import FileWatching
 import Sockets
-using Sockets: getaddrinfo, IPv4
+using Sockets: getaddrinfo, getalladdrinfo, IPAddr, IPv4, IPv6
 
 const LIB = LibSSH2_jll.libssh2
 
@@ -59,24 +59,45 @@ const SOCK_STREAM = Cint(1)
 const F_SETFL = Cint(4)
 const O_NONBLOCK = Cint(4)
 
+const AF_INET6 = Cint(Sys.isbsd() ? 30 : 10)
+
+# The `sockaddr` for `ip:port`, in this system's layout: BSD puts a length byte before a one-byte
+# family, Linux has a two-byte family.
+function _sockaddr(ip::IPAddr, port::Integer)
+    v6 = ip isa IPv6
+    sa = zeros(UInt8, v6 ? 28 : 16)
+    fam = v6 ? AF_INET6 : AF_INET
+    if Sys.isbsd(); sa[1] = UInt8(length(sa)); sa[2] = UInt8(fam); else; sa[1] = UInt8(fam); end
+    p = UInt16(port); sa[3] = UInt8(p >> 8); sa[4] = UInt8(p & 0xff)
+    if v6
+        h = UInt128(ip.host)                     # address at offset 8, after the flow label
+        for k in 0:15; sa[9+k] = UInt8((h >> (8 * (15 - k))) & 0xff); end
+    else
+        v = UInt32(ip.host)
+        for k in 0:3; sa[5+k] = UInt8((v >> (8 * (3 - k))) & 0xff); end
+    end
+    return fam, sa
+end
+
+# Connect to the first of the host's addresses that answers, IPv6 and IPv4 alike, in the order the
+# resolver gives them: a network that offers IPv6 first may have no usable IPv4 route, or the reverse.
 function _tcp_connect(hostname::AbstractString, port::Integer)
     Sys.iswindows() && error("SshTransport: Windows needs a Winsock socket here (WSAStartup + SOCKET)")
-    ip = getaddrinfo(String(hostname))
-    ip isa IPv4 || error("only IPv4 so far; $hostname resolved to $ip")
-    fd = ccall(:socket, Cint, (Cint, Cint, Cint), AF_INET, SOCK_STREAM, 0)
-    fd < 0 && error("socket() failed")
-    sa = zeros(UInt8, 16)
-    if Sys.isbsd(); sa[1] = 0x10; sa[2] = UInt8(AF_INET); else; sa[1] = UInt8(AF_INET); end
-    p = UInt16(port); sa[3] = UInt8(p >> 8); sa[4] = UInt8(p & 0xff)
-    v = UInt32(ip.host)
-    sa[5] = UInt8((v >> 24) & 0xff); sa[6] = UInt8((v >> 16) & 0xff)
-    sa[7] = UInt8((v >> 8) & 0xff);  sa[8] = UInt8(v & 0xff)
-    if ccall(:connect, Cint, (Cint, Ptr{UInt8}, Cuint), fd, sa, 16) != 0
+    ips = getalladdrinfo(String(hostname))
+    isempty(ips) && error("$hostname did not resolve")
+    tried = String[]
+    for ip in ips
+        fam, sa = _sockaddr(ip, port)
+        fd = ccall(:socket, Cint, (Cint, Cint, Cint), fam, SOCK_STREAM, 0)
+        fd < 0 && (push!(tried, "$ip: socket() failed"); continue)
+        if ccall(:connect, Cint, (Cint, Ptr{UInt8}, Cuint), fd, sa, length(sa)) == 0
+            ccall(:fcntl, Cint, (Cint, Cint, Cint), fd, F_SETFL, O_NONBLOCK)
+            return fd
+        end
+        push!(tried, "$ip: errno $(Libc.errno())")
         ccall(:close, Cint, (Cint,), fd)
-        error("connect to $hostname:$port refused")
     end
-    ccall(:fcntl, Cint, (Cint, Cint, Cint), fd, F_SETFL, O_NONBLOCK)
-    return fd
+    error("could not connect to $hostname:$port (" * join(tried, "; ") * ")")
 end
 
 # ── keyboard-interactive ─────────────────────────────────────────────────────────────────────
@@ -190,11 +211,14 @@ mutable struct Session
     # The task polling the socket for the pump. The socket is closed only after it has stopped, so it
     # can never poll a descriptor number the system has handed to something else.
     watcher::Union{Task,Nothing}
+    # A connection of its own for one bulk transfer (`_with_bulk`): signed in by key only, never with
+    # prompts, and not announced or registered as the host's session.
+    bulk::Bool
 end
-Session(ep, fd, ptr, req, owner, prompter, alive, err, fwds) =
+Session(ep, fd, ptr, req, owner, prompter, alive, err, fwds; bulk::Bool = false) =
     Session(ep, fd, ptr, req, owner, prompter, alive, err, fwds, ReentrantLock(), ReentrantLock(), Cint(0), "",
             Base.Semaphore(_max_channels()), Threads.Atomic{Int}(0), Channel{Any}(32),
-            Base.Event(true), Base.Event(true), Threads.Atomic{Int}(0), nothing)
+            Base.Event(true), Base.Event(true), Threads.Atomic{Int}(0), nothing, bulk)
 
 # Wake the session's pump: something it may have to move has arrived.
 _kick!(s::Session) = (notify(s.kick); nothing)
@@ -978,6 +1002,10 @@ function _open!(s::Session, ask)
     ms = auth_methods(s)
     if "publickey" in ms && _try_pubkey(s)
         # nothing more to do
+    elseif s.bulk
+        # A bulk connection is only worth having when it costs nobody anything: no prompt, and no
+        # attempt spent on a host that counts them. The transfer uses the host's session instead.
+        error("$(s.ep.alias): a bulk connection signs in by key only")
     elseif "keyboard-interactive" in ms
         # Discover the host's prompts only when we do not already remember them - from this run, or a
         # persisted earlier one. Discovery burns an authentication attempt on its OWN connection (it
@@ -1019,7 +1047,7 @@ function _open!(s::Session, ask)
     end
     _authed(s) || error("$(s.ep.alias): authentication did not complete")
     s.alive = true
-    errormonitor(Threads.@spawn _announce_connect(s.ep.alias))
+    s.bulk || errormonitor(Threads.@spawn _announce_connect(s.ep.alias))
     # Keep the session warm. Between runs a region holds nothing but an idle control session, and an
     # idle session dies to the server's own timeout or a NAT dropping the flow - after which the only
     # way back is an interactive second factor. Configuring an interval here and sending on a timer
@@ -1113,6 +1141,7 @@ function _serve(s::Session, ask)
             kind === :forward ? _add_forward!(s, arg[1], arg[2], arg[3]) :
             kind === :unforward ? (_drop_forward!(s, arg); (true, "")) :
             kind === :close ? (_close_session!(s); (true, "")) :
+            kind === :ready ? (true, "") :
             (false, "unknown request $kind")
         catch e
             (false, sprint(showerror, e))
@@ -1246,7 +1275,10 @@ function session(host::AbstractString; ask)
 end
 
 function _request(host::AbstractString, kind::Symbol, arg, fail; ask)
-    s = session(host; ask = ask)
+    return _request_on(session(host; ask = ask), kind, arg, fail)
+end
+
+function _request_on(s::Session, kind::Symbol, arg, fail)
     reply = Channel{Any}(1)
     try
         put!(s.req, (kind, arg, reply))
@@ -1254,6 +1286,35 @@ function _request(host::AbstractString, kind::Symbol, arg, fail; ask)
         return fail
     end
     return take!(reply)
+end
+
+# ── Bulk transfers on connections of their own ──────────────────────────────────────────────
+# The host's session is one TCP connection kept for hours, and TCP carries a connection's history:
+# after a burst of loss the sender keeps its window small, and after each idle pause it starts again
+# from that small window rather than growing quickly to the path's capacity, so bulk reads on an old
+# session can run at a fraction of what a new connection on the same path gets. A large transfer
+# therefore gets a connection of its own, opened for it and closed after it: a TCP handshake and a
+# key sign-in, about a second. Hosts that need a prompt to sign in keep using the session.
+
+"""
+    _with_bulk(f, host) -> f(s) or `nothing`
+
+Open a session to `host` for one transfer, signed in by key without prompting, and run `f(s)` on it;
+closed when `f` returns. `nothing` when the host cannot be signed in to that way.
+"""
+function _with_bulk(f, host::AbstractString)
+    ep = resolve(String(host))
+    s = Session(ep, Cint(-1), C_NULL, Channel{Any}(32), nothing, Prompter(String(host)), false, "", Fwd[];
+                bulk = true)
+    s.owner = Threads.@spawn _serve(s, (_...) -> nothing)
+    try
+        # Answered once the sign-in has finished, either way.
+        _request_on(s, :ready, nothing, (false, "the bulk session closed"))
+        s.alive || return nothing
+        return f(s)
+    finally
+        try; put!(s.req, (:close, "", Channel{Any}(1))); catch; end
+    end
 end
 
 """
@@ -1270,17 +1331,25 @@ exec(host::AbstractString, cmd::AbstractString; ask, timeout::Real = 120.0, onli
              (false, "session for $host is gone", :not_started); ask = ask)
 
 """
-    exec_io(host, cmd, input; sink = nothing, timeout = 300) -> (ok, stdout::Vector{UInt8}, stderr::String)
+    exec_io(host, cmd, input; sink = nothing, timeout = 300, bulk = false) -> (ok, stdout::Vector{UInt8}, stderr::String)
 
 Like `exec`, but streams `input` to the command's stdin and returns stdout as bytes. This is what
 carries a tar archive in either direction without a second authenticated transport. With `sink`,
 stdout is written there as it arrives and the returned bytes are empty: how bulk data reaches a file
-without being held in memory.
+without being held in memory. `bulk = true` runs it on a connection of its own (`_with_bulk`).
 """
-exec_io(host::AbstractString, cmd::AbstractString, input::Union{Vector{UInt8},IO,Nothing}; ask,
-        sink::Union{IO,Nothing} = nothing, timeout::Real = 300.0) =
-    _request(String(host), :io, (String(cmd), input, sink, Float64(timeout)),
-             (false, UInt8[], "session for $host is gone"); ask = ask)
+function exec_io(host::AbstractString, cmd::AbstractString, input::Union{Vector{UInt8},IO,Nothing}; ask,
+                 sink::Union{IO,Nothing} = nothing, timeout::Real = 300.0, bulk::Bool = false)
+    arg = (String(cmd), input, sink, Float64(timeout))
+    fail = (false, UInt8[], "session for $host is gone")
+    if bulk
+        # On a connection of its own (`_with_bulk`); the host's session only when none can be opened,
+        # so a transfer that started there is never repeated here.
+        r = _with_bulk(s -> _request_on(s, :io, arg, fail), host)
+        r === nothing || return r
+    end
+    return _request(String(host), :io, arg, fail; ask = ask)
+end
 
 """
     forward!(host, localport, target, targetport; ask) -> (ok, message)

@@ -4180,7 +4180,7 @@ function fetch_viewed(host::AbstractString, script::AbstractString, dest::Abstra
     upd(f) = lock(_XFER_VIEW_LOCK) do; v = get(_XFER_VIEWS, vid, nothing); v === nothing || f(v); end
     ok, n = false, 0
     try
-        ok, n = Sweep.fetch_to(host, script, dest; input, part, on_bytes = b -> upd(v -> (v.done = b)))
+        ok, n = Sweep.fetch_to(host, script, dest; input, part, total, on_bytes = b -> upd(v -> (v.done = b)))
     finally
         upd(v -> (v.done = n; v.finished = time(); ok || (v.err = "stopped or failed")))
         _xfer_trace_push!((; src = String(host), dst = "local", name = String(name), via = "ssh"),
