@@ -1096,23 +1096,27 @@ end
 
 # Everything that decides what step 3 of a provision installs: the environment's own files, the
 # Project of each dev'd dependency (a dependency it adds changes the resolve), the worker packages
-# added beside them, the extension SDK, and the Julia that resolves it all. A host that recorded
+# added beside them, the Projects of the worker package and the SDK, and the Julia that resolves it
+# all. A host that recorded
 # this after its last successful build already holds this environment.
 #
-# Cached per environment, infra, depot and worker code: hashed again only when one of the files it
-# reads changes size or modification time.
+# Slate's worker code is not part of it. The worker package and the SDK are developed from the host's
+# copy of this version's code, so a new version changes only the two paths the Manifest names, which a
+# provision points at the current copy (`_repoint_worker_code_sh`).
+#
+# Cached per environment, infra and depot: hashed again only when one of the files it reads changes size
+# or modification time.
 function _env_fingerprint(envdir::AbstractString, infra::AbstractString; depot::AbstractString = "")
-    dev = _worker_develop()
-    key = (String(envdir), String(infra), String(depot), dev)
+    key = (String(envdir), String(infra), String(depot))
     files = _env_fingerprint_inputs(envdir)
     stamp = Sweep.stat_key(files)
     c = lock(() -> get(_ENV_FP, key, nothing), _ENV_FP_LOCK)
     c !== nothing && c.stamp == stamp && return c.fp
-    fp = _env_fingerprint_hash(envdir, infra, dev; depot)
+    fp = _env_fingerprint_hash(envdir, infra; depot)
     lock(() -> (_ENV_FP[key] = (; stamp, fp)), _ENV_FP_LOCK)
     return fp
 end
-const _ENV_FP = Dict{NTuple{4,String},NamedTuple{(:stamp, :fp),Tuple{String,String}}}()
+const _ENV_FP = Dict{NTuple{3,String},NamedTuple{(:stamp, :fp),Tuple{String,String}}}()
 const _ENV_FP_LOCK = ReentrantLock()
 
 # The files `_env_fingerprint_hash` reads.
@@ -1125,11 +1129,10 @@ function _env_fingerprint_inputs(envdir::AbstractString)
     return files
 end
 
-function _env_fingerprint_hash(envdir::AbstractString, infra::AbstractString, dev::AbstractString;
-                               depot::AbstractString = "")
+function _env_fingerprint_hash(envdir::AbstractString, infra::AbstractString; depot::AbstractString = "")
     ctx = _SHA.SHA1_CTX()
     add(s) = _SHA.update!(ctx, codeunits(String(s)))
-    add("julia $VERSION\n"); add(infra); add(dev)
+    add("julia $VERSION\n"); add(infra)
     # Where it is installed: a different depot holds none of it.
     isempty(depot) || add("depot $depot\n")
     for p in (joinpath(_LOCAL_SEB, "Project.toml"), joinpath(@__DIR__, "SlateWorker", "Project.toml"))
@@ -1189,6 +1192,8 @@ function _held_record_snippet(file::AbstractString, stamp::AbstractString)
         for (_, _info) in Pkg.dependencies()
             _src = _info.source
             (_src === nothing || !isdir(_src)) && continue
+            # Slate's worker code is checked by the start on its own, and moves with each version.
+            occursin("/kaimonslate/worker/payload/", _src) && continue
             push!(_held, _src)
             for _name in ("Artifacts.toml", "JuliaArtifacts.toml")
                 _toml = joinpath(_src, _name)
@@ -1322,6 +1327,9 @@ function _host_state_script(projrel::AbstractString = ""; stamp::AbstractString 
     println(io, "echo \"kgate=\$(test -f ", q("$_REMOTE_KGATE_ENV/.ready"), " && echo 1)\"")
     if !isempty(projrel)
         println(io, "echo \"env=\$(test -f ", q("$projrel/Manifest.toml"), " && cat ", q(stamp), " 2>/dev/null)\"")
+        # The version of Slate's worker code the environment's Manifest develops (`_repoint_worker_code_sh`).
+        println(io, "echo \"wkey=\$(grep -o 'worker/payload/[0-9a-f]\\{16\\}/' ", q("$projrel/Manifest.toml"),
+                " 2>/dev/null | head -n 1 | cut -d/ -f3)\"")
         println(io, "echo \"rg=\$(R=\$(cat ", q(_RG_PATH_FILE), " 2>/dev/null); test -n \"\$R\" && test -x \"\$R\" && echo 1)\"")
     end
     # Whether the depot still holds what the environment was built with (`_held_record_snippet`): the
@@ -1341,6 +1349,19 @@ function _host_state(host::AbstractString, projrel::AbstractString = ""; stamp::
     ok, out = _run_on(String(host), _host_state_script(projrel; stamp, held))
     ok || return nothing
     return _parse_probe(out)
+end
+
+# Points the Manifest of the environment at `projrel` at this version's copy of the worker package and
+# the SDK (`_runtime_dir`). Their paths are the only part of an environment that a new version of
+# Slate's code changes, so this replaces a rebuild: the Project files match (the fingerprint holds
+# them), and `using SlateWorker` compiles the new code where the worker starts. Prints `repointed`
+# when it changed the file.
+function _repoint_worker_code_sh(projrel::AbstractString, key::AbstractString = _runtime_key())
+    q(p) = (startswith(p, "/") || startswith(p, "~/")) ? Sweep.shq_path(p) : "\"\$HOME/\"" * Sweep.shq(p)
+    return "f=" * q(projrel * "/Manifest.toml") * "; [ -f \"\$f\" ] || exit 0; " *
+           "sed -e 's#worker/payload/[0-9a-f]\\{16\\}/#worker/payload/" * key * "/#g' \"\$f\" > \"\$f.slate-tmp\" || exit 1; " *
+           "if cmp -s \"\$f\" \"\$f.slate-tmp\"; then rm -f \"\$f.slate-tmp\"; " *
+           "else mv \"\$f.slate-tmp\" \"\$f\" && echo repointed; fi"
 end
 
 # Steps 0–2 of a provision: what any worker on `host` needs before a notebook's environment is
@@ -1533,6 +1554,13 @@ function provision_remote!(t::RemoteTarget, parent_project::AbstractString; prec
         end
         _put_file(host, Vector{UInt8}(codeunits(stamp)), _env_stamp_path(t)) ||
             _rlog("provision: could not record the environment fingerprint on $host (next start rebuilds)")
+    end
+    # An environment kept, repaired or copied from a twin can develop an older version's worker code.
+    key = _runtime_key()
+    if built || repair || get(st, "wkey", "") != key
+        ok, out = _run_on(host, _repoint_worker_code_sh(rel, key))
+        ok || error("provision: could not point the environment on $host at worker code $key")
+        occursin("repointed", out) && _rlog("provision [3/3] pointed the environment on $host at worker code $key")
     end
     # WHERE rg is, written down once. `ripgrep_jll` is provisioned into the worker env, but a JLL
     # installs its binary into an artifact directory and never onto PATH — so `command -v rg` fails

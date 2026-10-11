@@ -2079,6 +2079,15 @@ end
             # Manifest there must be rewritten to name it.
             moved = mktempdir(); cp(env, joinpath(moved, basename(env))); cp(dep, joinpath(moved, basename(dep)))
             @test RE._env_fingerprint(joinpath(moved, basename(env)), "[infra]") != fp3
+            # A new version of Slate's worker code is not a new environment: the Manifest is pointed at it.
+            k0 = RE._RUNTIME_KEY[]
+            try
+                RE._RUNTIME_KEY[] = (at = time() + 3600, key = "0123456789abcdef")
+                empty!(RE._ENV_FP)
+                @test RE._env_fingerprint(env, "[infra]") == fp3
+            finally
+                RE._RUNTIME_KEY[] = k0
+            end
 
             # What the host records adds its own Julia, and whether the build precompiled.
             s(j, pc) = RE._env_stamp(fp3, j, pc)
@@ -2126,6 +2135,19 @@ end
             @test RE._parse_probe(sh(RE._host_state_script(rel)))["env"] == "fp0"
             put(RE._RG_PATH_FILE, joinpath(home, "gone", "rg"))
             @test RE._parse_probe(sh(RE._host_state_script(rel)))["rg"] == ""   # a path that went away
+
+            # The worker code the Manifest develops, and pointing it at this version's copy.
+            old = "/h/.cache/kaimonslate/worker/payload/0123456789abcdef"
+            put(rel * "/Manifest.toml", "[[deps.SlateWorker]]\npath = \"$old/SlateWorker\"\n" *
+                                        "[[deps.SlateExtensionsBase]]\npath = \"$old/SlateExtensionsBase\"\n")
+            @test RE._parse_probe(sh(RE._host_state_script(rel)))["wkey"] == "0123456789abcdef"
+            key = "fedcba9876543210"
+            @test occursin("repointed", sh(RE._repoint_worker_code_sh(rel, key)))
+            mf = read(joinpath(home, rel, "Manifest.toml"), String)
+            @test count("payload/$key/", mf) == 2 && !occursin("0123456789abcdef", mf)
+            @test RE._parse_probe(sh(RE._host_state_script(rel)))["wkey"] == key
+            @test !occursin("repointed", sh(RE._repoint_worker_code_sh(rel, key)))   # already there
+            @test !isfile(joinpath(home, rel, "Manifest.toml.slate-tmp"))
 
             # Without a project the env lines are left out; the runtime ones remain.
             bare = RE._parse_probe(sh(RE._host_state_script()))
