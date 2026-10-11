@@ -3700,50 +3700,39 @@ function _region_serves_kernel(r)
 end
 
 function _supervise_runs!(h)   # NOTE: `Hub` is defined later (server_hub.jl, included at ~1510) — untyped so this loads
-    try; ReportEngine.reap_pending_kills!()   # hub-wide, not per-notebook — see gate_kernel.jl
-    catch e; ReportEngine._rlog("supervisor: pending-kill reap error: " * first(sprint(showerror, e), 120))
-    end
-    try; _sweep_idle_regions!(h)              # hub-wide too: a region is not a notebook's to release
-    catch e; ReportEngine._rlog("supervisor: region sweep error: " * first(sprint(showerror, e), 120))
-    end
-    try; _sweep_stale_conn_state!(h)          # drop the series of workers that are gone
-    catch e; ReportEngine._rlog("supervisor: conn-state sweep error: " * first(sprint(showerror, e), 120))
-    end
+    # Each part is timed, so a slow pass names what it waited on.
+    took = Pair{String,Float64}[]
+    part(f, name) = (s = time(); try; f(); catch e
+        ReportEngine._rlog("supervisor: $name error: " * first(sprint(showerror, e), 120))
+    end; push!(took, name => time() - s))
+    start = time()
+    part(ReportEngine.reap_pending_kills!, "pending-kill reap")   # hub-wide, not per-notebook — see gate_kernel.jl
+    part(() -> _sweep_idle_regions!(h), "region sweep")            # hub-wide too: a region is not a notebook's to release
+    part(() -> _sweep_stale_conn_state!(h), "conn-state sweep")    # drop the series of workers that are gone
     # Release the next wave of any started sweep, for every cluster this MACHINE knows — not just
     # the notebooks that happen to be open. A sweep's second wave used to wait on a sweep card
     # polling, so closing the tab left the rest of a grid unsubmitted until someone came back.
-    try; ReportEngine.Sweep.advance_started!()
-    catch e; ReportEngine._rlog("supervisor: sweep advance error: " * first(sprint(showerror, e), 120))
-    end
-    try; _drive_region_sweeps!(h)             # a region sweep's chunks, on the region's node
-    catch e; ReportEngine._rlog("supervisor: region sweep driver error: " * first(sprint(showerror, e), 120))
-    end
-    try                                       # a leak is only visible as a series, so write one
+    part(ReportEngine.Sweep.advance_started!, "sweep advance")
+    part(() -> _drive_region_sweeps!(h), "region sweep driver")    # a region sweep's chunks, on the region's node
+    part("diag log") do                                            # a leak is only visible as a series, so write one
         line = SlateDiag.diag_log_line()
         line === nothing || ReportEngine._rlog(line)
-    catch e; ReportEngine._rlog("supervisor: diag log error: " * first(sprint(showerror, e), 120))
     end
     nbs = lock(h.lock) do; collect(values(h.notebooks)); end
     for nb in nbs
-        try; _liveness_sweep!(nb)   # heartbeat + dead-wire heal; caches running ids for the reconciler
-        catch e; ReportEngine._rlog("supervisor: liveness error on $(nb.id): " * first(sprint(showerror, e), 120))
-        end
-        try; _reconcile_nb_runs!(nb)
-        catch e; ReportEngine._rlog("supervisor: reconcile error on $(nb.id): " * first(sprint(showerror, e), 120))
-        end
-        try; _reconcile_stale_runner!(nb)
-        catch e; ReportEngine._rlog("supervisor: stale-runner reconcile error on $(nb.id): " * first(sprint(showerror, e), 120))
-        end
-        try; _reconcile_blocked_regions!(nb)
-        catch e; ReportEngine._rlog("supervisor: blocked-region reconcile error on $(nb.id): " * first(sprint(showerror, e), 120))
-        end
-        try; _reconcile_stranded_readers!(nb)
-        catch e; ReportEngine._rlog("supervisor: stranded-reader reconcile error on $(nb.id): " * first(sprint(showerror, e), 120))
-        end
-        try; _watchdog_scan!(nb)
-        catch e; ReportEngine._rlog("watchdog: scan error on $(nb.id): " * first(sprint(showerror, e), 120))
-        end
+        part(() -> _liveness_sweep!(nb), "liveness on $(nb.id)")   # heartbeat + dead-wire heal; caches running ids for the reconciler
+        part(() -> _reconcile_nb_runs!(nb), "reconcile on $(nb.id)")
+        part(() -> _reconcile_stale_runner!(nb), "stale-runner reconcile on $(nb.id)")
+        part(() -> _reconcile_blocked_regions!(nb), "blocked-region reconcile on $(nb.id)")
+        part(() -> _reconcile_stranded_readers!(nb), "stranded-reader reconcile on $(nb.id)")
+        part(() -> _watchdog_scan!(nb), "watchdog scan on $(nb.id)")
         try; _ws_health!(nb); catch; end   # push watchdog status to open pages over the WS (replaces the GET /api/health poll)
+    end
+    dt = time() - start
+    if dt > 1.0
+        slow = sort!(filter(p -> p.second > 0.1, took); by = p -> -p.second)
+        ReportEngine._rlog("supervisor: a pass took $(round(dt; digits = 1))s" *
+                           (isempty(slow) ? "" : " (" * join(("$(k) $(round(v; digits = 1))s" for (k, v) in first(slow, 4)), ", ") * ")"))
     end
     return nothing
 end
@@ -4070,16 +4059,14 @@ end
 # thread that made the timer, and so are a page socket's reader, its calls and its writer: a pass run
 # there holds every one of them until it ends, which a page sees as calls that hang for the length of
 # the pass. A tick that finds the last pass still running skips, so a slow pass cannot pile up behind
-# itself, and one over a second is logged.
+# itself, and one over a second is logged with its slowest parts.
 const _SUPERVISING = Threads.Atomic{Bool}(false)
 function _ensure_run_supervisor!(h)   # NOTE: `Hub` defined later (server_hub.jl) — untyped so this loads
     _RUN_SUPERVISOR[] === nothing || return nothing
     _RUN_SUPERVISOR[] = Timer(_SUPERVISOR_TICK_S; interval = _SUPERVISOR_TICK_S) do _
         Threads.atomic_cas!(_SUPERVISING, false, true) && return
         Threads.@spawn try
-            t0 = time()
             _supervise_runs!(h)
-            (dt = time() - t0) > 1.0 && ReportEngine._rlog("supervisor: a pass took $(round(dt; digits = 1))s")
         catch
         finally
             _SUPERVISING[] = false
