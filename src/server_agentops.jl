@@ -262,6 +262,8 @@ function _cell_result_text(c::Cell)
         c.blocked == WAIT_LOCKED &&
             return (isempty(c.blocked_host) || c.blocked_host == c.id) ? "(locked; run it to compute)" :
                    "(waits on locked cell $(c.blocked_host); `run_locked=true` computes it too)"
+        c.blocked == WAIT_UPSTREAM_STOPPED &&
+            return "(waits on $(c.blocked_host), which was stopped; running $(c.blocked_host) runs this too)"
         why = get(_WAIT_TEXT, c.blocked, replace(c.blocked, '_' => ' '))
         return "(" * why * (isempty(c.blocked_host) ? "" : " on " * c.blocked_host) * ")"
     end
