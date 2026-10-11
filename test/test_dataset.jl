@@ -983,6 +983,15 @@ const MS = RE.MemoStore
             @test q[2:3, 1:2:3, 2:2:4] == A[2:3, 1:2:3, 2:2:4]
             @test p[:, :, 1:2:5] == A[:, :, 1:2:5]       # …and locally
             @test q[1:7] == A[1:7]
+            # In a worker a read waits on the cell's task, reporting progress and checking its Stop.
+            calls = Ref(0)
+            RE.Sweep.READ_HOOKS[] = (; progress = (f, m, d) -> nothing, checkpoint = () -> (calls[] += 1))
+            try
+                @test q[:, 1:2:3, :] == A[:, 1:2:3, :]
+                @test calls[] >= 1
+            finally
+                RE.Sweep.READ_HOOKS[] = nothing
+            end
             cached() = filter(startswith("range-"), readdir(RE.Sweep._blob_cache_dir()))
             before = cached()
             @test q[:, 2, :] == A[:, 2, :]               # the same selection again: no new fetch

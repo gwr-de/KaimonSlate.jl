@@ -2601,7 +2601,7 @@ function _await_fetch(f, part::AbstractString, total::Integer, label::AbstractSt
     finally
         shown && (try; h.progress(1.0, "", true); catch; end)
     end
-    return fetch(t)
+    return Base.fetch(t)          # this module's own `fetch` is for artifacts
 end
 
 """
