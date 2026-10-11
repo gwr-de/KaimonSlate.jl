@@ -165,9 +165,10 @@ end
 
 # SLURM answers in one line per job, which is what `-o` is for. `%S` is the expected start of a
 # pending job (once the scheduler has planned one), `%r` what it is waiting on, and `%C` the CPUs
-# it holds: SLURM raises them to cover the memory asked for.
+# it holds: SLURM raises them to cover the memory asked for. Only this user's jobs: a region's job
+# name is the same for everyone who names a region alike.
 _slurm_find_script(name) =
-    "squeue -h -n " * shq(name) * " -o '%i|%T|%N|%L|%S|%r|%C' 2>/dev/null"
+    "squeue -h -u \"\$USER\" -n " * shq(name) * " -o '%i|%T|%N|%L|%S|%r|%C' 2>/dev/null"
 
 # PBS has no per-name query and no output format of its own, so one `qstat -f` is filtered by name
 # into the same fields, with the planned start and the scheduler's comment last. `%L` has no equivalent either: what is LEFT is the walltime asked for
@@ -483,11 +484,9 @@ so a `true` here means the allocation really is a minute longer.
 can_extend_allocation!(kind::Symbol, host::AbstractString, name::AbstractString) =
     extend_allocation!(kind, host, name, 60)
 
-_slurm_release_script(name) = "scancel -n " * shq(name) * " 2>&1"
-# `qdel` takes ids, not names, so the name is resolved first — one round trip either way.
-_pbs_release_script(name) =
-    "ids=\$(qselect -N " * shq(name) * " -u \"\$USER\" 2>/dev/null); " *
-    "[ -n \"\$ids\" ] && qdel \$ids 2>&1"
+# By the job id the lookup found, so only the job this hub holds is cancelled.
+_slurm_release_script(id) = "scancel " * shq(id) * " 2>&1"
+_pbs_release_script(id) = "qdel " * shq(id) * " 2>&1"
 
 """
     release_allocation!(kind, host, name) -> Bool
@@ -498,8 +497,9 @@ it is held, not the time it is used, and the commonest way to waste a cluster is
 function release_allocation!(kind::Symbol, host::AbstractString, name::AbstractString)
     a = find_allocation(kind, host, name)
     settled(a) && return false          # nothing held, or nobody to tell
-    script = kind === :slurm ? _slurm_release_script(name) :
-             kind === :pbs   ? _pbs_release_script(name) : _unsupported_scheduler(kind)
+    isempty(a.id) && return false
+    script = kind === :slurm ? _slurm_release_script(a.id) :
+             kind === :pbs   ? _pbs_release_script(a.id) : _unsupported_scheduler(kind)
     ok, _ = run_there(host, script)
     return ok
 end

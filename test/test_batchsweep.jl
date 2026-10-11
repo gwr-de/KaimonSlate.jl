@@ -671,6 +671,13 @@ end
                 @test Sweep.find_allocation(:slurm, "", "hold").state === :none
                 tool("squeue", "echo '42|RUNNING|nid1|0:41|N/A|None|32'")
                 @test Sweep.find_allocation(:slurm, "", "hold").state === :running
+                # Only this user's jobs are looked at, and a release cancels the job found, by its id.
+                tool("squeue", "echo \"\$@\" > $(bin)/asked; echo '42|RUNNING|nid1|0:41|N/A|None|32'")
+                tool("scancel", "echo \"\$@\" > $(bin)/cancelled")
+                @test Sweep.release_allocation!(:slurm, "", "hold")
+                asked = read(joinpath(bin, "asked"), String)
+                @test occursin("-u $(ENV["USER"])", asked) && occursin("-n hold", asked)
+                @test strip(read(joinpath(bin, "cancelled"), String)) == "42"
                 # Nothing held and the submission refused: the scheduler's reason comes back.
                 tool("squeue", "exit 0")
                 a = Sweep.request_allocation!(:slurm, "", "hold"; cpus = 8, gpus = "1")

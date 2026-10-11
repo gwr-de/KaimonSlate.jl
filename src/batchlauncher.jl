@@ -1092,7 +1092,7 @@ function poll(l::SlurmLauncher, root::AbstractString, names)
     # sweep's liveness on a single command: a slow or refused `squeue` dropped every chunk to
     # :unknown at once, and the next poll brought them all back, so the grid flashed in blocks.
     for part in Iterators.partition(ns, _POLL_NAMES)
-        ok, txt = (_ssh(l, "squeue -h -o '%j|%T|%i|%r|%S|%N|%M|%L' --name=$(join(part, ','))"))
+        ok, txt = (_ssh(l, "squeue -h -u \"\$USER\" -o '%j|%T|%i|%r|%S|%N|%M|%L' --name=$(join(part, ','))"))
         ok || continue
         for line in split(txt, '\n'; keepempty = false)
             # `|`-separated as asked for; a bare `name STATE` from an older or stand-in squeue still reads.
@@ -1147,7 +1147,7 @@ function cancel!(l::SlurmLauncher, root::AbstractString, names)
     before = poll(l, root, ns)
     live = [n for n in ns if get(before, n, :unknown) in (:pending, :running)]
     isempty(live) && return 0
-    (_ssh(l, join(("scancel --name=$(n)" for n in live), "; ")))
+    (_ssh(l, join(("scancel -u \"\$USER\" --name=$(n)" for n in live), "; ")))
     after = poll(l, root, live)
     return count(n -> !(get(after, n, :unknown) in (:pending, :running)), live)
 end
