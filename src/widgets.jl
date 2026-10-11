@@ -1974,6 +1974,11 @@ function _populate_notebook_ns!(m::Module; echart, EChart, slate_table, SlateTab
         Core.eval(m, :(macro sweep(args...)
             esc(Expr(:macrocall, $(GlobalRef(_sw, Symbol("@sweep"))), __source__, args...))
         end))
+        # `adopt(path)` in a cell stores the file in a dataset store beside the data, under
+        # `datadir()` (a region's scratch on a region), and returns the Dataset. A sweep body's `adopt`
+        # is its shard's own, stored by the unit's runner.
+        Core.eval(m, :(adopt(paths...; label::AbstractString = "") =
+            $(_sw).adopt_into(joinpath(datadir(), ".datasets"), $(_sw).SlateTask.adopt(paths...); label)))
     end
 
     Core.eval(m, :(const slate_fingerprint = $slate_fingerprint))   # canonical value hash (fingerprint.jl)

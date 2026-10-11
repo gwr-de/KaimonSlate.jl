@@ -153,6 +153,21 @@ them, `runs.dataset[:sst]` hands back an ordinary dataset to slice, and the dime
 attributes the format carried come with it. Write files under `datadir()` or `@sfile`, which resolve
 on the node the way they do in the notebook — the per-region scratch, beside the job.
 
+`adopt` works in an ordinary cell too. On a region, the file is stored in a dataset store under the
+region's `datadir()`, and the cell's value is the dataset. Read from the notebook, that value is the
+index, and each slice is read from the region over ssh:
+
+```julia
+#%% code id=frames region=gpu
+frames = adopt(@sfile("run.nc"))      # n(x, y, z, t), stored once on the region
+
+#%% code id=first_half
+n = frames[:n][1]                     # the variable, still on the region
+block = n[:, :, :, 1:200]             # one contiguous read of 200 frames
+```
+
+An unchanged file is not read again, so re-running the cell costs nothing.
+
 ## Working on a compute node
 
 A region whose host is a cluster's front door does not run there. `login` is where you **ask**; the

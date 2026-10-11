@@ -881,12 +881,18 @@ See also `save_asset`, `FileUpload`."""),
          end`"""),
 
     SlateApiEntry("adopt", "Batch sweep",
-        "Hand back a FILE a unit wrote (HDF5, NetCDF) instead of a value — sliced without moving it.",
+        "Read a FILE (HDF5, NetCDF) as a dataset where it lies — sliced without moving it.",
         ["hdf5", "netcdf", "nc", "h5", "file", "adopt", "dataset", "external data", "climate",
-         "solver output", "variables"],
-        "adopt(path)  ·  adopt(path1, path2, …)  ·  adopt(paths)",
-        """For output that never becomes a Julia value: a solver writes a file from deep inside
-        itself and the body only learns a path. Return `adopt(f)` from a `data=auto` sweep body and
+         "solver output", "variables", "region", "slice", "remote file"],
+        "adopt(path)  ·  adopt(path1, path2, …)  ·  adopt(paths)  ·  ds[:var][1][i, j, …]",
+        """IN A CELL, `adopt(f)` stores the file's variables in a dataset store under `datadir()`
+        (a region's own scratch on a region) and returns the Dataset; an unchanged file is not read
+        again. On a region the bytes stay there: the value that crosses to the notebook is the
+        index, and each slice is read from the region over ssh.
+        `v = ds[:n][1]` is the variable, indexed by its dimensions: `v[:, :, :, 1:200]` reads exactly
+        that block, and whole leading dimensions with a range of the next are one contiguous read.
+        IN A SWEEP, for a solver that writes a file from deep inside itself and leaves the body only
+        a path, return `adopt(f)` from a `data=auto` sweep body and
         the file is read WHERE IT WAS WRITTEN and re-emitted as Slate's own chunks — the read is on
         the compute node, so nothing extra crosses the wire. Write it under `datadir()`/`@sfile`,
         which resolve on the node the same way they do in the notebook.

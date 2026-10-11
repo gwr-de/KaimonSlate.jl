@@ -937,6 +937,57 @@ const MS = RE.MemoStore
         end
     end
 
+    @testset "a cell adopts a file once, and reads it by its dimensions from anywhere" begin
+        # A file holding one 4×3×5 array, `cube`, whose elements are 1:60 in memory order.
+        reads = Ref(0)
+        ST.register_dataset_adapter!("cube", path -> endswith(path, ".cube"),
+            path -> (reads[] += 1;
+                     (Dict{String,Any}("note" => read(path, String)),
+                      [(; name = "cube", dims = ["x", "y", "t"], attrs = Dict{String,Any}(),
+                          data = reshape(collect(1.0:60.0), 4, 3, 5))])))
+        A = reshape(collect(1.0:60.0), 4, 3, 5)
+        mktempdir() do dir
+            f = joinpath(dir, "a.cube"); write(f, "first")
+            store = joinpath(dir, ".datasets")
+            ds = RE.Sweep.adopt_into(store, ST.adopt(f))
+            @test ds.kind === :group && keys(ds) == ["cube"] && reads[] == 1
+            @test RE.Sweep.dimensions(ds, :cube) == ["x", "y", "t"]
+            p = ds[:cube][1]
+            @test size(p) == (4, 3, 5)
+            @test p[:, :, 2:4] == A[:, :, 2:4]       # whole leading dimensions: one run
+            @test p[2:3, :, 5] == A[2:3, :, 5]       # an integer drops its dimension
+            @test p[:, 2, :] == A[:, 2, :]           # an inner slab: one run per t
+            @test p[3, 1, 2] == A[3, 1, 2]
+            @test_throws BoundsError p[:, :, 6]
+            @test_throws DimensionMismatch p[:, :]
+
+            # Unchanged, the file is not read again; the store's manifest says what it holds.
+            @test RE.Sweep.adopt_into(store, ST.adopt(f))[:cube][1][:, :, 1] == A[:, :, 1]
+            @test reads[] == 1
+            mf = only(readdir(joinpath(store, "manifests")))
+            d = MS.read_manifest(store, first(splitext(mf)))
+            @test p.index["blob"] in MS._manifest_blobs(d)
+            # A changed file is a new dataset.
+            write(f, "second"); RE.Sweep.adopt_into(store, ST.adopt(f))
+            @test reads[] == 2
+
+            # Moved to another machine, the same reads go over ssh (an empty host runs them here),
+            # split into requests no larger than READ_REQUEST_BYTES.
+            far = RE.Sweep.relocate(ds, "")
+            q = far[:cube][1]
+            @test q.src isa RE.Sweep.SshSource && q.src.root == abspath(store)
+            old = RE.Sweep.READ_REQUEST_BYTES[]
+            try
+                RE.Sweep.READ_REQUEST_BYTES[] = 40
+                @test q[:, :, 2:4] == A[:, :, 2:4]
+                @test q[2:3, :, 5] == A[2:3, :, 5]
+            finally
+                RE.Sweep.READ_REQUEST_BYTES[] = old
+            end
+            @test RE.Sweep.relocate(far, "elsewhere")[:cube][1].src.host == ""   # already remote: kept
+        end
+    end
+
     @testset "an element type from a package resolves without Main having it" begin
         # The stored name is whatever `string(eltype(v))` produced WHERE THE UNIT RAN, and that may
         # be qualified into a module this session never imported. Adoption makes it ordinary rather

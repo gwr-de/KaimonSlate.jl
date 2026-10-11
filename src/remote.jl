@@ -4868,6 +4868,15 @@ function probe_transfer!(src_k, dst_k; bytes::Int = _probe_bytes())
     end
 end
 
+# The host this hub reaches a kernel's files through over ssh: the login node of the allocation a
+# worker runs in, else the worker's own host. Empty for a kernel on this machine.
+function _files_host(k)
+    t = hasproperty(k, :target) ? k.target : nothing
+    t isa RemoteTarget || return ""
+    v = via(t.ssh_host)
+    return v === nothing ? t.ssh_host : v.host
+end
+
 function transfer_binding!(src_k, dst_k, name::AbstractString; zc::Bool = false, mode::Symbol = :relay,
                            on_plan = nothing, on_progress = nothing, cellkey::AbstractString = "")
     # `cellkey` (the producing cell's memo key) lets the source memo-RESTORE the value if its live global
@@ -4876,7 +4885,8 @@ function transfer_binding!(src_k, dst_k, name::AbstractString; zc::Bool = false,
     # Where the time goes, phase by phase, for the line that reports the move.
     p0 = time(); phases = Pair{String,Float64}[]
     phase(n) = (push!(phases, n => time() - p0); p0 = time(); nothing)
-    meta = _tool(src_k, "__slate_blob_of", Dict{String,Any}("name" => String(name), "cellkey" => String(cellkey)); timeout = _blob_xfer_timeout())
+    meta = _tool(src_k, "__slate_blob_of", Dict{String,Any}("name" => String(name), "cellkey" => String(cellkey),
+                                                             "host" => _files_host(src_k)); timeout = _blob_xfer_timeout())
     phase("describe")
     err = try; getproperty(meta, :error); catch; nothing; end
     err === nothing || error("transfer '$name': $err")

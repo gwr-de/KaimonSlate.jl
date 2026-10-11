@@ -1172,7 +1172,7 @@ address — `(; hash, codec, bytes)` (or `(; error)`). One half of cross-kernel 
 (region runner): the hub moves the blob to the other worker's CAS over the data channel (or the
 filesystem, when that worker is local) and calls `__slate_bind_blob` there. Codec-picked like
 the memo store (arrow/raw/jls), so a DataFrame crosses as mmap-ready Arrow IPC."
-function __slate_blob_of(name::String; cellkey::String = "")
+function __slate_blob_of(name::String; cellkey::String = "", host::String = "")
     _MEMO_OK || return (; error = "memo/blob layer disabled on this worker")
     m = _NS[]
     s = Symbol(name)
@@ -1189,6 +1189,9 @@ function __slate_blob_of(name::String; cellkey::String = "")
             (isempty(cellkey) ? "" : " (absent from the live namespace and no memo entry restores it — its cell must re-run on its side)"))
     end
     v = Base.invokelatest(getglobal, m, s)
+    # A dataset over this machine's files is read from elsewhere over ssh through `host`, the host the
+    # hub reaches this worker's files by. Its bytes stay here.
+    (!isempty(host) && isdefined(@__MODULE__, :Sweep) && v isa Sweep.Dataset) && (v = Sweep.relocate(v, host))
     codec = try; _codec_pick(v); catch; "jls"; end
     h, n = try
         try

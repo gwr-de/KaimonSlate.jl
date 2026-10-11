@@ -2481,11 +2481,19 @@ function Base.getindex(p::DatasetPart, i::AbstractUnitRange)
             # Local: mmap the window, so the pages outside it are never faulted in.
             SlateTask.dataset_elements(p.root, p.index, i)
         else
-            # Remote: the same window as an exact byte range, reinterpreted on arrival. An array's
-            # layout is what makes this a single request rather than a search.
+            # Remote: the same window as exact byte ranges, reinterpreted on arrival. An array's
+            # layout is what makes this a few requests rather than a search; a long window is split
+            # so no one reply has to carry all of it.
             blob, off, nb, _ = SlateTask.array_range(p.index, i)
             T = SlateTask.eltype_of(String(p.index["eltype"]))
-            collect(reinterpret(T, read_range(p.src, blob, off, nb)))
+            buf = Vector{UInt8}(undef, nb)
+            at = 0
+            while at < nb
+                len = min(READ_REQUEST_BYTES[], nb - at)
+                copyto!(buf, at + 1, read_range(p.src, blob, off + at, len), 1, len)
+                at += len
+            end
+            collect(reinterpret(T, buf))
         end
     catch e
         _explain_missing(p, e)
@@ -2496,6 +2504,98 @@ function Base.getindex(p::DatasetPart, i::AbstractUnitRange)
 end
 Base.getindex(p::DatasetPart, i::Integer) = p[i:i][1]
 Base.length(p::DatasetPart) = p.rows
+"An array part's dimensions, from its index."
+Base.size(p::DatasetPart) = Tuple(Int(d) for d in get(p.index, "dims", Int[]))
+
+"The most bytes one remote read asks for. A larger window is read as several."
+const READ_REQUEST_BYTES = Ref(32 * 1024^2)
+
+"""
+    part[i, j, k, …]   -> the selection, shaped as the same indices would shape an Array
+
+An array part indexed by its dimensions, with integers, ranges and `:`. The selection is read as the
+contiguous runs it covers: whole leading dimensions and a range of the next one are one run, so a
+block of frames along the last dimension is a single read, and a slab in an inner dimension is one
+run per index of the dimensions after it.
+"""
+function Base.getindex(p::DatasetPart, I::Vararg{Union{Colon,Integer,AbstractUnitRange},N}) where {N}
+    dims = Int[d for d in get(p.index, "dims", Int[])]
+    N == length(dims) ||
+        throw(DimensionMismatch("this part has $(length(dims)) dimensions ($(join(dims, "×"))), " *
+                                "indexed with $(N)"))
+    rs = ntuple(d -> I[d] isa Colon ? (1:dims[d]) : I[d] isa Integer ? (I[d]:I[d]) : UnitRange{Int}(I[d]), N)
+    for d in 1:N
+        isempty(rs[d]) || (first(rs[d]) >= 1 && last(rs[d]) <= dims[d]) ||
+            throw(BoundsError("dimension $(d) of a $(join(dims, "×")) part indexed with $(I[d])"))
+    end
+    T = SlateTask.eltype_of(String(p.index["eltype"]))
+    out = Array{T}(undef, map(length, rs))
+    if !isempty(out)
+        # `f` is the first dimension not taken whole: everything before it, and its range, is one run.
+        f = something(findfirst(d -> length(rs[d]) != dims[d], 1:N), N)
+        strides = cumprod([1; dims[1:end-1]])
+        runlen = strides[f] * length(rs[f])
+        at = 0
+        for c in CartesianIndices(rs[f+1:end])
+            start = 1 + (first(rs[f]) - 1) * strides[f] + sum(((c[k] - 1) * strides[f+k] for k in 1:N-f); init = 0)
+            copyto!(out, at + 1, p[start:start+runlen-1], 1, runlen)
+            at += runlen
+        end
+    end
+    all(i -> i isa Integer, I) && return out[1]
+    return reshape(out, Tuple(length(rs[d]) for d in 1:N if !(I[d] isa Integer)))
+end
+
+# ── Adopting a file in a notebook cell ───────────────────────────────────────────────────────
+# A sweep unit's `adopt` is stored by the unit's runner. A notebook cell's is stored here, at once:
+# the file is read where it lies into a dataset store beside it, and the cell gets the Dataset. When
+# that value moves to another machine, `relocate` turns its reads into ranged reads over ssh, so a
+# region's data stays on the region and only the slices a reader asks for cross.
+
+"""
+    adopt_into(root, files::SlateTask.AdoptedFile; label = "") -> Dataset
+
+Store the files in the dataset store at `root` and return them as a group dataset read from there.
+Keyed by each file's path, size and modification time, so adopting an unchanged file again returns
+the stored dataset without reading the file.
+"""
+function adopt_into(root::AbstractString, a::SlateTask.AdoptedFile; label::AbstractString = "")
+    isempty(a.paths) && error("adopt() was given no paths")
+    for f in a.paths
+        isfile(f) || error("adopt(): no such file: $(f)")
+    end
+    root = abspath(root)
+    stamp = join((string(abspath(f), '\t', filesize(f), '\t', mtime(f)) for f in a.paths), '\n')
+    key = "adopt-" * bytes2hex(SHA.sha256(stamp))[1:40]
+    lbl = isempty(label) ? join(basename.(a.paths), ", ") : String(label)
+    m = MemoStore.read_manifest(root, key)
+    held = m === nothing ? nothing : get(m, "dataset", nothing)
+    if held isa AbstractDict
+        idx = Dict{String,Any}(String(k) => v for (k, v) in held)
+        part = DatasetPart(root, idx, NamedTuple(), 0, Int(get(idx, "bytes", 0)), lbl)
+        part_present(part) && return Dataset(:group, [part], 0, lbl)
+    end
+    idx, n = SlateTask.write_dataset!(root, a)
+    MemoStore.write_manifest(root, key, Dict{String,Any}(
+        "kind" => "adopted", "dataset" => idx, "created" => round(Int, time()),
+        "paths" => String[abspath(f) for f in a.paths]))
+    return Dataset(:group, [DatasetPart(root, idx, NamedTuple(), 0, Int(n), lbl)], 0, lbl)
+end
+
+"""
+    relocate(ds, host) -> Dataset
+
+`ds` as another machine sees it: parts read from a store on this machine are read over ssh through
+`host`, the host that reaches this machine's files.
+"""
+function relocate(ds::Dataset, host::AbstractString)
+    parts = DatasetPart[p.src isa LocalSource ?
+                        DatasetPart(p.root, p.backend, p.index, p.params, p.facts, p.rows, p.bytes,
+                                    p.label, SshSource(String(host), p.src.root)) : p
+                        for p in ds.parts]
+    return Dataset(ds.kind, parts, ds.pnames, ds.columns, ds.types, ds.starts, ds.whole, ds.whole_why,
+                   ds.label, ds.purged, ds.limit)
+end
 
 """
     query_cost(ds; between = nothing) -> NamedTuple

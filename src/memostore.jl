@@ -301,8 +301,25 @@ function _manifest_blobs(d::AbstractDict; group::Symbol = :all)
         for x in get(d, "artifacts", Any[])
             x isa AbstractDict && push!(hs, String(get(x, "blob", "")))
         end
+        # An addressable result, or an adopted file: its blobs stay where they were written, like an
+        # artifact's.
+        ds = get(d, "dataset", nothing)
+        ds isa AbstractDict && _index_blobs!(hs, ds)
     end
     return filter(_validhash, hs)
+end
+
+# The blobs a dataset index names: an array's one, a table's chunks, and a group's variables.
+function _index_blobs!(hs::Vector{String}, idx::AbstractDict)
+    b = get(idx, "blob", nothing)
+    b isa AbstractString && push!(hs, String(b))
+    for c in get(idx, "chunks", Any[])
+        c isa AbstractDict && push!(hs, String(get(c, "blob", "")))
+    end
+    for v in get(idx, "vars", Any[])
+        v isa AbstractDict && (vi = get(v, "index", nothing)) isa AbstractDict && _index_blobs!(hs, vi)
+    end
+    return hs
 end
 
 # ── Scoped export: a SUBSET of the store, for embedding in a standalone `.jl` ─────────────────
