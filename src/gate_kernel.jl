@@ -406,8 +406,9 @@ mutable struct GateKernel <: Kernel
     label::String    # gate-session display label (the notebook's filename) — names the session in `ping`/TUI
     target::Any      # RunTarget: nothing ⇒ local spawn; RemoteTarget ⇒ provision + spawn on a host, connect over CURVE/tunnel
     tunnel::Any      # supervised SSH Tunnel for a :ssh_tunnel RemoteTarget (closed on teardown), else nothing
-    ns_gen::Int      # namespace generation — bumped whenever a FRESH (empty) namespace is bound: a cold
-                     # spawn, a pool ADOPTION (`__slate_adopt` swaps in a new namespace), a reprovision.
+    ns_gen::Int      # namespace generation — renewed (`_fresh_namespace!`) whenever a FRESH (empty) namespace is
+                     # bound: a cold spawn, a pool ADOPTION (`__slate_adopt` swaps in a new namespace), a reprovision.
+                     # Unique across all kernels, so a rebuilt kernel never matches a record left by another.
                      # NOT bumped on a reattach (park/record/probe reuse the SAME live process + namespace).
                      # The region dedups (prime / resource / datadir / synced) fold this into their key, so
                      # a swapped worker's blank namespace is correctly re-established instead of skipped.
@@ -977,8 +978,13 @@ function _slate_logdir()
     end
 end
 
+# A new namespace generation for `k`. Drawn from one counter, since the region records are keyed by the
+# kernel's objectid, which a later kernel can reuse once this one is collected.
+const _NS_GEN = Threads.Atomic{Int}(0)
+_fresh_namespace!(k) = (k.ns_gen = Threads.atomic_add!(_NS_GEN, 1) + 1)
+
 function _spawn_worker!(k::GateKernel)
-    k.ns_gen += 1   # a fresh LOCAL process ⇒ blank namespace (mirrors spawn_and_connect_remote!): the
+    _fresh_namespace!(k)   # a fresh LOCAL process ⇒ blank namespace (mirrors spawn_and_connect_remote!): the
                     # ns_gen-keyed re-establish re-primes it — main-kernel @bind registrations here, and
                     # region prime/resource/sync in the region layer. Without this a mid-session respawn
                     # (worker crash → prepare! replaces it) left a fresh namespace looking unchanged.

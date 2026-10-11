@@ -3293,7 +3293,7 @@ function _spawn_and_connect_remote!(k, t::RemoteTarget, parent_project::Abstract
                   "(attempt $attempt of $_SPAWN_TRIES)")
         end
         r.conn === nothing && error("slate remote: could not reach worker on $host:$port ($(r.err))")
-        k.ns_gen += 1   # fresh process ⇒ blank namespace: region dedups keyed on ns_gen re-establish it
+        _fresh_namespace!(k)   # fresh process ⇒ blank namespace: region dedups keyed on ns_gen re-establish it
         _note_start!(host, :started)
         _unmark_reaped!(host, port)
         _attach_record!(host, k.label; port = port, stream_port = stream_port,
@@ -3448,7 +3448,7 @@ function _spawn_and_connect_remote!(k, t::RemoteTarget, parent_project::Abstract
                 # Stamp the region's data root as we tie this generic pool worker to us — same handoff
                 # that re-points PARENT_PROJECT. Empty datadir clears any prior region's root (set-or-clear).
                 _tool(k, "__slate_adopt", Dict{String,Any}("parent" => t.project, "datadir" => t.datadir); timeout = 15.0)
-                k.ns_gen += 1   # adopt swaps in a fresh namespace ⇒ region dedups must re-establish it
+                _fresh_namespace!(k)   # adopt swaps in a fresh namespace ⇒ region dedups must re-establish it
                 true
             catch e
                 _rlog("adopt: worker-$(pool.port) refused adoption ($(sprint(showerror, e))) — falling back to fresh spawn")
