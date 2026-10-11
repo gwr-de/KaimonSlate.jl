@@ -2929,6 +2929,19 @@ function _heal_dead_wire!(nb::LiveNotebook, k, unresp_s::Real = 0.0)
     return dropped
 end
 
+# The heartbeat of every connected worker of `nbs`, all asked at once: kernel => (its connection when
+# asked, `_liveness_ping`'s answer). A worker on a host nobody is signed in to is not asked; its
+# notebook's sweep handles it.
+function _ping_workers(nbs)
+    tasks = Dict{Any,Tuple{Any,Task}}()
+    for nb in nbs, k in _nb_kernels(nb)
+        (k isa ReportEngine.GateKernel && k.conn !== nothing) || continue
+        (h = ReportEngine.session_host(k)) != "" && !ReportEngine.Sweep.connected(h) && continue
+        haskey(tasks, k) || (tasks[k] = (k.conn, Threads.@spawn _liveness_ping(k)))
+    end
+    return Dict{Any,Any}(k => (c, fetch(t)) for (k, (c, t)) in tasks)
+end
+
 # Ping every connected kernel: refresh the heartbeat, track failures, heal dead remote wires, and
 # stash the running cell ids, with which kernels answered, for the orphan reconciler. Runs every sweep (idle or busy) so a
 # wire that dies while nothing is running is still healed before the next cell is dispatched onto it.
@@ -2948,10 +2961,12 @@ function _liveness_ping(k)
     return (true, String[String.(run); String.(collect(something(field(:runs), ())))], nothing)
 end
 
-function _liveness_sweep!(nb::LiveNotebook)
+# `replies` are the answers `_ping_workers` collected for the whole pass; a worker without one is
+# asked here.
+function _liveness_sweep!(nb::LiveNotebook; replies = nothing)
     ids = Set{String}(); answered = Set{String}(); asked = Set{String}()
     # Every kernel is pinged at once, so a silent one costs the sweep one timeout, not one each.
-    pings = Tuple{Any,Any,Task}[]
+    pings = Tuple{Any,Any,Any}[]
     for k in _nb_kernels(nb)
         (k isa ReportEngine.GateKernel && k.conn !== nothing) || continue
         push!(asked, _kernel_side_label(nb, k))
@@ -2964,10 +2979,11 @@ function _liveness_sweep!(nb::LiveNotebook)
             _drop_signed_out_wire!(nb, k, h; hold = false)
             continue
         end
-        push!(pings, (k, k.conn, Threads.@spawn _liveness_ping(k)))
+        pre = replies === nothing ? nothing : get(replies, k, nothing)
+        push!(pings, pre === nothing ? (k, k.conn, Threads.@spawn _liveness_ping(k)) : (k, pre...))
     end
     for (k, conn0, t) in pings
-        ok, got, err = fetch(t)
+        ok, got, err = t isa Task ? fetch(t) : t
         if ok
             union!(ids, got)
             push!(answered, _kernel_side_label(nb, k))
@@ -3782,11 +3798,12 @@ function _region_serves_kernel(r)
 end
 
 function _supervise_runs!(h)   # NOTE: `Hub` is defined later (server_hub.jl, included at ~1510) — untyped so this loads
-    # Each part is timed, so a slow pass names what it waited on.
+    # Each part is timed, so a slow pass names what it waited on. Parts run on several tasks.
     took = Pair{String,Float64}[]
+    took_lk = ReentrantLock()
     part(f, name) = (s = time(); try; f(); catch e
         ReportEngine._rlog("supervisor: $name error: " * first(sprint(showerror, e), 120))
-    end; push!(took, name => time() - s))
+    end; lock(() -> push!(took, name => time() - s), took_lk))
     start = time()
     part(ReportEngine.reap_pending_kills!, "pending-kill reap")   # hub-wide, not per-notebook — see gate_kernel.jl
     part(() -> _sweep_idle_regions!(h), "region sweep")            # hub-wide too: a region is not a notebook's to release
@@ -3794,15 +3811,20 @@ function _supervise_runs!(h)   # NOTE: `Hub` is defined later (server_hub.jl, in
     # Release the next wave of any started sweep, for every cluster this MACHINE knows — not just
     # the notebooks that happen to be open. A sweep's second wave used to wait on a sweep card
     # polling, so closing the tab left the rest of a grid unsubmitted until someone came back.
-    part(ReportEngine.Sweep.advance_started!, "sweep advance")
-    part(() -> _drive_region_sweeps!(h), "region sweep driver")    # a region sweep's chunks, on the region's node
+    # Both of these wait on remote hosts, so they run beside the pass rather than in it.
+    _background_step!("sweep advance", ReportEngine.Sweep.advance_started!)
+    _background_step!("region sweep driver", () -> _drive_region_sweeps!(h))   # a region sweep's chunks, on its node
     part("diag log") do                                            # a leak is only visible as a series, so write one
         line = SlateDiag.diag_log_line()
         line === nothing || ReportEngine._rlog(line)
     end
     nbs = lock(h.lock) do; collect(values(h.notebooks)); end
+    # Every worker's heartbeat is asked at once, so the pass waits for the slowest reply rather than
+    # the sum of them; what the replies mean is then worked out notebook by notebook, on this task.
+    replies = Dict{Any,Any}()
+    part(() -> (replies = _ping_workers(nbs)), "liveness pings")
     for nb in nbs
-        part(() -> _liveness_sweep!(nb), "liveness on $(nb.id)")   # heartbeat + dead-wire heal; caches running ids for the reconciler
+        part(() -> _liveness_sweep!(nb; replies), "liveness on $(nb.id)")   # heartbeat + dead-wire heal; caches running ids for the reconciler
         part(() -> _reconcile_nb_runs!(nb), "reconcile on $(nb.id)")
         part(() -> _reconcile_stale_runner!(nb), "stale-runner reconcile on $(nb.id)")
         part(() -> _reconcile_blocked_regions!(nb), "blocked-region reconcile on $(nb.id)")
@@ -4143,6 +4165,26 @@ end
 # the pass. A tick that finds the last pass still running skips, so a slow pass cannot pile up behind
 # itself, and one over a second is logged with its slowest parts.
 const _SUPERVISING = Threads.Atomic{Bool}(false)
+
+# A supervisor step that waits on remote hosts, started on a task of its own each tick unless the last
+# one is still running. Logged when slow, as a pass is.
+const _BACKGROUND_STEPS = Dict{String,Threads.Atomic{Bool}}()
+const _BACKGROUND_STEPS_LK = ReentrantLock()
+function _background_step!(name::AbstractString, f)
+    flag = lock(() -> get!(() -> Threads.Atomic{Bool}(false), _BACKGROUND_STEPS, String(name)), _BACKGROUND_STEPS_LK)
+    Threads.atomic_cas!(flag, false, true) && return nothing
+    Threads.@spawn try
+        t0 = time()
+        f()
+        dt = time() - t0
+        dt > 5.0 && ReportEngine._rlog("supervisor: $name took $(round(dt; digits = 1))s")
+    catch e
+        ReportEngine._rlog("supervisor: $name error: " * first(sprint(showerror, e), 120))
+    finally
+        flag[] = false
+    end
+    return nothing
+end
 function _ensure_run_supervisor!(h)   # NOTE: `Hub` defined later (server_hub.jl) — untyped so this loads
     _RUN_SUPERVISOR[] === nothing || return nothing
     _RUN_SUPERVISOR[] = Timer(_SUPERVISOR_TICK_S; interval = _SUPERVISOR_TICK_S) do _

@@ -1496,6 +1496,15 @@ end
 # last question is still in the post.
 const _ADVANCE_AT = Dict{String,Float64}()
 
+# Started runs found settled, with the state of their store at the time. A run keeps its started
+# marker once it is done, and a settled run has nothing to submit until something changes it: units
+# landing, a retry, a reset, a resume or cleared attempts, each of which writes to the store's
+# `events` or `jobs`. Until one of those changes it is not synced or reconciled again, so a machine
+# with many finished sweeps costs a `stat` per store per tick rather than a reconcile of each.
+const _SETTLED = Dict{Tuple{String,String},Tuple{Float64,Float64}}()
+_store_stamp(root::AbstractString) =
+    (mtime(joinpath(root, "events")), mtime(BatchSweep.jobs_dir(String(root))))
+
 """
     advance_started!(; every = 30.0) -> Int
 
@@ -1529,6 +1538,8 @@ function advance_started!(; every::Real = 30.0)
         t = try; _cluster_from(c); catch; continue; end      # a definition we cannot build is not ours to fix
         root = store_root(t)
         runs = started_runs(root)
+        stamp = _store_stamp(root)
+        filter!(r -> get(_SETTLED, (root, r), nothing) != stamp, runs)   # settled, and nothing since
         isempty(runs) && continue
         time() - get(_ADVANCE_AT, name, 0.0) < every && continue
         _ADVANCE_AT[name] = time()
@@ -1542,6 +1553,7 @@ function advance_started!(; every::Real = 30.0)
         # leaves this side holding the originals; folding here is what keeps the mirror from growing
         # for the life of the store. Local files only, and never required for correctness.
         try; SlateTask.compact_events!(root); BatchSweep.forget_fold!(root); catch; end
+        stamp = _store_stamp(root)          # after the sync and the fold, which write to the mirror
         for run in runs
             # Clear markers with no run behind them; the store was synced in above.
             if MemoStore.read_manifest(root, run) === nothing
@@ -1560,7 +1572,12 @@ function advance_started!(; every::Real = 30.0)
                 # The run's launcher, not the registry's: a region's queue names the environment its
                 # task workers start in, and that is the notebook's, which only the run records.
                 p = reconcile_and_sync!(t, run, launcher_for(tr); submit = true, failure_policy = sweep_policy(t))
-                BatchSweep.is_settled(p) || (n += 1)
+                if BatchSweep.is_settled(p)
+                    _SETTLED[(root, run)] = stamp
+                else
+                    n += 1
+                    delete!(_SETTLED, (root, run))
+                end
             catch e
                 _hub_log("supervisor: advancing $(name)/$(run) failed: " * first(sprint(showerror, e), 160))
             end
