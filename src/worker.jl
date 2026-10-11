@@ -2659,7 +2659,7 @@ end
 # How long to wait on the hub, by operation. A login is bounded by a person finding their phone;
 # everything else is bounded by the cluster. Both are generous, because the alternative to waiting
 # is failing a cell that would have worked.
-_sshop_timeout(op::Symbol) = op === :connect ? 300.0 : op === :fetch ? 3600.0 : 180.0
+_sshop_timeout(op::Symbol) = op === :connect ? 300.0 : op in (:fetch, :fetch_many) ? 3600.0 : 180.0
 
 # "Is this host connected?" is asked on every sweep reconcile and every card poll, and the answer
 # changes only when someone logs in or out. Caching it briefly keeps a polling notebook from

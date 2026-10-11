@@ -348,7 +348,7 @@ Base.write(c::_CountingSink, b::UInt8) = (unsafe_write(c, Ref(b), UInt(1)); 1)
 SshTransport.stop_requested(c::_CountingSink) = c.stop[]
 
 # A fetch at least this large opens a connection of its own rather than sharing the host's session.
-const BULK_BYTES = 8 * 1024 * 1024
+const BULK_BYTES = Ref(8 * 1024 * 1024)
 
 # The fetches running in this process, by the file they write, so one can be stopped from elsewhere.
 const _FETCHES = Dict{String,Threads.Atomic{Bool}}()
@@ -373,39 +373,98 @@ function fetch_to(host::AbstractString, script::AbstractString, dest::AbstractSt
                                            name = String(name), total = Int(total)))
         return r === nothing ? (false, 0) : r
     end
-    mkpath(dirname(String(dest)))
+    runner = isempty(host) ? :here : (connect!(host) || return (false, 0); total < 0 || total >= BULK_BYTES[] ? :bulk : :session)
+    sofar = Ref(0)                              # `_fetch_job` reports each write; this reports the total
+    each = on_bytes === nothing ? nothing : (d -> on_bytes(sofar[] += d))
+    return _fetch_job(runner, String(host), String(script), input, String(dest), String(part), each, timeout)
+end
+
+# Parts cancelled before their job started, so a queued job that is stopped is never run.
+const _CANCELLED = Set{String}()
+
+# One fetch job: `script` with `input` on stdin, its stdout into `part`, moved onto `dest` when whole.
+# `runner` is where it runs: `:here`, `:session` (the host's session), `:bulk` (a connection of its own
+# for this job) or a bulk `SshTransport.Session` already open. `on_bytes(n)` gets each write's size.
+function _fetch_job(runner, host::String, script::String, input, dest::String, part::String, on_bytes, timeout)
+    mkpath(dirname(dest))
     stop = Threads.Atomic{Bool}(false)
-    lock(_FETCHES_LOCK) do; _FETCHES[String(part)] = stop; end
+    lock(_FETCHES_LOCK) do
+        part in _CANCELLED && (delete!(_CANCELLED, part); stop[] = true)
+        _FETCHES[part] = stop
+    end
+    stop[] && (lock(() -> delete!(_FETCHES, part), _FETCHES_LOCK); return (false, 0))
     ok = false
     try
-        open(String(part), "w") do io
-            sink = _CountingSink(io, 0, on_bytes, stop)
-            ok = if isempty(host)
+        open(part, "w") do io
+            last = Ref(0)
+            sink = _CountingSink(io, 0, on_bytes === nothing ? nothing : (n -> (on_bytes(n - last[]); last[] = n)), stop)
+            ok = if runner === :here
                 cmd = pipeline(`sh -c $script`; stdin = input === nothing ? devnull : IOBuffer(input),
                                stdout = sink, stderr = devnull)
                 try; run(cmd); true; catch; false; end
+            elseif runner === :session || runner === :bulk
+                first(SshTransport.exec_io(host, script, input; ask = _ask, sink, timeout, bulk = runner === :bulk))
             else
-                # Large or unknown amounts go on a connection of their own (`SshTransport._with_bulk`).
-                connect!(host) && first(SshTransport.exec_io(String(host), String(script), input;
-                                                             ask = _ask, sink, timeout,
-                                                             bulk = total < 0 || total >= BULK_BYTES))
+                first(SshTransport._request_on(runner, :io, (script, input, sink, Float64(timeout)),
+                                               (false, UInt8[], "the bulk session closed")))
             end
         end
         ok = ok && !stop[]
-        ok && mv(String(part), String(dest); force = true)
+        ok && mv(part, dest; force = true)
     finally
-        lock(_FETCHES_LOCK) do; delete!(_FETCHES, String(part)); end
-        rm(String(part); force = true)
+        lock(_FETCHES_LOCK) do; delete!(_FETCHES, part); end
+        rm(part; force = true)
     end
     return (ok, ok ? Int(filesize(dest)) : 0)
 end
 
-"Stop the fetch writing `part`, here or in the process that holds the sessions."
+"""
+    fetch_many(host, script, jobs; streams = 4, name = "", total = -1, on_bytes = nothing) -> Vector{(ok, bytes)}
+
+`fetch_to` for a list of jobs, each `(input, dest, part)`: `script` runs once per job with the job's
+stdin, writing the job's file. `streams` workers each open one connection (`SshTransport._with_bulk`)
+and take the next job whenever they finish one, so a connection the path treats badly does less of the
+work rather than holding up the rest. A worker that cannot sign in by key uses the host's session. In a
+worker process the hub runs it. `on_bytes(n)` gets the running total over all jobs.
+"""
+function fetch_many(host::AbstractString, script::AbstractString, jobs::AbstractVector;
+                    streams::Integer = 4, name::AbstractString = "", total::Integer = -1,
+                    on_bytes = nothing, timeout::Real = 3600.0)
+    if !isempty(host) && has_delegate()
+        r = _via(() -> nothing, :fetch_many, (; host = String(host), script = String(script),
+                                              jobs = collect(jobs), streams = Int(streams),
+                                              name = String(name), total = Int(total)))
+        return r === nothing ? [(false, 0) for _ in jobs] : r
+    end
+    h, sc = String(host), String(script)
+    isempty(h) || connect!(h) || return [(false, 0) for _ in jobs]
+    results = Vector{Tuple{Bool,Int}}(fill((false, 0), length(jobs)))
+    queue = Channel{Int}(length(jobs))
+    foreach(i -> put!(queue, i), eachindex(jobs)); close(queue)
+    landed = Threads.Atomic{Int}(0)
+    count = on_bytes === nothing ? nothing : (n -> on_bytes(Threads.atomic_add!(landed, n) + n))
+    run!(i, runner) = (j = jobs[i]; results[i] = _fetch_job(runner, h, sc, j[1], String(j[2]), String(j[3]), count, timeout))
+    function worker()
+        isempty(h) && (for i in queue; run!(i, :here); end; return)
+        r = SshTransport._with_bulk(h) do s
+            for i in queue; run!(i, s); end
+            true
+        end
+        r === nothing && (for i in queue; run!(i, :session); end)   # no key sign-in: the host's session
+        return
+    end
+    foreach(wait, [Threads.@spawn worker() for _ in 1:max(1, min(streams, length(jobs)))])
+    lock(() -> foreach(j -> delete!(_CANCELLED, String(j[3])), jobs), _FETCHES_LOCK)   # stops that arrived late
+    return results
+end
+
+"Stop the fetch writing `part`, here or in the process that holds the sessions; one not started yet never runs."
 function cancel_fetch!(part::AbstractString)
     has_delegate() && return _via(() -> false, :fetch_cancel, (; part = String(part)))
-    f = lock(_FETCHES_LOCK) do; get(_FETCHES, String(part), nothing); end
-    f === nothing && return false
-    f[] = true
+    lock(_FETCHES_LOCK) do
+        f = get(_FETCHES, String(part), nothing)
+        f === nothing ? push!(_CANCELLED, String(part)) : (f[] = true)
+    end
     return true
 end
 

@@ -4192,6 +4192,29 @@ function fetch_viewed(host::AbstractString, script::AbstractString, dest::Abstra
     return (ok, n)
 end
 
+# `fetch_viewed` for a read split into jobs across several connections (`Sweep.fetch_many`): one row
+# in the transfers view for the whole read.
+function fetch_many_viewed(host::AbstractString, script::AbstractString, jobs::AbstractVector;
+                           streams::Integer = 4, name::AbstractString = "", total::Integer = -1)
+    vid = Threads.atomic_add!(_XFER_VIEW_SEQ, 1)
+    t0 = time()
+    _xfer_view_prune!()
+    lock(_XFER_VIEW_LOCK) do
+        _XFER_VIEWS[vid] = XferView("local", String(host), String(name), "ssh×$(streams)", 0, Int(total), t0, 0.0, "")
+    end
+    upd(f) = lock(_XFER_VIEW_LOCK) do; v = get(_XFER_VIEWS, vid, nothing); v === nothing || f(v); end
+    results = Tuple{Bool,Int}[]
+    try
+        results = Sweep.fetch_many(host, script, jobs; streams, name, total, on_bytes = b -> upd(v -> (v.done = b)))
+    finally
+        n = sum(last, results; init = 0); ok = !isempty(results) && all(first, results)
+        upd(v -> (v.done = n; v.finished = time(); ok || (v.err = "stopped or failed")))
+        _xfer_trace_push!((; src = String(host), dst = "local", name = String(name), via = "ssh×$(streams)"),
+                          t0, n, [t0, time()], [0, n], ok ? "" : "stopped or failed")
+    end
+    return results
+end
+
 # Drive a peer pull on `dst_k` OVER ITS BLOB CHANNEL (not the gate): send the `X` request to the dst's
 # blob endpoint (hub-vantage — reuses the relay reach), then poll `S` to completion. The actual pull runs
 # on the dst's dedicated executor task, so the gate loop never blocks. `spec` is the newline-framed body

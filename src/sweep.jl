@@ -2573,23 +2573,28 @@ function _fetch_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
         try; touch(dest); catch; end
         return dest
     end
-    # A large selection is read as several streams, each its own connection: on a lossy path each
-    # loses and recovers on its own, and together they keep the link fuller than one can. Each stream
-    # writes its share to a piece of its own, and the pieces are joined in order.
-    groups = _split_spans(spans, total >= STREAM_MIN_BYTES[] ? FETCH_STREAMS[] : 1)
+    # A large selection is read in chunks by several connections, each taking the next chunk when it
+    # finishes one: on a lossy path the connections lose and recover separately, and one the path
+    # treats badly ends up doing less of the work instead of holding up the rest. Each chunk lands in
+    # a piece of its own, and the pieces are joined in order.
+    nchunks = total >= STREAM_MIN_BYTES[] ? max(FETCH_STREAMS[], cld(total, CHUNK_BYTES[])) : 1
+    groups = _split_spans(spans, nchunks)
     tag = string(getpid(), ".", string(rand(UInt32); base = 16))
     pieces = [string(dest, ".piece.", tag, ".", i) for i in eachindex(groups)]
     parts = [pc * ".part" for pc in pieces]
     script = ranges_command(p.src.root, blob)
+    input(g) = Vector{UInt8}(join((string(o, ' ', l, '\n') for (o, l) in g)))
     landed() = sum((isfile(pt) ? Int(filesize(pt)) : isfile(pc) ? Int(filesize(pc)) : 0
                     for (pt, pc) in zip(parts, pieces)); init = 0)
     results = try
         _await_fetch(landed, () -> foreach(pt -> (try; cancel_fetch!(pt); catch; end), parts), total, p.label) do
-            tasks = [Threads.@spawn fetch_to(p.src.host, script, pieces[i];
-                                             input = Vector{UInt8}(join((string(o, ' ', l, '\n') for (o, l) in groups[i]))),
-                                             part = parts[i], name = p.label, total = sum(last, groups[i]))
-                     for i in eachindex(groups)]
-            Base.fetch.(tasks)
+            if total < BULK_BYTES[]        # small: one read on the host's session, no new connection
+                [fetch_to(p.src.host, script, pieces[1]; input = input(groups[1]), part = parts[1],
+                          name = p.label, total)]
+            else
+                fetch_many(p.src.host, script, [(input(g), pieces[i], parts[i]) for (i, g) in enumerate(groups)];
+                           streams = length(groups) > 1 ? FETCH_STREAMS[] : 1, name = p.label, total)
+            end
         end
     catch
         foreach(pc -> rm(pc; force = true), pieces)
@@ -2615,9 +2620,10 @@ function _fetch_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
     return dest
 end
 
-"How many streams a large remote read is split into, and the size below which it is one."
+"How many connections a large remote read uses, the size below which it is one, and the chunk size."
 const FETCH_STREAMS = Ref(4)
 const STREAM_MIN_BYTES = Ref(16 * 1024 * 1024)
+const CHUNK_BYTES = Ref(16 * 1024 * 1024)
 
 # `spans` (offset, length) cut into at most `k` groups of about equal bytes, in order: a group is a
 # contiguous stretch of the bytes the selection asks for, so the pieces join back in group order.

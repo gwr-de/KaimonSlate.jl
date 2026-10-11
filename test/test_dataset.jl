@@ -1000,13 +1000,21 @@ const MS = RE.MemoStore
                 flat = reduce(vcat, [collect(o:o+l-1) for grp in g for (o, l) in grp])
                 @test flat == reduce(vcat, [collect(o:o+l-1) for (o, l) in sp])
             end
-            old = RE.Sweep.STREAM_MIN_BYTES[]
+            # Small enough to read as many chunks shared by several connections (here, local streams).
+            olds = (RE.Sweep.STREAM_MIN_BYTES[], RE.Sweep.BULK_BYTES[], RE.Sweep.CHUNK_BYTES[])
             try
-                RE.Sweep.STREAM_MIN_BYTES[] = 1                  # small enough to read as several streams
+                RE.Sweep.STREAM_MIN_BYTES[] = 1; RE.Sweep.BULK_BYTES[] = 1; RE.Sweep.CHUNK_BYTES[] = 24
                 @test q[:, 3, :] == A[:, 3, :]
                 @test q[1:2:4, 1:3, 2:5] == A[1:2:4, 1:3, 2:5]
+                @test q[:, :, :] == A
             finally
-                RE.Sweep.STREAM_MIN_BYTES[] = old
+                RE.Sweep.STREAM_MIN_BYTES[], RE.Sweep.BULK_BYTES[], RE.Sweep.CHUNK_BYTES[] = olds
+            end
+            # Every job runs once, whatever order the streams take them in.
+            mktempdir() do jd
+                jobs = [("", joinpath(jd, "out$i"), joinpath(jd, "out$i.part")) for i in 1:9]
+                rs = RE.Sweep.fetch_many("", "printf x", jobs; streams = 3)
+                @test all(first, rs) && all(i -> read(joinpath(jd, "out$i"), String) == "x", 1:9)
             end
             cached() = filter(startswith("range-"), readdir(RE.Sweep._blob_cache_dir()))
             before = cached()

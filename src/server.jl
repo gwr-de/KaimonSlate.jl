@@ -184,6 +184,8 @@ function _run_sshop(op::Symbol, a)
     op === :io         && return S.run_io(a.host, a.script, a.input)
     op === :fetch      && return ReportEngine.fetch_viewed(a.host, a.script, a.dest, a.part;
                                                          input = a.input, name = a.name, total = a.total)
+    op === :fetch_many && return ReportEngine.fetch_many_viewed(a.host, a.script, a.jobs;
+                                                                streams = a.streams, name = a.name, total = a.total)
     op === :fetch_cancel && return S.cancel_fetch!(a.part)
     op === :forward    && return S.forward!(a.host, a.localport, a.target, a.targetport)
     op === :unforward  && return S.unforward!(a.host, a.localport)
