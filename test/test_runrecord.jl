@@ -81,6 +81,25 @@ cellof(nb, id) = nb.report.cells[findfirst(c -> c.id == id, nb.report.cells)]
         @test a.rev == rev && a.run === run
     end
 
+    @testset "a side's results belong to the worker they were computed in" begin
+        nb = mknb("sides", "#%% code id=a\nx = 1\n#%% code id=g region=gpu\ny = 2\n" *
+                           "#%% code id=h region=gpu\nz = y + 1\n#%% md id=m\nprose\n")
+        RE.build_dependencies!(nb.report)
+        for c in nb.report.cells; RE.mark_fresh!(c); end
+        RE.mark_stopped!(cellof(nb, "h"), nothing)
+        @test NS._note_side_worker!(nb, "gpu", UInt(1)) === :first
+        @test NS._note_side_worker!(nb, "gpu", UInt(1)) === :same
+        @test NS._note_side_worker!(nb, "gpu", UInt(2)) === :changed
+        @test NS._note_side_worker!(nb, "", UInt(2)) === :first           # each side has its own
+        # A new worker on the region: its cells run again; the notebook's own, and prose, keep theirs.
+        NS._invalidate_side!(nb, "gpu", RE.InProcessKernel())
+        @test [c.state for c in nb.report.cells] == [RE.FRESH, RE.STALE, RE.STOPPED, RE.FRESH]
+        # Only a connected gate worker is compared: a key read before it connects is not final.
+        @test !NS._check_side!(nb, "gpu", RE.InProcessKernel())
+        @test !NS._check_side!(nb, "gpu", RE.GateKernel(mktempdir()))
+        @test NS._kernel_gen(RE.GateKernel(mktempdir())) == -1
+    end
+
     @testset "Stop halts the drain, and only a run asked for resumes it" begin
         hub = NS.start_hub(; port = freeport())
         try

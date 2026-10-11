@@ -92,12 +92,15 @@ mutable struct LiveNotebook
     # fresh one, which re-establishes the namespace before running anything. Both under `lock`.
     halted::Bool
     epoch::Int
+    # The worker each side's results were computed in (`_worker_key`: the kernel and its namespace
+    # generation), "" for the main kernel. See `_check_side!`. Under `lock`.
+    computed_in::Dict{String,UInt}
     # Inner constructor takes the original 13 fields and starts empty scratchpad + frontend/asset/import registries, so
     # every existing positional call site (server + tests) is unchanged; all are populated at runtime.
     LiveNotebook(id, path, report, kernel, version, undo, redo, lock, listeners, llock, agent_id, agent_busy, agents) =
         new(id, path, report, kernel, version, undo, redo, lock, listeners, llock, agent_id, agent_busy, agents,
             Cell[], @NamedTuple{id::String, js::String, esm::Bool, kind::String}[], Dict{String,String}(),
-            Dict{String,String}(), Set{String}(), false, false, 0)
+            Dict{String,String}(), Set{String}(), false, false, 0, Dict{String,UInt}())
 end
 
 # ── Notebook-lock protocol (`nb.lock`) ─────────────────────────────────────────────────────────────
@@ -939,23 +942,17 @@ const _RUNNER_STALE_HITS = Dict{String,Int}()         # nb.id → consecutive st
 const _RUNNER_STALE_AFTER = 600.0                     # 10 min with pending work + no progress ⇒ suspect
 const _RUNNER_STALE_CONFIRMATIONS = 3                 # consecutive 5s sweeps before self-healing (~15s)
 
-# Per-notebook MAIN-kernel worker identity we last re-established (`_worker_key` = objectid + ns_gen). A
-# worker swap (cold spawn / pool adopt / reprovision — never a reattach) bumps `k.ns_gen`, handing us a
-# BLANK namespace mid-session where every global (imports, theme, @bind registrations) is gone while the
-# cells still read FRESH. We detect the change (see `_reestablish_fresh_namespace!`) and re-establish; a
-# reattach (same worker key) is a no-op. Same key the region layer uses, for the main kernel.
-const _MAIN_GEN = Dict{String,UInt}()
-const _MAIN_GEN_LOCK = ReentrantLock()
+const _WORKER_GEN_LOCK = ReentrantLock()
 
-# A small MONOTONIC counter of how many times this notebook's worker has been replaced. `_MAIN_GEN` holds an
+# A small MONOTONIC counter of how many times this notebook's worker has been replaced. `computed_in` holds an
 # opaque worker key (good for "did it change?", useless for ordering), and the browser needs ordering: a page
 # must react to a worker reset only if it happened AFTER the page loaded. A page that boots fresh against
 # generation N has nothing belonging to any earlier worker, so a `workerreset:` for N (or lower) is not its
 # business — and acting on it would tear down the sessions it just established (Bonito's `close_session` even
 # removes their DOM). The page learns its boot generation from `state_json` (`workerGen`) and compares.
 const _WORKER_GEN = Dict{String,Int}()
-worker_generation(nb::LiveNotebook) = lock(_MAIN_GEN_LOCK) do; get(_WORKER_GEN, nb.id, 0); end
-_bump_worker_generation!(nb::LiveNotebook) = lock(_MAIN_GEN_LOCK) do
+worker_generation(nb::LiveNotebook) = lock(_WORKER_GEN_LOCK) do; get(_WORKER_GEN, nb.id, 0); end
+_bump_worker_generation!(nb::LiveNotebook) = lock(_WORKER_GEN_LOCK) do
     _WORKER_GEN[nb.id] = get(_WORKER_GEN, nb.id, 0) + 1
 end
 
@@ -1309,7 +1306,6 @@ function _prepare_for_notebook!(nb::LiveNotebook, name::AbstractString; rebuild_
                           _forget_region_kernel!(nb, String(r.name))
                           try; ReportEngine._drop_kernel_conn!(k0); catch; end
                           try; ReportEngine.reap_remote_worker(host, port); catch; end
-                          _restale_side!(nb, String(r.name))
                           ReportEngine._rlog("prepare[$(r.name)]: replaced worker-$port on $host so it starts from what this prepare built")
                       end
                   end
@@ -2281,14 +2277,9 @@ function _place_in_background!(name::AbstractString, nb::Union{LiveNotebook,Noth
             # be left saying "run me again" — nobody should have to poll a notebook by hand. The
             # node landing is the event; re-arm the runner and the waiting cells run themselves.
             if nb !== nothing && ReportEngine._region_holds_node(r)
-                # A job that has already spent part of its walltime was there before this asked: found,
-                # not granted (a hub restart finding its region's node by name, say).
-                found = alloc !== nothing && !isempty(alloc.timeleft) &&
-                        ReportEngine._sched_seconds(alloc.timeleft) < ReportEngine._sched_seconds(ReportEngine._alloc_walltime(r)) - 120
-                ReportEngine._rlog("region[$name]: " * (found ? "found its node still held" : "node granted") *
-                                   " ($(ReportEngine.region_host(r))) — re-running the cells that were waiting")
-                # A new allocation means a new worker: whatever ran in the last one is not in it.
-                found || _restale_side!(nb, String(name))
+                # Whether its worker is a new one is found when a cell next runs there (`_check_side!`).
+                ReportEngine._rlog("region[$name]: node held ($(ReportEngine.region_host(r))) — " *
+                                   "re-running the cells that were waiting")
                 _region_ready!(nb, String(name))
             end
         end
@@ -2592,18 +2583,90 @@ function restart_region!(nb::LiveNotebook, side::AbstractString)
     return nb
 end
 
-# The cells that run on `side` keep their results in that side's worker. A new worker process has
-# none of them, so they go stale, and the next run computes them again in order. Returns their ids.
-function _restale_side!(nb::LiveNotebook, side::AbstractString)
+# ── A side's results live in its worker ─────────────────────────────────────────────────────────
+# The cells that run on a side keep their values in that side's worker, so they hold only while the
+# worker they were computed in does. Each side records that worker (`nb.computed_in`, by `_worker_key`:
+# the kernel object and its namespace generation), and before a cell runs on a side or reads a value
+# from one, the side's worker is compared with it (`_check_side!`). A different one (a process that
+# died and was started again, a node granted anew, a worker replaced by a prepare, a pool adoption)
+# holds none of them: the side is invalidated, and the run goes back to the runner, which computes
+# them again in order. This one comparison is what notices a replaced worker, wherever it was replaced.
+
+# Thrown by a cross-side read whose source side turned out to have a new worker: the reading cell
+# goes back to the runner rather than failing on a value that is no longer there.
+struct SideReplaced <: Exception
+    side::String
+end
+Base.showerror(io::IO, e::SideReplaced) =
+    print(io, "the worker for ", isempty(e.side) ? "the notebook" : "region '" * e.side * "'", " was replaced")
+
+# Records `wk` as the worker `side`'s results come from: `:same` as the one recorded, `:changed` from
+# it, or `:first` when the side has none recorded yet.
+function _note_side_worker!(nb::LiveNotebook, side::AbstractString, wk::UInt)
+    lock(nb.lock) do
+        was = get(nb.computed_in, String(side), nothing)
+        was == wk && return :same
+        nb.computed_in[String(side)] = wk
+        was === nothing ? :first : :changed
+    end
+end
+
+# Compares `side`'s worker `k` with the one its results came from, and invalidates the side when they
+# differ. Only a connected kernel is compared: a namespace generation moves when the worker connects,
+# so a key read before then is not the one the results will come from. A side seen for the first time
+# holds whatever ran there before it was recorded (a run whose worker connected during it), so it is
+# only seeded. Returns whether it invalidated.
+function _check_side!(nb::LiveNotebook, side::AbstractString, k)
+    k = _resolved_kernel(k)
+    (k isa ReportEngine.GateKernel && k.conn !== nothing) || return false
+    seen = _note_side_worker!(nb, side, _worker_key(k))
+    seen === :same && return false
+    _invalidate_side!(nb, side, k; restale = seen === :changed)
+    return seen === :changed
+end
+
+# `side`'s worker holds none of its results: every cell that runs there goes stale (a locked one too:
+# its frozen result restores into the new worker, it is not in it), its `@bind` registrations are
+# seeded with the values the hub holds, and its EVERYWHERE cells are primed into it. A stopped cell
+# stays stopped. `restale = false` only seeds and primes. Kernel calls run off `nb.lock`.
+function _invalidate_side!(nb::LiveNotebook, side::AbstractString, k; restale::Bool = true)
+    binds = Tuple{Symbol,Any}[]
+    if restale
+        ids = _restale_side!(nb, side; binds)
+        isempty(ids) || ReportEngine._rlog("$(nb.id): the worker for $(_side_label(nb, side)) is new — " *
+                                           "$(length(ids)) cell(s) run there again")
+    else
+        lock(nb.lock) do
+            for c in nb.report.cells
+                _cell_side(nb, c) == side && append!(binds, ((b.name, b.value) for b in c.binds))
+            end
+        end
+    end
+    k isa ReportEngine.GateKernel || return nothing
+    try; _prime_namespace!(nb, k, String(side)); catch e
+        @debug "slate: namespace prime failed" notebook = nb.id side exception = e
+    end
+    # The registry starts at each widget's default; the hub holds the value the reader chose, which is
+    # also what any cached result was keyed on.
+    for (name, value) in binds
+        try; ReportEngine.assign_bind!(k, nb.report, name, value)
+        catch e; @debug "slate: bind re-seed failed" name exception = e; end
+    end
+    return nothing
+end
+
+# Marks the cells that run on `side` stale and returns their ids, collecting their `@bind` values
+# into `binds`. A restart asked for (`restart_region!`, the roster's restart) calls it directly, to run
+# them again now. Under `nb.lock`; pushes the new state.
+function _restale_side!(nb::LiveNotebook, side::AbstractString; binds = Tuple{Symbol,Any}[])
     ids = String[]
     lock(nb.lock) do
-        for cell in nb.report.cells
-            (cell.kind == CODE && _cell_side(nb, cell) == side) || continue
-            # Locked cells too: their frozen result restores into the new process, it is not in it. A
-            # stopped cell stays stopped: a new worker is not a request to run it.
-            cell.state == STOPPED && continue
-            ReportEngine.force_stale!(cell)
-            push!(ids, cell.id)
+        for c in nb.report.cells
+            (c.kind !== MARKDOWN && ReportEngine.runs_automatically(c.kind) && _cell_side(nb, c) == side) || continue
+            append!(binds, ((b.name, b.value) for b in c.binds))
+            c.state == STOPPED && continue
+            ReportEngine.force_stale!(c)
+            push!(ids, c.id)
         end
         isempty(ids) || (nb.version += 1)
     end
@@ -3007,7 +3070,6 @@ function _drop_kernels_for_worker!(h, host::AbstractString, port::Integer)
             if ReportEngine._drop_kernel_conn!(k)
                 n += 1
                 ReportEngine._rlog("reap: dropped live wire on $(nb.id)/$(_kernel_side_label(nb, k)) (worker-$port on $host reaped)")
-                side === nothing || _restale_side!(nb, side)
                 try; facts_changed!(); catch; end   # pill flips to amber "reconnecting" immediately
             end
         catch; end
@@ -4250,6 +4312,11 @@ function _region_presync!(nb::LiveNotebook, cell::Cell, dst_k; dst_side::Abstrac
     # runs — content-addressed, dedup-aware, once per kernel. Best-effort; a miss just errors in-cell.
     try; _sync_datadir_to!(nb, dst_k; cell_id = cell.id); catch e; @warn "slate region: datadir sync failed" cell = cell.id exception = e; end
     prepared = false
+    # A value comes from the worker its writer ran in, or from nowhere: each side read from is checked
+    # once (`_check_side!`), after its kernel is up.
+    checked = Set{String}()
+    _source_current!(side, k) = side in checked || (ReportEngine.prepare!(k, nb.report);
+        _check_side!(nb, side, k) && throw(SideReplaced(side)); push!(checked, side))
     for r in cell.reads
         # The theme sentinel (`##makie_theme##`) is a synthetic ordering/effect token the graphics
         # analysis injects to chain `set_theme!` cells → figures — NOT a real global. Shipping it
@@ -4283,6 +4350,7 @@ function _region_presync!(nb::LiveNotebook, cell::Cell, dst_k; dst_side::Abstrac
                 _prime_namespace!(nb, src_k, src_side); _prime_namespace!(nb, dst_k, dst_side)
                 prepared = true
             end
+            _source_current!(src_side, src_k)
             _ensure_resource_on!(nb, writer, dst_k, dst_side)
             continue
         end
@@ -4326,6 +4394,7 @@ function _region_presync!(nb::LiveNotebook, cell::Cell, dst_k; dst_side::Abstrac
             _prime_namespace!(nb, dst_k, dst_side)
             prepared = true
         end
+        _source_current!(src_side, src_k)
         # Portability guard: a live handle (DB / socket / file — a `Ptr`) shipped across a boundary
         # lands as a dangling pointer and throws a cryptic error on the far side (the "Failed to open
         # connection" trap). Catch it HERE, where we can name the binding and the fix, instead. Runs
@@ -4659,9 +4728,11 @@ function _release_held_on!(nb::LiveNotebook, cid::AbstractString)
 end
 
 # The kernel a run was dispatched to, as the kernel it stands for (a boot placeholder forwards to the
-# real one), and that kernel's namespace generation, or -1 when it has none to read yet.
+# real one), and that kernel's namespace generation, or -1 when it has none to read yet (a placeholder,
+# or a worker not connected, whose generation moves when the run connects it).
 _resolved_kernel(k) = (k isa PendingKernel && k.real !== nothing) ? k.real : k
-_kernel_gen(k) = (k = _resolved_kernel(k); k isa ReportEngine.GateKernel ? k.ns_gen : (k isa PendingKernel ? -1 : 0))
+_kernel_gen(k) = (k = _resolved_kernel(k);
+    k isa ReportEngine.GateKernel ? (k.conn === nothing ? -1 : k.ns_gen) : (k isa PendingKernel ? -1 : 0))
 
 # Whether a run's result belongs in the cell: its side's kernel is still the one it was dispatched to,
 # with the namespace it ran in. A worker replaced mid-run took that namespace with it.
@@ -4790,6 +4861,7 @@ function _eval_one_run!(nb::LiveNotebook, cid::AbstractString, run::ReportEngine
         # Tagged markdown interpolates on its region (bring the kernel up first, like a code cell); an
         # untagged md (side=="") stays on main. Presync pulls any cross-boundary names it interpolates.
         _prepare_region_for_cell!(nb, cell, run, kernel, side) || return nothing
+        _check_side!(nb, side, kernel) && return _settle!(c -> nothing, nb, cid, run)
         _region_active(nb) && !isempty(side) && _stats_ran_on!(nb, cid, _side_label(nb, side))
         try; _region_presync!(nb, cell, kernel; dst_side = side); catch e; @warn "slate region: md presync failed" cell = cid exception = e; end
         # The `$(…)` interpolation is a kernel round-trip, so it runs OFF nb.lock (protocol; mirrors the
@@ -4807,6 +4879,9 @@ function _eval_one_run!(nb::LiveNotebook, cid::AbstractString, run::ReportEngine
     # The cell's cross-boundary inputs ship over after the kernel is primed. A presync failure is the
     # CELL's error — surfaced in place instead of a mystery UndefVarError on the other side.
     _prepare_region_for_cell!(nb, cell, run, kernel, side) || return nothing
+    # A side whose worker is not the one its results came from has none of them: they run again first,
+    # this cell with them, in order.
+    _check_side!(nb, side, kernel) && return _settle!(c -> nothing, nb, cid, run)
     # Provenance for the DAG/stats: which kernel this run executes on (only meaningful — and
     # only recorded — while a region is active; users otherwise know where cells run).
     _region_active(nb) && _stats_ran_on!(nb, cid, _side_label(nb, side))
@@ -4816,6 +4891,8 @@ function _eval_one_run!(nb::LiveNotebook, cid::AbstractString, run::ReportEngine
     catch e
         e
     end
+    # An input's side has a new worker: its cells run again first, and this one after them.
+    presync_err isa SideReplaced && return _settle!(c -> nothing, nb, cid, run)
     if presync_err !== nothing
         # A wait arrives here too, and by the same route: reading a value that lives on a region
         # needs that region's kernel, so a node that has not been granted raises `RegionWaiting`
@@ -5268,62 +5345,19 @@ function apply_live_rerender!(nb::LiveNotebook, cid::AbstractString, wire)
     return nothing
 end
 
-# Re-establish a fresh main-kernel namespace (see `_MAIN_GEN`). Called at the top of every drain: bring the
-# worker up, and if its `ns_gen` advanced since we last primed it, (1) SEED the worker's bind registry with
-# the host's authoritative control values — so a bind cell that re-runs OR restores reconciles to the user's
-# selection, not the widget default (the value can't drift from the cached compute keyed on it) — and (2)
-# re-stale every code cell so the drain re-runs/restores them against the blank namespace (memoized cells
-# RESTORE, not recompute). In-process kernels (no `ns_gen`) and reattaches (gen unchanged) are no-ops. This is
-# the main-kernel counterpart to the region layer's ns_gen-keyed re-priming.
+# Brings the main worker up at the top of every drain and checks it against the one the main side's
+# results came from (`_check_side!`), so a drain never runs into a namespace that was replaced since
+# the last one. In-process kernels never swap namespaces.
+#
+# Extensions holding browser-side state are not told here. A changed worker key covers two cases that
+# need opposite handling: a namespace rebuilt in the same process (a live renderer's Bonito root
+# survives, and the page must keep its sessions) and a replaced process (everything the page holds is
+# orphaned, and only a page reload is coherent). `SlateExtensionsBase.on_worker_reset` /
+# `slateOnWorkerReset` (panels.js, generation-gated) are in place for the second; the trigger is not wired.
 function _reestablish_fresh_namespace!(nb::LiveNotebook)
-    nb.kernel isa ReportEngine.GateKernel || return nothing               # in-process never swaps namespaces
-    try; ReportEngine.prepare!(nb.kernel, nb.report); catch; return nothing; end   # up (bumps ns_gen if fresh)
-    wk = _worker_key(nb.kernel)
-    lock(_MAIN_GEN_LOCK) do; get(_MAIN_GEN, nb.id, UInt(0)); end == wk && return nothing   # reattach → unchanged
-    # NOT NOTIFIED HERE — deliberately. This fires on any `_worker_key` change, which lumps together two
-    # cases that need OPPOSITE handling from an extension holding browser-side state:
-    #   • a namespace REBUILD keeps the same worker PROCESS, so a live renderer's Bonito root (a process
-    #     global) survives. The page must KEEP its sessions; telling it to drop them makes Julia and the
-    #     page disagree, and the next figure attaches to a root the page just threw away — silent stall.
-    #     `_rewire_page_root!` (re-registering the namespace handler) is the correct response, and it is
-    #     what the extension already does from `enable!`.
-    #   • a worker PROCESS replacement genuinely orphans everything the page holds — but then a partial
-    #     teardown cannot work either, because the page's WGLMakie scene-order executor survives and its
-    #     numbering can no longer be matched from Julia (see BonitoSlate connection.jl). A page reload is
-    #     the only coherent response.
-    # So a useful notification has to distinguish PROCESS replacement from namespace rebuild, and the
-    # process case wants "reload", not "clean up". `SlateExtensionsBase.on_worker_reset` /
-    # `slateOnWorkerReset` (panels.js, generation-gated) are in place for it; the trigger is not wired.
-    # Genuinely re-execute EVERYWHERE cells' full source on the main kernel — the SAME mechanism
-    # `_prepare_region_for_cell!` already uses for region kernels (`_prime_namespace!` is kernel-
-    # agnostic: its own idempotency cache is keyed by `(nb.id, _worker_key(k))`, so calling it here
-    # is safe and a no-op once already primed for this process). This establishes theme/using/
-    # scaffold effects correctly EARLY, ahead of any dependent cell, rather than relying solely on
-    # `_eval_one!`'s memo-restore replay (`_replay_scaffold!`) to catch every EVERYWHERE effect —
-    # that replay only recognizes specific syntax forms (imports, `@bind`, a fixed theme-call
-    # whitelist) and can silently miss one it wasn't taught about. EVERYWHERE cells still go through
-    # the ordinary drain below too (full bookkeeping: stats, broadcast, region `using` mirroring) —
-    # a harmless redundant re-run, since EVERYWHERE cells are cheap/effect-only by definition.
-    try; _prime_namespace!(nb, nb.kernel, ""); catch e
-        @debug "slate: main-kernel namespace prime failed" notebook = nb.id exception = e
-    end
-    binds = lock(nb.lock) do
-        bs = Tuple{Symbol,Any}[(b.name, b.value) for c in nb.report.cells for b in c.binds]
-        # A blank namespace ⇒ every global is gone: re-run/restore all. EVERY kind that runs, not
-        # just CODE — a WEB cell defines bindings too, and a JOB cell registers the channel its
-        # card's buttons call. Leaving a job cell `fresh` across a worker restart left a card on
-        # screen whose Submit reached a handler that no longer existed.
-        for c in nb.report.cells
-            (c.kind !== ReportEngine.MARKDOWN && ReportEngine.runs_automatically(c.kind)) &&
-                ReportEngine.restale!(c)
-        end
-        bs
-    end
-    for (name, value) in binds                         # seed the fresh registry with the host's current values
-        try; ReportEngine.assign_bind!(nb.kernel, nb.report, name, value)
-        catch e; @debug "slate: bind re-seed failed on fresh namespace" name exception = e; end
-    end
-    lock(_MAIN_GEN_LOCK) do; _MAIN_GEN[nb.id] = wk; end
+    nb.kernel isa ReportEngine.GateKernel || return nothing
+    try; ReportEngine.prepare!(nb.kernel, nb.report); catch; return nothing; end
+    _check_side!(nb, "", nb.kernel)
     return nothing
 end
 

@@ -1352,10 +1352,6 @@ function prepare!(k::GateKernel, report::Report; explicit::Bool = false)
         # Spawn if never started, OR respawn if the worker died (OOM / segfault / user exit()) —
         # otherwise a crashed worker would no-op here forever and every eval would error.
         elseif k.conn === nothing || (k.proc !== nothing && !process_running(k.proc))
-            # Did we HAVE a worker? Then whatever replaces it starts with an empty namespace. The
-            # first-ever spawn has no predecessor, so it must not restale (that would undo the
-            # locked-cell restores the open path just did).
-            replaced = k.proc !== nothing
             _kill_worker!(k)                      # tear down a dead/old proc before replacing (no leak/orphan)
             fork_refresh(k, report)               # a forked env behind its parent project is re-resolved first
             _spawn_worker!(k)
@@ -1363,15 +1359,9 @@ function prepare!(k::GateKernel, report::Report; explicit::Bool = false)
             lock(_GATE_SESSION_LOCK) do; _GATE_SESSION[k.conn.name] = report.id; end   # route this worker's stream events back to the notebook
             _ensure_poller!()
             _reconstruct_env!(k)                  # env dir absent but footer has a delta → rebuild it
-            # A worker that DIED (OOM, segfault, an `exit()` in a cell) took every binding with it,
-            # but the cells still record the state they were in when it was alive. Left alone, the
-            # notebook claims to be fresh while nothing is defined, and the next run of a downstream
-            # cell fails with `UndefVarError` on a name the notebook visibly defines two cells up.
-            #
-            # An EXPLICIT restart already does this (`reset!` → `reset_all!`); this is the same
-            # correction for the restart nobody asked for. Cheap: a memo-restorable cell restores
-            # rather than recomputing, and the run goes in dependency order either way.
-            replaced && reset_all!(report)
+            # A worker that died took every binding with it. Its connection moved `ns_gen`, which the
+            # runner compares before the next cell runs (`_check_side!`), so the cells that ran here
+            # run again then.
         end
     end
     return nothing
