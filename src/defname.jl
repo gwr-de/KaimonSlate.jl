@@ -138,14 +138,30 @@ end
 # absolute path — the same tree lives at /Users/… locally and elsewhere on a compute node, and an
 # absolute path would fork the digest and make every transferred entry unfindable.
 
-"(def-name → body-hash) for one source file, parsed fresh from disk."
+"""
+    file_defs(path) -> Dict{String,UInt64}
+
+(def-name → body-hash) for one source file. Parsed when the file's size, modification time or inode
+differs from the last parse, and taken from the last parse otherwise: a digest of a source tree is
+asked for on a timer, and parsing every file of it each time made the asker a steady stream of
+allocations.
+"""
 function file_defs(path::AbstractString)
+    st = try; stat(path); catch; nothing; end
+    (st === nothing || !isfile(st)) && return Dict{String,UInt64}()
+    key = (st.size, st.mtime, st.inode)
+    p = String(path)
+    hit = lock(_FILE_DEFS_LOCK) do; get(_FILE_DEFS, p, nothing); end
+    hit !== nothing && hit[1] == key && return copy(hit[2])
     d = Dict{String,UInt64}()
-    isfile(path) || return d
-    src = try; read(path, String); catch; return d; end
-    top = try; Meta.parseall(src); catch; return d; end
-    return _collect_defs!(d, top)
+    src = try; read(p, String); catch; return d; end
+    top = try; Meta.parseall(src); catch; nothing; end
+    top === nothing || _collect_defs!(d, top)
+    lock(_FILE_DEFS_LOCK) do; _FILE_DEFS[p] = (key, d); end
+    return copy(d)
 end
+const _FILE_DEFS = Dict{String,Tuple{Tuple{Int64,Float64,UInt64},Dict{String,UInt64}}}()
+const _FILE_DEFS_LOCK = ReentrantLock()
 
 "Every `.jl` file under `dirs`, deterministically ordered."
 function src_tree_files(dirs)

@@ -147,6 +147,22 @@ defs(src) = _collect_defs!(Dict{String,UInt64}(), Meta.parseall(src))
         end
     end
 
+    @testset "file_defs parses a file again only when it changes" begin
+        mktempdir() do dir
+            f = joinpath(dir, "R.jl")
+            write(f, "h(x) = x\n")
+            a = file_defs(f)
+            file_defs(f)
+            @test (@allocated file_defs(f)) < 10_000           # unchanged: no parse
+            write(f, "h(x) = x + 1\n")
+            @test file_defs(f)["h"] != a["h"]                  # changed: parsed again
+            b = file_defs(f); b["extra"] = 0x1
+            @test !haskey(file_defs(f), "extra")               # a caller's copy, not the cache
+            rm(f)
+            @test isempty(file_defs(f))
+        end
+    end
+
     # Several methods share one name, so the per-name entry FOLDS them. Assigning instead would keep
     # only the last, and an edit to any earlier method would hash identically — no hot-reload banner,
     # and an unchanged memo key, so a cached result from the old code gets restored.
