@@ -3473,10 +3473,28 @@ _worker_logger(io::IO) = Logging.ConsoleLogger(io, Logging.Info;
         (c, string(Dates.format(Dates.now(), "HH:MM:SS "), pre), suf)
     end)
 
+# The oldest SlateExtensionsBase this code runs with: the lower bound of SlateWorker's compat entry.
+# The notebook's environment comes first on the load path, so a package there that holds
+# SlateExtensionsBase back shadows the worker's own copy.
+function _seb_floor()
+    c = worker_seb_compat()
+    isempty(c) && return nothing
+    return tryparse(VersionNumber, lstrip(strip(first(split(c, ','))), ['^', '~', '=']))
+end
+
+function _check_seb_version()
+    floor, v = _seb_floor(), pkgversion(SlateExtensionsBase)
+    (floor === nothing || v === nothing || v >= floor) && return nothing
+    error("this notebook's environment resolves SlateExtensionsBase $v, and Slate's worker needs $floor " *
+          "or later. A package in the environment holds it back; `Pkg.why(\"SlateExtensionsBase\")` " *
+          "in that environment names it.")
+end
+
 function start(; host::String = "127.0.0.1", port::Int, stream_port::Int,
                curve::Bool = false, allowed_clients::Vector{String} = String[],
                data_port::Int = 0, warm_deps::Bool = false, stats_path::String = "",
                blob_curve::Bool = true, blob_bind::String = "", blob_free_port::Bool = false)
+    _check_seb_version()
     _STREAM_PORT[] = stream_port   # publish for `__slate_ports` (hub-assigned today; the hub owns only the gate)
     _start_emit_channel!()         # before the gate serves, so `__slate_ports` always reports it
     _reset_image_once_flags!()

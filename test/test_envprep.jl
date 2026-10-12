@@ -62,6 +62,18 @@ end
         @test r.seeded["deps"]["Statistics"] == "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
     end
 
+    @testset "a fork requires the SlateExtensionsBase the worker runs with" begin
+        c = ReportEngine.worker_seb_compat()
+        @test !isempty(c)
+        # Even over a parent that allows an older release: the worker cannot run with it.
+        r = seed_from("""
+        [compat]
+        SlateExtensionsBase = "0.10, 0.11"
+        """)
+        @test r.seeded["deps"]["SlateExtensionsBase"] == "bc31d39e-4442-48fa-b9ae-1bd99fed63f7"
+        @test r.seeded["compat"]["SlateExtensionsBase"] == c
+    end
+
     @testset "a rebuild puts the notebook's own packages back" begin
         # Seeding rebuilds the fork from the PARENT, which knows nothing about what the notebook
         # added — so a parent Project.toml edit stales the fork, the rebuild re-seeds, and every
@@ -81,6 +93,46 @@ end
         # A notebook that added nothing rebuilds exactly as before.
         @test ReportEngine.env_add_code(Dict{String,Any}[]) == ""
         @test ReportEngine.env_add_code(nothing) == ""
+    end
+
+    @testset "a rebuild develops again what the fork had developed" begin
+        mktempdir() do root
+            parent = mkpath(joinpath(root, "Parent")); env = mkpath(joinpath(root, "env"))
+            vrs = mkpath(joinpath(root, "VRS")); seb = mkpath(joinpath(root, "SEB"))
+            write(joinpath(env, "Project.toml"), """
+                [deps]
+                Parent = "11111111-1111-1111-1111-111111111111"
+                VRS = "22222222-2222-2222-2222-222222222222"
+                SEB = "33333333-3333-3333-3333-333333333333"
+                FFTW = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+                """)
+            write(joinpath(env, "Manifest.toml"), """
+                manifest_format = "2.0"
+                [[deps.Parent]]
+                path = "$(parent)"
+                uuid = "11111111-1111-1111-1111-111111111111"
+                [[deps.VRS]]
+                path = "../VRS"
+                uuid = "22222222-2222-2222-2222-222222222222"
+                [[deps.SEB]]
+                path = "$(seb)"
+                uuid = "33333333-3333-3333-3333-333333333333"
+                [[deps.FFTW]]
+                git-tree-sha1 = "0000000000000000000000000000000000000000"
+                uuid = "7a1cc6ca-52ef-59f5-83cd-3a7055c09341"
+                version = "1.10.0"
+                """)
+            devs = ReportEngine.fork_devs(env, parent)
+            # The parent is developed by seeding; a registered package is not a checkout.
+            @test devs == Dict("VRS" => normpath(vrs), "SEB" => normpath(seb))
+            delta = [Dict{String,Any}("name" => "VRS", "uuid" => "22222222-2222-2222-2222-222222222222"),
+                     Dict{String,Any}("name" => "FFTW", "uuid" => "7a1cc6ca-52ef-59f5-83cd-3a7055c09341")]
+            code = ReportEngine.env_add_code(delta, devs)
+            @test occursin("Pkg.develop([", code) && occursin("path=raw\"$(normpath(vrs))\"", code)
+            @test occursin("path=raw\"$(normpath(seb))\"", code)
+            @test occursin("name=raw\"FFTW\"", code) && !occursin("name=raw\"VRS\"", code)
+            @test findfirst("Pkg.develop", code).start < findfirst("Pkg.add", code).start
+        end
     end
 
     @testset "a named parent is reported, and the fork is not itself a package" begin
@@ -250,13 +302,14 @@ end
         write(joinpath(root, _manifest_vname()),
               read(joinpath(root, _manifest_vname()), String) * "\n[[deps.Other]]\n")
         @test ReportEngine.env_parent_fingerprint(member) != f1
-        # For an ordinary project the hash is over the same bytes in the same order as before the
-        # workspace support, so upgrading doesn't stale every existing fork.
+        # For an ordinary project the hash is over its two files and the worker's SlateExtensionsBase
+        # requirement, which is seeded into every fork.
         plain = mktempdir()
         write(joinpath(plain, "Project.toml"), "[deps]\nStatistics = \"10745b16-79ce-11e8-11f9-7d13ad32a3b2\"\n")
         write(joinpath(plain, "Manifest.toml"), "manifest_format = \"2.0\"\n")
         io = IOBuffer()
         for f in ("Project.toml", "Manifest.toml"); write(io, read(joinpath(plain, f))); end
+        write(io, "SlateExtensionsBase ", ReportEngine.worker_seb_compat())
         @test ReportEngine.env_parent_fingerprint(plain) == string(hash(take!(io)); base = 16)
     end
 

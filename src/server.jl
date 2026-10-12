@@ -338,13 +338,15 @@ end
 # when the worker can't run yet (a stale env would crash it at boot). Streams into the boot banner.
 function _rebuild_notebook_env!(envdir::AbstractString, parent::AbstractString; online = nothing,
                                 delta = Dict{String,Any}[])
+    # Read before the re-seed overwrites the fork's files.
+    devs = ReportEngine.fork_devs(envdir, parent)
     build = function ()
         pname = ReportEngine.seed_env_project!(envdir, parent)
         dev = isempty(pname) ? "" :
               "Pkg.develop(Pkg.PackageSpec(path=raw\"$(parent)\"); preserve=Pkg.PRESERVE_ALL); "
         ok = _instantiate_env!(envdir; online = online,
                                code = "using Pkg; $(dev)Pkg.instantiate()" *
-                                      ReportEngine.env_add_code(delta))
+                                      ReportEngine.env_add_code(delta, devs))
         ok && ReportEngine.stamp_env!(envdir, parent)
         return ok
     end

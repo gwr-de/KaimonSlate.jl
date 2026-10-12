@@ -253,6 +253,31 @@ function add_installed_first!(specs)
     return nothing
 end
 
+const _SEB_UUID = "bc31d39e-4442-48fa-b9ae-1bd99fed63f7"
+
+"""
+    worker_seb_compat() -> String
+
+The SlateExtensionsBase versions Slate's worker runs with: SlateWorker's compat entry for it, or `""`
+when that cannot be read.
+"""
+function worker_seb_compat()
+    c = get(get(_toml(joinpath(@__DIR__, "SlateWorker", "Project.toml")), "compat", Dict{String,Any}()),
+            "SlateExtensionsBase", nothing)
+    return c isa AbstractString ? String(c) : ""
+end
+
+# A fork lists SlateExtensionsBase with the worker's compat entry. The worker loads it from the
+# notebook's environment, which comes first on the load path, so a package there that allows an older
+# release (and Pkg prefers what is installed) would otherwise give the worker a version it cannot run.
+function _require_worker_seb!(seed::AbstractDict)
+    c = worker_seb_compat()
+    isempty(c) && return seed
+    get!(Dict{String,Any}, seed, "deps")["SlateExtensionsBase"] = _SEB_UUID
+    get!(Dict{String,Any}, seed, "compat")["SlateExtensionsBase"] = c
+    return seed
+end
+
 """
     seed_env_project!(envdir, parent) -> parent_pkg_name
 
@@ -284,6 +309,7 @@ function seed_env_project!(envdir::AbstractString, parent::AbstractString)
     haskey(pt, "weakdeps") && (seed["weakdeps"] = pt["weakdeps"])
     haskey(pt, "extras") && (seed["extras"] = pt["extras"])
     _inherit_workspace!(seed, ppf)
+    _require_worker_seb!(seed)
     open(joinpath(envdir, "Project.toml"), "w") do io; Pkg.TOML.print(io, seed); end
     pmf = parent_manifest(parent)
     if !isempty(pmf)
@@ -306,26 +332,56 @@ notebook's first `using`, with nothing to connect it to the upstream change.
 
 Packages are added by name and uuid and left to resolve. The footer records a version too, but
 pinning it would fight the parent's fresh resolution, which is the thing that just changed.
+
+`devs` (name => path, from [`fork_devs`](@ref)) are the packages the fork had developed from a
+local checkout. They are developed again from the same path, before the adds, instead of being
+replaced by a registered release.
 """
-function env_add_code(delta)
+function env_add_code(delta, devs::AbstractDict = Dict{String,String}())
     specs = String[]
     for e in (delta isa AbstractVector ? delta : ())
         e isa AbstractDict || continue
         nm = String(get(e, "name", ""))
-        isempty(nm) && continue
+        (isempty(nm) || haskey(devs, nm)) && continue
         uu = String(get(e, "uuid", ""))
         push!(specs, isempty(uu) ? "Pkg.PackageSpec(name=raw\"$(nm)\")" :
                                    "Pkg.PackageSpec(name=raw\"$(nm)\", uuid=raw\"$(uu)\")")
     end
-    return isempty(specs) ? "" : "; Pkg.add([" * join(specs, ", ") * "])"
+    paths = ["Pkg.PackageSpec(path=raw\"$(p)\")" for p in sort!(collect(values(devs)))]
+    return (isempty(paths) ? "" : "; Pkg.develop([" * join(paths, ", ") * "])") *
+           (isempty(specs) ? "" : "; Pkg.add([" * join(specs, ", ") * "])")
+end
+
+"""
+    fork_devs(envdir, parent) -> Dict{String,String}
+
+The direct dependencies of the fork at `envdir` that its Manifest resolves from a local path, by
+name, with absolute paths. The parent project itself is left out: seeding develops it already.
+Read before a rebuild re-seeds the fork, which would otherwise swap each of them for a release.
+"""
+function fork_devs(envdir::AbstractString, parent::AbstractString)
+    out = Dict{String,String}()
+    deps = get(_toml(joinpath(envdir, "Project.toml")), "deps", Dict{String,Any}())
+    man = get(_toml(joinpath(envdir, "Manifest.toml")), "deps", Dict{String,Any}())
+    skip = isempty(parent) ? "" : normpath(abspath(parent))
+    for name in keys(deps)
+        entries = get(man, name, nothing)
+        (entries isa AbstractVector && !isempty(entries)) || continue
+        p = get(entries[1], "path", nothing)
+        p isa AbstractString || continue
+        full = normpath(isabspath(p) ? p : joinpath(envdir, p))
+        rstrip(full, '/') == rstrip(skip, '/') && continue
+        isdir(full) && (out[name] = full)
+    end
+    return out
 end
 
 # The parent fingerprint the fork was seeded from — everything `seed_env_project!` reads: the parent's
 # project file, any workspace roots above it (their `[sources]`/`[compat]` are seeded in, so an edit up
 # there has to stale the fork too), and the manifest that resolves it. Any change — a dep added, a
-# re-resolve — flips it, so a fork seeded from the old state reads as stale.
-# For an ordinary project this hashes the same bytes in the same order as before, so existing forks
-# don't all go stale on upgrade.
+# re-resolve — flips it, so a fork seeded from the old state reads as stale. The worker's
+# SlateExtensionsBase requirement is seeded in too (`_require_worker_seb!`), so a Slate that raises it
+# re-seeds every fork once.
 function env_parent_fingerprint(parent::AbstractString)
     isempty(parent) && return ""
     ppf = project_file_in(parent)
@@ -337,6 +393,7 @@ function env_parent_fingerprint(parent::AbstractString)
     end
     pmf = _manifest_for(ppf)
     isempty(pmf) || write(io, read(pmf))
+    write(io, "SlateExtensionsBase ", worker_seb_compat())
     return string(hash(take!(io)); base = 16)
 end
 
