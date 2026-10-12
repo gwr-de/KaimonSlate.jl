@@ -41,6 +41,23 @@ release_all!(r::Recorder) = lock(() -> (foreach(f -> f(), r.releases); empty!(r.
         end
     end
 
+    @testset "closing a client whose connection failed returns" begin
+        # A refused client's credit socket is never writable again; telling the worker it is
+        # detaching must not wait on it.
+        s = server()
+        try
+            closed = map(1:3) do _
+                h = emit_client!(ZMQ, s.data_endpoint, s.credit_endpoint, handler(Recorder()); secret = "wrong")
+                sleep(0.5)
+                t = Threads.@spawn emit_close!(h)
+                timedwait(() -> istaskdone(t), 5.0) === :ok
+            end
+            @test all(closed)
+        finally
+            emit_close!(s)
+        end
+    end
+
     @testset "the server reports the ports it bound" begin
         s = server()
         try

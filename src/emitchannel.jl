@@ -194,8 +194,9 @@ function emit_send!(s::EmitServer, kind::UInt8, payload::Vector{UInt8};
         end
         try
             _writable_within(Z, s.data, EMIT_PEER_WAIT_S) || error("no hub on the emit channel")
-            Z.send(s.data, kind == EMIT_KIND_BINARY ? _KIND_B : _KIND_J; more = true)
-            Z.send(s.data, payload)
+            _send_now(Z, s.data, kind == EMIT_KIND_BINARY ? _KIND_B : _KIND_J; more = true) ||
+                error("no hub on the emit channel")
+            _send_now(Z, s.data, payload) || error("the emit channel's hub went away mid-message")
         catch
             # No hub to take it (gone without detaching). The kind part may be queued alone, which
             # would misalign the next message, so the channel stays detached until a new hello.
@@ -229,14 +230,24 @@ function _maybe_resync!(s::EmitServer)
         s.next_resync = time() + s.resync_after
         try
             _writable_within(s.Z, s.data, 0.2) || return nothing
-            s.Z.send(s.data, _KIND_R; more = true)
-            s.Z.send(s.data, UInt8[])
+            _send_now(s.Z, s.data, _KIND_R; more = true) && _send_now(s.Z, s.data, UInt8[])
         catch
         end
     end
     return nothing
 end
 const EMIT_PEER_WAIT_S = 2.0
+
+# One message part, without waiting: `true` once libzmq has it, `false` when the socket cannot take it
+# now. ZMQ.jl's `send` waits on the socket for as long as it is not writable, which is for good on a
+# PUSH whose peer has gone, and a peer can go between a writability check and the send.
+function _send_now(Z::Module, sock, data::Union{String,Vector{UInt8}}; more::Bool = false)
+    flags = Z.lib.ZMQ_DONTWAIT | (more ? Z.lib.ZMQ_SNDMORE : 0)
+    rc = GC.@preserve data Z.lib.zmq_send(sock, pointer(data), sizeof(data), flags)
+    rc >= 0 && return true
+    (err = Z.lib.zmq_errno()) == Libc.EAGAIN && return false
+    error("emit channel: send failed (errno $err)")
+end
 
 # Whether `sock` can take a message within `timeout` seconds. ZMQ.jl's `send` ignores `sndtimeo` and
 # waits on the socket for as long as it takes, and a PUSH whose peer has gone is never writable. A
@@ -312,7 +323,8 @@ function emit_client!(Z::Module, data_endpoint::AbstractString, credit_endpoint:
     c = EmitClient(Z, ctx, data, cs, ReentrantLock(), pool, Threads.Atomic{Int}(0),
                    Threads.Atomic{Bool}(true), nothing, Threads.Atomic{Int}(0), Threads.Atomic{Int}(0),
                    max(1, Int(window) ÷ 16), Int(window))
-    lock(() -> Z.send(cs, "H" * string(Int(window))), c.lock)
+    # The first hello waits a moment for the connection: a worker that never hears one never asks to resume.
+    lock(() -> _credit_send(c, "H" * string(Int(window)); wait_s = EMIT_PEER_WAIT_S), c.lock)
     # On the interactive pool where there is one, as the hub's gate-stream poller is: this task wakes for
     # every message, and on the default pool each wake scans a run queue per thread.
     c.task = Threads.nthreads(:interactive) > 0 ? Threads.@spawn(:interactive, _emit_receive_loop(c, on_message)) :
@@ -328,7 +340,18 @@ function _emit_grant!(c::EmitClient, n::Integer)
     c.running[] || return nothing
     (total >= c.grant_every || left <= 0) || return nothing
     g = Threads.atomic_xchg!(c.ungranted, 0)
-    g > 0 && lock(() -> (try; c.Z.send(c.credit_sock, "C" * string(g)); catch; end), c.lock)
+    g > 0 && lock(() -> _credit_send(c, "C" * string(g)), c.lock)
+    return nothing
+end
+
+# Send on the credit socket only if it takes the message now (`_send_now`): a connection that failed or
+# lost its worker leaves it unwritable for good. A message not sent is not lost for long: a worker
+# short of credit stalls, asks to resume, and gets a fresh hello. Called with `c.lock` held.
+function _credit_send(c::EmitClient, msg::String; wait_s::Real = 0.0)
+    try
+        _writable_within(c.Z, c.credit_sock, wait_s) && _send_now(c.Z, c.credit_sock, msg)
+    catch
+    end
     return nothing
 end
 
@@ -371,7 +394,7 @@ function _emit_receive_loop(c::EmitClient, on_message)
         if !isempty(kind) && kind[1] == EMIT_KIND_RESYNC
             give_buffer!(c.pool, buf)
             Threads.atomic_xchg!(c.ungranted, 0)
-            lock(() -> (try; Z.send(c.credit_sock, "H" * string(c.window)); catch; end), c.lock)
+            lock(() -> _credit_send(c, "H" * string(c.window)), c.lock)
             continue
         end
         Threads.atomic_add!(c.received, 1)
@@ -400,7 +423,8 @@ function emit_close!(c::EmitClient)
     # Tell the worker first, so its next emit takes the gate stream at once instead of waiting out a
     # send to a hub that is gone. The credit socket lingers long enough to deliver it.
     lock(c.lock) do
-        try; c.credit_sock.linger = 1000; c.Z.send(c.credit_sock, "D0"); catch; end
+        try; c.credit_sock.linger = 1000; catch; end
+        _credit_send(c, "D0")
     end
     c.running[] = false
     try; wait(c.task); catch; end
