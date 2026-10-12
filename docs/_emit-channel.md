@@ -1,6 +1,6 @@
 # The emit channel: a worker's fourth socket, for `slate_emit`
 
-Status: design, being implemented on `feat/mbse`. Untracked note, 2026-10-11.
+Status: implemented for local workers. Working note, 2026-10-11.
 
 ## Why
 
@@ -52,15 +52,23 @@ the hub connects to whatever it is told:
 ## Flow control
 
 Credit-based, in bytes. The worker starts with none. The hub's hello grants a window (32 MB: enough to keep the path busy; at saturation every message waits behind it, so it is also the latency a flat-out producer sees).
-Each emit spends its size. The hub grants a message's size back once every open page of the
-notebook has sent it (or dropped it at the page queue's byte bound), so the window bounds what is
-in flight between the worker's emit and the pages' sockets. A notebook with no page open is granted
-back on receipt, as if sent.
+Each emit spends its size. The hub grants a message's size back once the first open page of the
+notebook has written it to its socket, so the producer runs at the pace of the fastest page; a drop
+at a page queue grants nothing. The buffer goes back once every page has written or dropped it. A
+notebook with no page open is granted back on receipt. Grants go back in chunks of a sixteenth of the
+window, and the grant that leaves no received message ungranted sends whatever is left, so an idle
+channel holds its whole window.
 
-When credit runs out, `slate_emit` waits for a grant: a producer runs at the rate of the slowest
-page and nothing is dropped. After `EMIT_WAIT_S` (5 s) without enough credit it drops that message
-and counts it, so a cell cannot hang on a page nobody is reading. A message larger than the whole
-window goes once nothing else is in flight.
+When credit runs out, `slate_emit` waits for a grant. After `EMIT_WAIT_S` (5 s) without enough
+credit the channel detaches: that message and the ones after it take the gate stream, and the worker
+asks the hub to resume (`R`), first after `EMIT_RESYNC_S` and then at doubling intervals while it
+keeps stalling soon after resuming. The hub answers with a fresh hello. A message larger than the
+whole window goes once nothing else is in flight.
+
+Order is kept on each path, not across a switch between them. Frames the hub has not yet read from
+the channel when the worker detaches can reach the pages after the first frames sent on the gate
+stream. The hub has normally read them already, since credit runs out while the pages are slow to
+write rather than while the hub is slow to read.
 
 The worker uses the channel only while the hub is attached (a hello received). Before that, and on a
 worker where it never starts, emits take the gate stream as today.
@@ -86,7 +94,7 @@ dropped), which is how the last page releases the buffer and returns the credit.
 ## Tests
 
 - Transport, in one process over `ipc://`: messages arrive in order, both kinds; credit bounds what is
-  sent; an emit waits for a grant and goes when it comes; an emit with no grant drops after the wait;
+  sent; an emit waits for a grant and goes when it comes; an emit with no grant detaches the channel after the wait, and it resumes;
   a message larger than the window goes when nothing is in flight; no attach means no channel use.
 - Page queue: a frame queued to two pages is released once, after both have sent it; a frame dropped
   at the byte bound is released at once.

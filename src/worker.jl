@@ -165,8 +165,8 @@ function _start_emit_channel!()
 end
 
 # `slate_emit` from a notebook: the emit channel while the hub is attached to it, the gate stream
-# otherwise. A message the channel drops (no credit within its wait) is not resent the other way, so
-# the order of what does arrive is the order of the emits.
+# otherwise. A message the channel cannot take in time (it detached) goes on the gate stream. Order
+# holds on each path, not across the switch: see docs/_emit-channel.md.
 function _slate_emit(channel::String, value)
     s = _EMIT[]
     if s !== nothing && emit_attached(s)
