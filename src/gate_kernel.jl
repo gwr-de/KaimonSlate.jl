@@ -1252,7 +1252,7 @@ function _attach_emit!(k::GateKernel)
         ep, cr = get_(:emit), get_(:emit_credit)
         (isempty(ep) || isempty(cr)) && return nothing
         Z = getfield(_kaimon(), :KaimonGate).ZMQ
-        c = emit_client!(Z, ep, cr, (kind, buf, release) -> _on_emit_message(name, kind, buf, release);
+        c = emit_client!(Z, ep, cr, (kind, buf, release, grant) -> _on_emit_message(name, kind, buf, release, grant);
                          secret = get_(:emit_secret), pool = _HUB_EMIT_POOL)
         old = lock(_EMIT_CLIENTS_LOCK) do
             o = get(_EMIT_CLIENTS, name, nothing); _EMIT_CLIENTS[name] = (c, k); o
@@ -1291,12 +1291,14 @@ function _ensure_emit_supervisor!()
 end
 
 # One message from a worker's emit channel, on its receive task. A binary frame goes to the pages as
-# it is and is released after the last page has sent it; a JSON emit is decoded and released at once.
-function _on_emit_message(name::String, kind::UInt8, buf::Vector{UInt8}, release)
+# it is: its credit is granted back once the first page has sent it, so the worker runs at the pace of
+# the fastest page rather than of one that is not reading, and its buffer is released once the last has.
+# A JSON emit is decoded and released at once.
+function _on_emit_message(name::String, kind::UInt8, buf::Vector{UInt8}, release, grant = release)
     rid = lock(_GATE_SESSION_LOCK) do; get(_GATE_SESSION, name, nothing); end
     rid === nothing && return release()
     if kind == EMIT_KIND_BINARY
-        _do_emit_bin(rid, buf; release)
+        _do_emit_bin(rid, buf; release, grant)
     elseif kind == EMIT_KIND_JSON
         i = findfirst(==(0x1f), buf)
         if i === nothing

@@ -20,7 +20,7 @@ mutable struct Recorder
     lock::ReentrantLock
 end
 Recorder(; hold = false) = Recorder(Tuple{UInt8,Vector{UInt8}}[], Any[], hold, ReentrantLock())
-handler(r::Recorder) = (kind, buf, release) -> lock(r.lock) do
+handler(r::Recorder) = (kind, buf, release, grant) -> lock(r.lock) do
     push!(r.got, (kind, copy(buf)))
     r.hold ? push!(r.releases, release) : release()
 end
@@ -122,6 +122,27 @@ release_all!(r::Recorder) = lock(() -> (foreach(f -> f(), r.releases); empty!(r.
         finally
             EMIT_RESYNC_S[] = old
             release_all!(r); emit_close!(h); emit_close!(s)
+        end
+    end
+
+    @testset "a grant lets the worker go on while the buffer is still held" begin
+        # The hub's way with several pages: credit back once the first has sent a frame, the buffer
+        # only once the last has. A page that is slow to read holds buffers, not the worker.
+        s = server()
+        held = Any[]; lk = ReentrantLock(); n = Threads.Atomic{Int}(0)
+        h = client(s, (kind, buf, release, grant) -> begin
+                grant(); lock(() -> push!(held, release), lk); Threads.atomic_add!(n, 1)
+            end; window = 3000)
+        try
+            @test waitfor(() -> emit_attached(s))
+            for _ in 1:10
+                @test emit_send!(s, EMIT_KIND_BINARY, zeros(UInt8, 1000); wait_s = 5) === :sent
+            end
+            @test waitfor(() -> n[] == 10)
+            @test s.stalls[] == 0                 # ten window-sized sends' worth, nothing released yet
+        finally
+            lock(() -> foreach(f -> f(), held), lk)
+            emit_close!(h); emit_close!(s)
         end
     end
 

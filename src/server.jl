@@ -242,9 +242,9 @@ function _wire_callbacks!(nb::LiveNotebook)
     catch; end))   # slate_emit → push over the page WebSocket (NOT the coalescing SSE); payload is a Julia value, JSON-encoded in _ws_emit!
     # slate_emit_bin → forward the raw binary frame over the page WebSocket as-is; `release` (a frame from
     # a worker's emit channel) comes back once every page has sent it.
-    register_bin_emit!(nb.report.id, (frame; release = nothing) -> begin
+    register_bin_emit!(nb.report.id, (frame; release = nothing, grant = nothing) -> begin
         try
-            _ws_broadcast_bin!(nb, frame; release)
+            _ws_broadcast_bin!(nb, frame; release, grant)
         catch
             release === nothing || release()
         end

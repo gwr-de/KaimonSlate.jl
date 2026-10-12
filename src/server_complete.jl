@@ -3668,9 +3668,17 @@ function _ws_drain!(c::_WSConn)
         lock(c.wlock) do
             while isready(c.out)
                 f = take!(c.out)
+                t0 = time_ns()
+                ok = false
                 try
                     _raw_send(c.ws, f)
+                    ok = true
                 finally
+                    # With SlateDiag on: each socket write, by kind, as a route of its own, so the
+                    # time a page's socket takes per frame shows beside the hub's requests.
+                    SlateDiag.diag_enabled() &&
+                        SlateDiag.diag_record!(f isa Vector{UInt8} ? "WS send binary" : "WS send text",
+                                               time_ns() - t0, sizeof(f), ok)
                     Threads.atomic_sub!(c.queued, sizeof(f))
                     _ws_sent!(c, f)
                 end
@@ -3754,22 +3762,32 @@ end
 
 # Send a pre-built frame (a JSON text frame, or a raw binary numeric frame) to every live page socket of a
 # notebook (no-op when none are connected). With `release`, it is called once every page has sent the
-# frame (or dropped it, or gone away), and at once when no page is open.
-function _ws_broadcast!(nb::LiveNotebook, frame::Union{AbstractString,Vector{UInt8}}; release = nothing)
+# frame (or dropped it, or gone away), and at once when no page is open; `grant`, once the first has.
+function _ws_broadcast!(nb::LiveNotebook, frame::Union{AbstractString,Vector{UInt8}}; release = nothing,
+                       grant = nothing)
     conns = lock(_WS_LOCK) do; v = get(_WS_CONNS, nb.id, nothing); v === nothing ? _WSConn[] : copy(v); end
     if release === nothing
         for c in conns; _ws_send!(c, frame); end
         return nothing
     end
-    isempty(conns) && (release(); return nothing)
+    if isempty(conns)
+        grant === nothing || grant()
+        release(); return nothing
+    end
     left = Threads.Atomic{Int}(length(conns))
-    done = () -> (Threads.atomic_sub!(left, 1) == 1 && release(); nothing)
+    first_done = Threads.Atomic{Bool}(false)
+    done = () -> begin
+        grant === nothing || Threads.atomic_xchg!(first_done, true) || grant()
+        Threads.atomic_sub!(left, 1) == 1 && release()
+        nothing
+    end
     for c in conns; _ws_send!(c, frame; on_sent = done); end
     return nothing
 end
 # slate_emit_bin → forward the raw binary frame (SlateExtensionsBase.encode_binary_frame) to every page
 # socket as a WebSocket BINARY frame, untouched. Channel + meta + dtype + shape are inside the frame.
-_ws_broadcast_bin!(nb::LiveNotebook, frame::Vector{UInt8}; release = nothing) = _ws_broadcast!(nb, frame; release)
+_ws_broadcast_bin!(nb::LiveNotebook, frame::Vector{UInt8}; release = nothing, grant = nothing) =
+    _ws_broadcast!(nb, frame; release, grant)
 
 # slate_emit → push `{t:"emit",channel,data}` to every live page socket. `value` is a Julia value (the
 # slate_emit unification); JSON-encoded once here on the hub.

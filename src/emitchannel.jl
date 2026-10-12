@@ -285,10 +285,12 @@ end
 """
     emit_client!(Z, data_endpoint, credit_endpoint, on_message; window, pool) -> EmitClient
 
-Attach to a worker's emit channel and start receiving. `on_message(kind, buf, release)` is called on
-the receive task for each message, in order: `buf` is the payload in a buffer from `pool`, and
-`release()` must be called exactly once when `buf` is no longer needed (it gives the buffer back and
-grants its size back to the worker).
+Attach to a worker's emit channel and start receiving. `on_message(kind, buf, release, grant)` is called
+on the receive task for each message, in order: `buf` is the payload in a buffer from `pool`. `grant()`
+grants the message's size back to the worker, once the message has gone where it is going first.
+`release()` must be called exactly once, when `buf` is no longer needed by anyone: it gives the buffer
+back, and grants too if `grant` has not been called. Separating the two lets a consumer that is slow
+to read hold its copy of the bytes without holding back the worker.
 """
 function emit_client!(Z::Module, data_endpoint::AbstractString, credit_endpoint::AbstractString,
                       on_message; window::Integer = EMIT_WINDOW_BYTES[], pool::FramePool = FramePool(8),
@@ -367,16 +369,18 @@ function _emit_receive_loop(c::EmitClient, on_message)
         end
         Threads.atomic_add!(c.received, 1)
         n = length(buf)
+        granted = Threads.Atomic{Bool}(false)
         released = Threads.Atomic{Bool}(false)
+        grant = () -> (Threads.atomic_xchg!(granted, true) || _emit_grant!(c, n); nothing)
         release = () -> begin
             Threads.atomic_xchg!(released, true) && return nothing
+            grant()
             give_buffer!(c.pool, buf)
-            _emit_grant!(c, n)
             return nothing
         end
         try
             # invokelatest: this task lives as long as the worker, in the world it started in.
-            Base.invokelatest(on_message, isempty(kind) ? 0x00 : kind[1], buf, release)
+            Base.invokelatest(on_message, isempty(kind) ? 0x00 : kind[1], buf, release, grant)
         catch e
             @debug "emit channel: message handler failed" exception = e
             release()
