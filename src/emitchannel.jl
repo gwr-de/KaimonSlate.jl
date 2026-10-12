@@ -24,7 +24,7 @@ import FileWatching
 
 const EMIT_KIND_BINARY = 0x42   # 'B'
 const EMIT_KIND_JSON = 0x4a     # 'J'
-const EMIT_WINDOW_BYTES = Ref(256 * 1024 * 1024)
+const EMIT_WINDOW_BYTES = Ref(32 * 1024 * 1024)   # what may be in flight; at saturation, the delay a message waits behind
 const EMIT_WAIT_S = Ref(5.0)
 
 # ── worker side ───────────────────────────────────────────────────────────────────────────────────
@@ -230,6 +230,10 @@ mutable struct EmitClient
     received::Threads.Atomic{Int}
     running::Threads.Atomic{Bool}
     task::Any
+    # Released bytes not yet granted back. Grants go in chunks of `grant_every` bytes: one per message
+    # would be a message back to the worker, and a wake of its credit task, for every frame received.
+    ungranted::Threads.Atomic{Int}
+    grant_every::Int
 end
 
 """
@@ -255,14 +259,22 @@ function emit_client!(Z::Module, data_endpoint::AbstractString, credit_endpoint:
     Z.connect(data, String(data_endpoint))
     Z.connect(cs, String(credit_endpoint))
     c = EmitClient(Z, ctx, data, cs, ReentrantLock(), pool, Threads.Atomic{Int}(0),
-                   Threads.Atomic{Bool}(true), nothing)
+                   Threads.Atomic{Bool}(true), nothing, Threads.Atomic{Int}(0), max(1, Int(window) ÷ 16))
     lock(() -> Z.send(cs, "H" * string(Int(window))), c.lock)
-    c.task = Threads.@spawn _emit_receive_loop(c, on_message)
+    # On the interactive pool where there is one, as the hub's gate-stream poller is: this task wakes for
+    # every message, and on the default pool each wake scans a run queue per thread.
+    c.task = Threads.nthreads(:interactive) > 0 ? Threads.@spawn(:interactive, _emit_receive_loop(c, on_message)) :
+                                                  Threads.@spawn(_emit_receive_loop(c, on_message))
     return c
 end
 
-_emit_grant!(c::EmitClient, n::Integer) =
-    (n > 0 && c.running[]) && lock(() -> (try; c.Z.send(c.credit_sock, "C" * string(Int(n))); catch; end), c.lock)
+function _emit_grant!(c::EmitClient, n::Integer)
+    (n > 0 && c.running[]) || return nothing
+    Threads.atomic_add!(c.ungranted, Int(n)) + n < c.grant_every && return nothing
+    g = Threads.atomic_xchg!(c.ungranted, 0)
+    g > 0 && lock(() -> (try; c.Z.send(c.credit_sock, "C" * string(g)); catch; end), c.lock)
+    return nothing
+end
 
 # A part received into a buffer from the pool: received as a libzmq message, copied, and the message
 # closed here, on this task. ZMQ.jl's `recv(sock, Vector{UInt8})` does the same into a new array.
