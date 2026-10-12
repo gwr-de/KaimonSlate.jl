@@ -886,8 +886,8 @@ See also `save_asset`, `FileUpload`."""),
          "solver output", "variables", "region", "slice", "remote file"],
         "adopt(path)  ·  adopt(path1, path2, …)  ·  adopt(paths)  ·  ds[:var][1][i, j, …]",
         """IN A CELL, `adopt(f)` stores the file's variables in a dataset store under `datadir()`
-        (a region's own scratch on a region) and returns the Dataset; an unchanged file is not read
-        again. On a region the bytes stay there: the value that crosses to the notebook is the
+        (a region's own scratch on a region) and returns the Dataset; a relative `f` is under
+        `datadir()`, and an unchanged file is not read again. On a region the bytes stay there: the value that crosses to the notebook is the
         index, and each slice is read from the region over ssh.
         `v = ds[:n][1]` is the variable, indexed by its dimensions: `v[:, :, :, 1:200]` reads exactly
         that block, and whole leading dimensions with a range of the next are one contiguous read.

@@ -154,7 +154,8 @@ attributes the format carried come with it. Write files under `datadir()` or `@s
 on the node the way they do in the notebook — the per-region scratch, beside the job.
 
 `adopt` works in an ordinary cell too. On a region, the file is stored in a dataset store under the
-region's `datadir()`, and the cell's value is the dataset. Read from the notebook, that value is the
+region's `datadir()`, and the cell's value is the dataset. A relative path is read as under
+`datadir()`, as `@sfile` builds it. Read from the notebook, that value is the
 index, and each slice is read from the region over ssh:
 
 ```julia

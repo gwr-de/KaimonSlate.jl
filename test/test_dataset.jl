@@ -970,8 +970,8 @@ const MS = RE.MemoStore
             mf = only(readdir(joinpath(store, "manifests")))
             d = MS.read_manifest(store, first(splitext(mf)))
             @test p.index["blob"] in MS._manifest_blobs(d)
-            # A changed file is a new dataset.
-            write(f, "second"); RE.Sweep.adopt_into(store, ST.adopt(f))
+            # A changed file is a new dataset. A cell's relative path is under its data directory.
+            write(f, "second"); RE.Sweep.adopt_in(dir, "a.cube")
             @test reads[] == 2
 
             # Moved to another machine, the same reads go over ssh (an empty host runs them here): a

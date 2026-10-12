@@ -2806,6 +2806,18 @@ function adopt_into(root::AbstractString, a::SlateTask.AdoptedFile; label::Abstr
 end
 
 """
+    adopt_in(dir, paths...; label = "") -> Dataset
+
+A cell's `adopt`: the files stored in the dataset store under `dir` (the cell's `datadir()`), with a
+relative path read as under `dir`, as `@sfile` builds paths and `adopted` looks them up.
+"""
+function adopt_in(dir::AbstractString, paths...; label::AbstractString = "")
+    a = SlateTask.adopt(paths...)
+    full = String[isabspath(f) ? f : joinpath(dir, f) for f in a.paths]
+    return adopt_into(joinpath(dir, ".datasets"), SlateTask.AdoptedFile(full); label)
+end
+
+"""
     adopted(region, path) -> Dataset
 
 The dataset a cell's `adopt(path)` stored on `region`, opened from any notebook. `path` is relative to
