@@ -741,8 +741,10 @@ function _ensure_poller!()
                 srcnames = Dict{String,Set{String}}()   # parent /src edits → changed def-names
                 srcerr = Dict{String,String}()          # parent /src parse/apply errors
                 prog = Dict{Tuple{String,String},Tuple{Float64,String,Bool}}()   # (notebook, bar id) → LATEST (frac,msg,done)
-                emits = Tuple{String,String,Any}[]   # ordered slate_emit pushes (rid, channel, deserialized VALUE) — NOT coalesced; each event matters
-                binemits = Tuple{String,Vector{UInt8}}[]   # ordered slate_emit_bin frames (rid, raw binary frame) — forwarded to the page WS as-is
+                # Ordered `slate_emit` pushes, JSON and binary in one list so they reach the page in the order
+                # they were emitted: (rid, channel, deserialized VALUE), or (rid, nothing, raw binary frame)
+                # forwarded to the page WS as-is. NOT coalesced; each event matters.
+                emits = Tuple{String,Union{Nothing,String},Any}[]
                 # (notebook, cell) → LATEST cooked (stdout, stderr) while that cell runs. Coalesced like
                 # `prog`: each frame is a full snapshot of the cell's output, so an older one is pure waste.
                 cellouts = Dict{Tuple{String,String},Tuple{String,String}}()
@@ -809,7 +811,7 @@ function _ensure_poller!()
                             push!(setbinds, (rid, String(parts[1]), val))
                         end
                     elseif m.channel == "slate_emit_bin"      # a raw binary numeric frame (bytes carry channel+meta+dtype+shape+payload)
-                        m.data isa Vector{UInt8} && push!(binemits, (rid, m.data))
+                        m.data isa Vector{UInt8} && push!(emits, (rid, nothing, m.data))
                     elseif m.channel == "slate_log"           # worker log record → live tail push (no store)
                         _relay_log!(m.conn_name, String(m.data))
                     elseif m.channel == "slate_prepare"       # env precompile progress → "Preparing packages" banner
@@ -848,10 +850,7 @@ function _ensure_poller!()
                     _do_setbind(rid, name, val)
                 end
                 for (rid, ch, d) in emits
-                    _do_emit(rid, ch, d)
-                end
-                for (rid, frame) in binemits
-                    _do_emit_bin(rid, frame)
+                    ch === nothing ? _do_emit_bin(rid, d) : _do_emit(rid, ch, d)
                 end
             catch e
                 # Surface a persistent failure (this class of bug — a missing/renamed Kaimon
