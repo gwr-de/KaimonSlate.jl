@@ -135,7 +135,7 @@ end
     end
 
     @testset "allocations are profiled by bytes, with what was allocated" begin
-        RE.profile_arm!("pa", "alloc"; alloc_rate = 0.5)
+        RE.profile_arm!("pa", "alloc"; alloc_rate = 0.01)   # still ~10^5 samples; each one costs a backtrace
         RE.run_capture(ProfNS, "a = Any[i for i in 1:50_000]\nb = sum(length(collect(1:k % 50)) for k in 1:20_000)\n", "cell:pa")
         p = RE.profile_result("pa")
         @test p["unit"] == "bytes" && p["samples"] > 0 && !isempty(p["types"])
@@ -245,7 +245,7 @@ end
         # the run's start.
         RE.Profile.clear(); RE.Profile.init(n = 10^5, delay = 0.001)
         c0 = RE._cycles(); t0 = time_ns()
-        RE.Profile.@profile (local s = 0.0; for i in 1:20_000_000; s += sin(i); end; s)
+        RE.Profile.@profile (local s = 0.0; for i in 1:2_000_000; s += sin(i); end; s)   # thousands of samples
         r = (c0, Int64(t0), RE._cycles(), Int64(time_ns()))
         data = RE.Profile.fetch(include_meta = true, limitwarn = false)
         clocks = [data[i - RE.Profile.META_OFFSET_CPUCYCLECLOCK] for i in eachindex(data) if RE.Profile.is_block_end(data, i)]
