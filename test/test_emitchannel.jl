@@ -102,16 +102,25 @@ release_all!(r::Recorder) = lock(() -> (foreach(f -> f(), r.releases); empty!(r.
         end
     end
 
-    @testset "a send with no grant in time is dropped and counted" begin
+    @testset "a send with no grant in time detaches the channel, and it resumes on its own" begin
+        old = EMIT_RESYNC_S[]; EMIT_RESYNC_S[] = 0.5
         s = server()
         r = Recorder(hold = true)
         h = client(s, handler(r); window = 1000)
         try
             @test waitfor(() -> emit_attached(s))
             @test emit_send!(s, EMIT_KIND_BINARY, zeros(UInt8, 1000)) === :sent
-            @test emit_send!(s, EMIT_KIND_BINARY, zeros(UInt8, 1000); wait_s = 0.2) === :dropped
-            @test s.dropped[] == 1
+            # The hub holds what it was sent: no grant comes, so the next send detaches the channel
+            # and the caller sends that message the other way.
+            @test emit_send!(s, EMIT_KIND_BINARY, zeros(UInt8, 1000); wait_s = 0.2) === :detached
+            @test s.stalls[] == 1 && !emit_attached(s)
+            @test emit_send!(s, EMIT_KIND_BINARY, UInt8[1]) === :detached
+            # The worker asks to resume, and the hub's fresh hello restores the whole window.
+            @test waitfor(() -> emit_attached(s); timeout = 10)
+            @test s.credit == 1000
+            @test emit_send!(s, EMIT_KIND_BINARY, zeros(UInt8, 1000)) === :sent
         finally
+            EMIT_RESYNC_S[] = old
             release_all!(r); emit_close!(h); emit_close!(s)
         end
     end

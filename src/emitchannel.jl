@@ -11,7 +11,14 @@
 #           `C<n>` = `n` more bytes granted. Decimal ASCII.
 #
 # Flow control is credit in bytes. A send spends its size; the hub grants it back once the pages have
-# taken it. Out of credit, a send waits up to `wait_s` for a grant and then drops the message.
+# taken it. Out of credit, a send waits up to `wait_s` for a grant.
+#
+# The channel heals itself. A send that gets no grant in time detaches the channel, and the caller sends
+# that message, and the ones after it, the other way (the gate stream). While detached the worker asks
+# the hub to resume (`R` on the data socket), at first after `EMIT_RESYNC_S` and, when the channel stalls
+# again soon after resuming, at doubling intervals up to `EMIT_RESYNC_MAX_S`; the hub answers with a
+# fresh hello, which restores the whole window. Grants are capped at the window, so credit for messages
+# from before a reset cannot raise it further.
 #
 # Local workers use TCP on loopback: on macOS it moves large messages several times faster than a Unix
 # socket. Any local user can reach a loopback port, so with a `secret` both sockets are PLAIN servers
@@ -26,6 +33,9 @@ const EMIT_KIND_BINARY = 0x42   # 'B'
 const EMIT_KIND_JSON = 0x4a     # 'J'
 const EMIT_WINDOW_BYTES = Ref(32 * 1024 * 1024)   # what may be in flight; at saturation, the delay a message waits behind
 const EMIT_WAIT_S = Ref(5.0)
+const EMIT_RESYNC_S = Ref(5.0)
+const EMIT_RESYNC_MAX_S = 60.0
+const EMIT_KIND_RESYNC = 0x52   # 'R': worker → hub, "send a fresh hello"
 
 # ── worker side ───────────────────────────────────────────────────────────────────────────────────
 
@@ -41,10 +51,14 @@ mutable struct EmitServer
     window::Int
     attached::Bool
     sent::Threads.Atomic{Int}
-    dropped::Threads.Atomic{Int}
+    stalls::Threads.Atomic{Int}  # sends that found no credit in time and detached the channel
     running::Threads.Atomic{Bool}
     task::Any
     zap::Any                     # the ZAP handler's task, when there is a secret
+    hub_seen::Bool               # a hub has attached at some point, so a detached channel asks to resume
+    attached_at::Float64
+    resync_after::Float64        # the current interval between requests to resume
+    next_resync::Float64
 end
 
 """
@@ -75,7 +89,7 @@ function emit_server!(Z::Module, data_endpoint::AbstractString, credit_endpoint:
     Z.bind(cs, String(credit_endpoint))
     s = EmitServer(Z, ctx, data, cs, _bound_endpoint(data), _bound_endpoint(cs),
                    Threads.Condition(), 0, 0, false, Threads.Atomic{Int}(0), Threads.Atomic{Int}(0),
-                   running, nothing, zap)
+                   running, nothing, zap, false, 0.0, EMIT_RESYNC_S[], 0.0)
     s.task = Threads.@spawn _emit_credit_loop(s)
     return s
 end
@@ -129,22 +143,25 @@ function _emit_credit_loop(s::EmitServer)
             msg = try
                 Z.recv(s.credit_sock, String)
             catch e
-                e isa Z.TimeoutError && continue
                 s.running[] || break
-                sleep(0.05); continue
+                e isa Z.TimeoutError || sleep(0.05)
+                ""
             end
-            isempty(msg) && continue
-            n = something(tryparse(Int, msg[2:end]), 0)
-            lock(s.cond) do
-                if msg[1] == 'H'               # a hub (re)attached: whatever was in flight is gone
-                    s.window = n; s.credit = n; s.attached = true
-                elseif msg[1] == 'C'
-                    s.credit += n
-                elseif msg[1] == 'D'           # the hub is detaching: emits take the gate stream from now
-                    s.attached = false
+            if !isempty(msg)
+                n = something(tryparse(Int, msg[2:end]), 0)
+                lock(s.cond) do
+                    if msg[1] == 'H'               # a hub (re)attached: whatever was in flight is gone
+                        s.window = n; s.credit = n; s.attached = true
+                        s.hub_seen = true; s.attached_at = time()
+                    elseif msg[1] == 'C'
+                        s.credit = min(s.window, s.credit + n)
+                    elseif msg[1] == 'D'           # the hub is detaching: emits take the gate stream from now
+                        s.attached = false; s.hub_seen = false
+                    end
+                    notify(s.cond)
                 end
-                notify(s.cond)
             end
+            _maybe_resync!(s)
         end
     finally
         lock(s.cond) do; s.attached = false; notify(s.cond); end
@@ -154,8 +171,8 @@ end
 """
     emit_send!(s, kind, payload; nbytes = length(payload), wait_s = EMIT_WAIT_S[]) -> Symbol
 
-Send one message: `:sent`, `:dropped` (no credit within `wait_s`) or `:detached` (no hub attached, so
-the caller sends it some other way). Returns once `send` has copied `payload` into libzmq, so the
+Send one message: `:sent`, or `:detached`, when no hub is attached or none granted credit within
+`wait_s` (the channel then detaches and asks to resume later), so the caller sends it some other way. Returns once `send` has copied `payload` into libzmq, so the
 caller may reuse it.
 """
 function emit_send!(s::EmitServer, kind::UInt8, payload::Vector{UInt8};
@@ -167,9 +184,10 @@ function emit_send!(s::EmitServer, kind::UInt8, payload::Vector{UInt8};
         # A message larger than the whole window goes once nothing else is in flight.
         while s.credit < nbytes && !(s.credit >= s.window && nbytes > s.window)
             left = deadline - time()
-            if left <= 0 || !s.attached
-                Threads.atomic_add!(s.dropped, 1)
-                return s.attached ? :dropped : :detached
+            s.attached || return :detached
+            if left <= 0
+                _stalled!(s)
+                return :detached
             end
             t = Timer(_ -> lock(() -> notify(s.cond), s.cond), left)
             try; wait(s.cond); finally; close(t); end
@@ -191,6 +209,33 @@ function emit_send!(s::EmitServer, kind::UInt8, payload::Vector{UInt8};
 end
 const _KIND_B = UInt8[EMIT_KIND_BINARY]
 const _KIND_J = UInt8[EMIT_KIND_JSON]
+const _KIND_R = UInt8[EMIT_KIND_RESYNC]
+
+# No grant came in time: the hub is not taking what it was sent. Detach, so emits take the gate stream,
+# and ask to resume after a while, waiting longer each time it stalls again soon after resuming. Called
+# with `s.cond` held.
+function _stalled!(s::EmitServer)
+    Threads.atomic_add!(s.stalls, 1)
+    s.attached = false
+    s.resync_after = time() - s.attached_at < 30 ? min(EMIT_RESYNC_MAX_S, 2 * s.resync_after) : EMIT_RESYNC_S[]
+    s.next_resync = time() + s.resync_after
+    return nothing
+end
+
+# Detached from a hub that had attached: ask it, when due, to resume with a fresh hello.
+function _maybe_resync!(s::EmitServer)
+    lock(s.cond) do
+        (s.attached || !s.hub_seen || time() < s.next_resync) && return nothing
+        s.next_resync = time() + s.resync_after
+        try
+            _writable_within(s.Z, s.data, 0.2) || return nothing
+            s.Z.send(s.data, _KIND_R; more = true)
+            s.Z.send(s.data, UInt8[])
+        catch
+        end
+    end
+    return nothing
+end
 const EMIT_PEER_WAIT_S = 2.0
 
 # Whether `sock` can take a message within `timeout` seconds. ZMQ.jl's `send` ignores `sndtimeo` and
@@ -234,6 +279,7 @@ mutable struct EmitClient
     # would be a message back to the worker, and a wake of its credit task, for every frame received.
     ungranted::Threads.Atomic{Int}
     grant_every::Int
+    window::Int
 end
 
 """
@@ -259,7 +305,8 @@ function emit_client!(Z::Module, data_endpoint::AbstractString, credit_endpoint:
     Z.connect(data, String(data_endpoint))
     Z.connect(cs, String(credit_endpoint))
     c = EmitClient(Z, ctx, data, cs, ReentrantLock(), pool, Threads.Atomic{Int}(0),
-                   Threads.Atomic{Bool}(true), nothing, Threads.Atomic{Int}(0), max(1, Int(window) ÷ 16))
+                   Threads.Atomic{Bool}(true), nothing, Threads.Atomic{Int}(0), max(1, Int(window) ÷ 16),
+                   Int(window))
     lock(() -> Z.send(cs, "H" * string(Int(window))), c.lock)
     # On the interactive pool where there is one, as the hub's gate-stream poller is: this task wakes for
     # every message, and on the default pool each wake scans a run queue per thread.
@@ -309,6 +356,13 @@ function _emit_receive_loop(c::EmitClient, on_message)
             _emit_recv_into!(Z, c.data, c.pool)
         catch
             c.running[] || break
+            continue
+        end
+        # A worker asking to resume after a stall: a fresh hello restores its whole window.
+        if !isempty(kind) && kind[1] == EMIT_KIND_RESYNC
+            give_buffer!(c.pool, buf)
+            Threads.atomic_xchg!(c.ungranted, 0)
+            lock(() -> (try; Z.send(c.credit_sock, "H" * string(c.window)); catch; end), c.lock)
             continue
         end
         Threads.atomic_add!(c.received, 1)

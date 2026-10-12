@@ -1255,9 +1255,10 @@ function _attach_emit!(k::GateKernel)
         c = emit_client!(Z, ep, cr, (kind, buf, release) -> _on_emit_message(name, kind, buf, release);
                          secret = get_(:emit_secret), pool = _HUB_EMIT_POOL)
         old = lock(_EMIT_CLIENTS_LOCK) do
-            o = get(_EMIT_CLIENTS, name, nothing); _EMIT_CLIENTS[name] = c; o
+            o = get(_EMIT_CLIENTS, name, nothing); _EMIT_CLIENTS[name] = (c, k); o
         end
-        old === nothing || emit_close!(old)
+        old === nothing || emit_close!(first(old))
+        _ensure_emit_supervisor!()
     catch e
         @debug "emit channel: attach failed; the worker's emits stay on the gate stream" exception = e
     end
@@ -1265,8 +1266,27 @@ function _attach_emit!(k::GateKernel)
 end
 
 function _detach_emit!(name::AbstractString)
-    c = lock(() -> pop!(_EMIT_CLIENTS, String(name), nothing), _EMIT_CLIENTS_LOCK)
-    c === nothing || Threads.@spawn (try; emit_close!(c); catch; end)
+    e = lock(() -> pop!(_EMIT_CLIENTS, String(name), nothing), _EMIT_CLIENTS_LOCK)
+    e === nothing || Threads.@spawn (try; emit_close!(first(e)); catch; end)
+    return nothing
+end
+
+# Every 10 s: a worker whose receive task has ended (anything that escaped its own error handling) is
+# attached again, so its emits do not stay on the gate stream for the rest of its life.
+const _EMIT_SUPERVISOR = Ref{Any}(nothing)
+function _ensure_emit_supervisor!()
+    _EMIT_SUPERVISOR[] === nothing || return nothing
+    _EMIT_SUPERVISOR[] = Timer(10.0; interval = 10.0) do _
+        EMIT_CHANNEL_ON[] || return
+        dead = lock(_EMIT_CLIENTS_LOCK) do
+            [(n, k) for (n, (c, k)) in _EMIT_CLIENTS if c.task !== nothing && istaskdone(c.task)]
+        end
+        for (n, k) in dead
+            @info "emit channel: the receive task for a worker ended; attaching again" worker = n
+            _detach_emit!(n)
+            try; Base.invokelatest(_attach_emit!, k); catch; end
+        end
+    end
     return nothing
 end
 
