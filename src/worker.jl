@@ -114,6 +114,29 @@ include(joinpath(@__DIR__, "sysstats.jl"))  # sys_sample! — host, process and 
 include(joinpath(@__DIR__, "capture.jl"))   # run_capture — uses EChart + SlateTable above
 include(joinpath(@__DIR__, "completion.jl")) # slate_completions — REPLCompletions in the NB namespace
 include(joinpath(@__DIR__, "prepare.jl"))   # PrepareTracker — classify precompile output into structured status (shared w/ engine)
+include(joinpath(@__DIR__, "framepool.jl")) # FramePool — reused buffers for large binary stream frames
+
+# Large binary frames are encoded into a pooled buffer, which the gate's broadcaster hands back once it
+# has sent it. Frames under the threshold are cheap to allocate, and a KaimonGate without the release
+# callback gets a new buffer per frame as before.
+const _FRAME_POOL = FramePool(4)
+const _FRAME_POOL_MIN_BYTES = 1 << 20
+const _GATE_RELEASES = Ref{Union{Nothing,Bool}}(nothing)
+function _gate_releases()
+    r = _GATE_RELEASES[]
+    r === nothing || return r
+    return _GATE_RELEASES[] = hasmethod(KaimonGate._publish_stream_raw, Tuple{String,Vector{UInt8}}, (:release,))
+end
+
+function _emit_binary(channel::String, value::SlateExtensionsBase.SlateBinary)
+    if sizeof(value.data) >= _FRAME_POOL_MIN_BYTES && _gate_releases()
+        buf = SlateExtensionsBase.encode_binary_frame!(take_buffer!(_FRAME_POOL), channel, value)
+        KaimonGate._publish_stream_raw("slate_emit_bin", buf; release = b -> give_buffer!(_FRAME_POOL, b))
+    else
+        KaimonGate._publish_stream_raw("slate_emit_bin", SlateExtensionsBase.encode_binary_frame(channel, value))
+    end
+    return nothing
+end
 
 # Per-notebook execution namespace (warm; reset by replacing the module). Built by the
 # SAME shared contract `_populate_notebook_ns!` as the in-process kernel, so the two
@@ -144,7 +167,7 @@ function _new_ns(m::Module = Module(:NB))
         # a binary WS frame → a TypedArray in the browser. Any other value takes the string path
         # (Serialization+base64; the hub deserializes + JSON-encodes it).
         slate_emit = (channel, value) -> value isa SlateExtensionsBase.SlateBinary ?
-            KaimonGate._publish_stream_raw("slate_emit_bin", SlateExtensionsBase.encode_binary_frame(string(channel), value)) :
+            _emit_binary(string(channel), value) :
             KaimonGate._publish_stream("slate_emit",
                 string(channel) * "\x1f" * Base64.base64encode(Serialization.serialize, value)),
         # `set_bind(:name, value)` — the bind registry lives in the HUB, so this publishes and the
