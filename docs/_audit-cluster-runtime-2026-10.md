@@ -560,3 +560,39 @@ These corrections change what the sections above say:
 Confirmed in the second pass, previously reviewer-traced only, among the high defects:
 - #14: the card poll submits from a cached scheduler answer.
 - #15: a failed scheduler poll reads as "nothing live". `cancel!` cancels nothing and still writes `.cancelled`.
+
+---
+
+## 8. Status at 748976e3 (2026-10-12)
+
+Each of the 114 findings in `.findings.json` now carries a `reconciled` record (status, evidence, commits, location at this commit, what remains, plan step). Of the 114: 29 fixed, 22 partial, 63 open, none obsolete. By severity: high 11 fixed / 4 partial / 7 open; medium 12 / 12 / 36; low 6 / 6 / 20. The open and partial findings collapse to about 45 distinct issues, because several area reviews reported the same defect.
+
+**Fixed since the audit.** Step 0 in full; Step 1 (run record, `_settle!`, STOPPED, halt; 55cd4c82); Step 2 (`computed_in`, `_check_side!`; ce7711ea, 78a1dcb8); High #10, #11, #12, #19 (b5f83a35, 2e9c6c4b, 2ceedbe7, 2adada55, a88c045b); `_key_poisoned` through `_cell_effect` and internal flags out of tags (ddd11518).
+
+**High, still open or partial** (findings ids; audit table # in parentheses):
+
+| Issue | Findings | Left |
+|---|---|---|
+| An edit drops `:everywhere_declared`/`:volatile_declared` from every cell (High #6) | 4, 19, 27, 98 | `update_source!` carries `run`/`rev`/blocked but not the declared flags; they return only on notebook open. Step 4's per-(cell, src_hash) record, or carry them for an unchanged `src_hash`. |
+| Prime and resource failures recorded as success (High #16) | 28 | One replay helper that checks `out.exception` and surfaces the failure on the reading cell. |
+| Presync token ignores reactive digests (High #18) | 30 | Fold `state_digests(report.id)` into the transfer token. |
+| Attach ladder reaps a busy worker (High #7) | 37 | One liveness oracle (telemetry plus process presence); never reap on gate silence while telemetry is fresh. |
+| Dropped wire leads to concurrent same-cid evals (High #8) | 38 | Runs are keyed by run id now; after a reattach, ask `__slate_running` and cancel or adopt runs the hub does not hold. |
+| Card poll submits from a cached scheduler answer (High #14) | 55 | Poll fresh for a submitting reconcile, and invalidate the collector after a submit. |
+| Failed scheduler poll means "nothing live" (High #15) | 56 | Tri-state poll with a whole-answer `:unreachable`; no submit decision on it; cancel by name or fail loudly. The PBS poll script still exits 0 on failure. |
+| A channel open unanswered at its deadline kills the whole session (High #13 remainder) | 65 | Started commands are no longer resent; a slow open still fails every command on the session. |
+| Reconnect re-render (High #3 remainder) | 11 | Hub side fixed; the worker still re-runs a running or queued live cell's old source and fires its cleanups (`rerender_live_outputs`). |
+
+**Medium and low, by plan step** (distinct issues):
+- Step 3, run control (6, 13, 14, 15, 91): one cancellation token for runs and `@onclick` handlers; cancel off the request path; `cancel_cells` boundary; watchdog and package-op restale still test `kind == CODE`.
+- Step 4, declared effects (7, 21, 22, 23, 26, 59, 61, 103, 109): records are add-only and never cleared on an empty run; everywhere replay has no kind filter; `connected`/`run_there` still declare volatile on every call; IMPURE unused.
+- Step 5, value identity (25, 29, 32, 34): prime and resource keyed on source only; the `using` mirror; four first-writer scans.
+- Step 6, WorkerRecord (39/99, 41, 42/111, 43, 100, 104, 105): SIGTERM-only restart that deletes the manifest first; spin guard; `_REAPED` host alias; heal takes `k.lock` inline.
+- Step 7, region lease (45, 46, 48, 49, 50, 51, 52, 53, 114): all of it.
+- Step 8, sweep ownership (57/112, 58, 62/89, 79, 84): unlocked advancers; settle only through a watching card; `reset!` orphans jobs; `push_meta!` sends the whole mirror; shared `.pullstamp`.
+- Step 9, transport (66–75, 77, 87, 101, 106, 107): session and channel lifecycle leaks, connection setup (no ProxyJump or agent auth), `run_io` budget, blob pull stall branch, error-text control flow.
+- Step 10, browser (88, 90, 92, 93): running marks wiped by pushes, SSE backpressure token, no per-cell rev gate on full state, worker dot sources.
+- Step 11, provisioning identity (80–83, 113): stamp recomputed after compile, `+pc`/`.pc`, `_julia_sh` precedence, per-host site stamps.
+- Unassigned (63, 76, 85, 86): unused `_rows` argument, poller drops a failed deserialize, regex manifest reads, process-lifetime caches.
+
+**Found in the 2026-10-12 review of the cherry-picked mbse work, not in the list above:** emit order is not kept across an emit-channel detach (documented in `docs/_emit-channel.md`); a region worker's `SshSource` read is delegated to the hub, which writes the cache on its own filesystem; `_attach_emit!` can register a client for a worker killed during the attach; settled sweeps skip the sync, so remote-only changes never reach the mirror. Two testsets in `test/test_reactive_state.jl` ("reactive state and the memo key", "a memo restore reports the live value…") return early without a gate and never run.
