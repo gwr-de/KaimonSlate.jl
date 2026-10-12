@@ -114,33 +114,10 @@ include(joinpath(@__DIR__, "sysstats.jl"))  # sys_sample! — host, process and 
 include(joinpath(@__DIR__, "capture.jl"))   # run_capture — uses EChart + SlateTable above
 include(joinpath(@__DIR__, "completion.jl")) # slate_completions — REPLCompletions in the NB namespace
 include(joinpath(@__DIR__, "prepare.jl"))   # PrepareTracker — classify precompile output into structured status (shared w/ engine)
-include(joinpath(@__DIR__, "framepool.jl")) # FramePool — reused buffers for large binary stream frames
+include(joinpath(@__DIR__, "framepool.jl")) # FramePool — reused buffers for binary frames sent on the emit channel
 
-# Large binary frames are encoded into a pooled buffer, which the gate's broadcaster hands back once it
-# has sent it. Frames under the threshold are cheap to allocate. Both packages involved are whatever
-# versions the notebook's environment resolved, not the ones this file ships with, so the pool is used
-# only when the KaimonGate there takes a release callback and the SlateExtensionsBase there encodes into
-# a buffer; otherwise each frame gets a new buffer as before.
+# Buffers binary frames are encoded into before they go on the emit channel.
 const _FRAME_POOL = FramePool(4)
-const _FRAME_POOL_MIN_BYTES = 1 << 20
-const _POOLED_FRAMES = Ref{Union{Nothing,Bool}}(nothing)
-function _pooled_frames()
-    r = _POOLED_FRAMES[]
-    r === nothing || return r
-    return _POOLED_FRAMES[] =
-        hasmethod(KaimonGate._publish_stream_raw, Tuple{String,Vector{UInt8}}, (:release,)) &&
-        isdefined(SlateExtensionsBase, :encode_binary_frame!)
-end
-
-function _emit_binary(channel::String, value::SlateExtensionsBase.SlateBinary)
-    if sizeof(value.data) >= _FRAME_POOL_MIN_BYTES && _pooled_frames()
-        buf = SlateExtensionsBase.encode_binary_frame!(take_buffer!(_FRAME_POOL), channel, value)
-        KaimonGate._publish_stream_raw("slate_emit_bin", buf; release = b -> give_buffer!(_FRAME_POOL, b))
-    else
-        KaimonGate._publish_stream_raw("slate_emit_bin", SlateExtensionsBase.encode_binary_frame(channel, value))
-    end
-    return nothing
-end
 
 include(joinpath(@__DIR__, "emitchannel.jl")) # EmitServer — `slate_emit` on a socket pair of its own
 
@@ -174,7 +151,10 @@ function _slate_emit(channel::String, value)
                                                        _emit_json_channel(s, channel, value)
         r === :detached || return nothing
     end
-    value isa SlateExtensionsBase.SlateBinary && return _emit_binary(channel, value)
+    if value isa SlateExtensionsBase.SlateBinary
+        KaimonGate._publish_stream_raw("slate_emit_bin", SlateExtensionsBase.encode_binary_frame(channel, value))
+        return nothing
+    end
     KaimonGate._publish_stream("slate_emit",
         channel * "\x1f" * Base64.base64encode(Serialization.serialize, value))
     return nothing
