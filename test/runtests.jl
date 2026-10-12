@@ -84,6 +84,7 @@ module Files;     include("test_files.jl");     end
 module Config;    include("test_config.jl");    end
 module WscallBinary; include("test_wscall_binary.jl"); end
 module FramePoolT; include("test_framepool.jl"); end
+module EmitChannelT; include("test_emitchannel.jl"); end
 module WsOrder;   include("test_ws_order.jl");   end
 module BindObs;   include("test_bind_observable.jl"); end
 module RecordDisplay; include("test_record_display.jl"); end
@@ -97,7 +98,7 @@ const _TESTMODS = (Defname, Prepare, Demux, Termcook, SharedInc, Parsched, Memos
                    Engine, Eval, Deps, Envprep, Gateauth, SshTransportT, Tools, Registry, Toolcell, Web,
                    Bind, ReactiveState, Render, LiveOutput, Tables, Trace, Complete, RunRecord, History, SlateApi,
                    Agentops, Repro, Slides, Debugger, Profiler, Specialist, Findings, ToolDocs, AppRender,
-                   Frontmatter, Export, Bootfail, Publishing, App, AppMode, Workbook, Extensions, CatalogT, AssetsSyntax, Files, Config, WscallBinary, FramePoolT, WsOrder, BindObs, RecordDisplay)
+                   Frontmatter, Export, Bootfail, Publishing, App, AppMode, Workbook, Extensions, CatalogT, AssetsSyntax, Files, Config, WscallBinary, FramePoolT, EmitChannelT, WsOrder, BindObs, RecordDisplay)
 
 # ARGS carries the optional ReTest pattern (forwarded by run_tests / Pkg.test); empty → run all.
 # ReTest matches a plain String LITERALLY (regex metacharacters escaped), so "deps|eval" would match
