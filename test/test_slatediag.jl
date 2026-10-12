@@ -92,4 +92,25 @@ const SD = KaimonSlate.SlateDiag
         SD.diag_gauge!("t_gone", () -> error("renamed"))
         @test occursin("t_gone=err", SD.diag_log_line(every = 0.0))
     end
+
+    @testset "a few large allocations are found among many small ones" begin
+        # Many small allocations and a few large ones, from one known function each. Ranked by count
+        # the large site can fall off the list; ranked by bytes over a size floor it is the answer.
+        big_alloc() = (x = Vector{UInt8}(undef, 4 * 2^20); x[1] = 0x01; x)
+        small_alloc() = [i for i in 1:4]
+        stop = Threads.Atomic{Bool}(false)
+        t = Threads.@spawn while !stop[]
+            for _ in 1:2000; small_alloc(); end
+            big_alloc(); sleep(0.01)
+        end
+        r = try
+            SD.alloc_sites(seconds = 1.0, rate = 1.0, by = :bytes, min_bytes = 2^20, depth = 2, limit = 5)
+        finally
+            stop[] = true; wait(t)
+        end
+        @test r["kept"] > 0 && !isempty(r["top"])
+        top = first(r["top"])
+        @test top["bytes"] >= 4 * 2^20 && occursin("big_alloc", top["site"])
+        @test all(s -> s["bytes"] >= 2^20, r["top"])
+    end
 end

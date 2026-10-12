@@ -2010,8 +2010,12 @@ function _make_router(h::Hub)
     HTTP.register!(router, "GET", "/api/_diag/allocs", req -> begin
         q = HTTP.queryparams(HTTP.URI(req.target))
         _json(SlateDiag.alloc_sites(
-            seconds = something(tryparse(Float64, get(q, "seconds", "5")), 5.0),
-            rate    = something(tryparse(Float64, get(q, "rate", "0.0005")), 0.0005)))
+            seconds   = something(tryparse(Float64, get(q, "seconds", "5")), 5.0),
+            rate      = something(tryparse(Float64, get(q, "rate", "0.0005")), 0.0005),
+            limit     = something(tryparse(Int, get(q, "limit", "25")), 25),
+            by        = get(q, "by", "count") == "bytes" ? :bytes : :count,
+            min_bytes = something(tryparse(Int, get(q, "min_bytes", "0")), 0),
+            depth     = clamp(something(tryparse(Int, get(q, "depth", "1")), 1), 1, 12)))
     end)
     # Manually reap a specific remote worker (kill process + remove its manifest). Body {host, port}.
     # Never automatic — the user decides, so a worker with useful results is never killed out from under them.

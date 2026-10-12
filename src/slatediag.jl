@@ -163,7 +163,7 @@ end
 
 # ── allocation attribution ────────────────────────────────────────────────────────────────────────
 """
-    alloc_sites(; seconds = 5.0, rate = 0.0005, limit = 25)
+    alloc_sites(; seconds = 5.0, rate = 0.0005, limit = 25, by = :count, min_bytes = 0)
 
 Where allocations come from, by source line. The only way to find a hot idle loop: a process doing
 nothing should not allocate, and when it does the cost shows up on the GC threads rather than
@@ -172,22 +172,30 @@ anywhere that looks busy.
 `rate` is a sampling FRACTION — keep it small on a hot process. Each sample is attributed to the
 innermost frame outside Julia's own trees: the useful answer is which of OUR loops runs hot, and
 stopping at the innermost frame overall answers every such question with `readline`.
+
+`by = :bytes` ranks sites by the bytes they allocated rather than how often, and `min_bytes` counts
+only allocations at least that large. Together they find a few large allocations a second among
+many small ones, which a ranking by count never shows.
 """
-function alloc_sites(; seconds::Real = 5.0, rate::Real = 0.0005, limit::Integer = 25)
+function alloc_sites(; seconds::Real = 5.0, rate::Real = 0.0005, limit::Integer = 25,
+                     by::Symbol = :count, min_bytes::Integer = 0, depth::Integer = 1)
     secs = clamp(Float64(seconds), 0.5, 60.0)
     r = clamp(Float64(rate), 1e-6, 1.0)
     Profile.Allocs.clear()
     Profile.Allocs.@profile sample_rate = r sleep(secs)
     res = Profile.Allocs.fetch()
     tally = Dict{String,Tuple{Int,Int}}()
+    kept = 0
     for a in res.allocs
-        site = _first_own_frame(a.stacktrace)
+        a.size >= min_bytes || continue
+        kept += 1
+        site = _own_frames(a.stacktrace, depth)
         n, b = get(tally, site, (0, 0))
         tally[site] = (n + 1, b + a.size)
     end
-    top = sort!(collect(tally); by = kv -> -kv[2][1])
+    top = sort!(collect(tally); by = kv -> by === :bytes ? -kv[2][2] : -kv[2][1])
     return Dict{String,Any}(
-        "seconds" => secs, "rate" => r, "sampled" => length(res.allocs),
+        "seconds" => secs, "rate" => r, "sampled" => length(res.allocs), "kept" => kept,
         "per_second" => round(Int, length(res.allocs) / r / secs),
         "top" => [Dict("site" => k, "count" => v[1], "bytes" => v[2])
                   for (k, v) in top[1:min(end, Int(limit))]])
@@ -209,6 +217,19 @@ end
 # is excluded by root instead.
 _is_own_file(f::AbstractString) =
     endswith(f, ".jl") && isabspath(f) && !any(r -> startswith(f, r), _jl_roots())
+
+# The innermost `depth` frames belonging to code we ship or depend on, innermost first, joined with
+# " < ": the site, then who called it.
+function _own_frames(st, depth::Integer)
+    depth <= 1 && return _first_own_frame(st)
+    fs = String[]
+    for fr in st
+        _is_own_file(String(fr.file)) || continue
+        push!(fs, string(basename(String(fr.file)), ":", fr.line, " ", fr.func))
+        length(fs) >= depth && break
+    end
+    return isempty(fs) ? _first_own_frame(st) : join(fs, " < ")
+end
 
 # The innermost frame belonging to code we ship or depend on. `readline` allocating says nothing;
 # the loop calling it in a cycle is the answer.
