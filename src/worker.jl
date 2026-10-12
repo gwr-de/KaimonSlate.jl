@@ -117,19 +117,23 @@ include(joinpath(@__DIR__, "prepare.jl"))   # PrepareTracker — classify precom
 include(joinpath(@__DIR__, "framepool.jl")) # FramePool — reused buffers for large binary stream frames
 
 # Large binary frames are encoded into a pooled buffer, which the gate's broadcaster hands back once it
-# has sent it. Frames under the threshold are cheap to allocate, and a KaimonGate without the release
-# callback gets a new buffer per frame as before.
+# has sent it. Frames under the threshold are cheap to allocate. Both packages involved are whatever
+# versions the notebook's environment resolved, not the ones this file ships with, so the pool is used
+# only when the KaimonGate there takes a release callback and the SlateExtensionsBase there encodes into
+# a buffer; otherwise each frame gets a new buffer as before.
 const _FRAME_POOL = FramePool(4)
 const _FRAME_POOL_MIN_BYTES = 1 << 20
-const _GATE_RELEASES = Ref{Union{Nothing,Bool}}(nothing)
-function _gate_releases()
-    r = _GATE_RELEASES[]
+const _POOLED_FRAMES = Ref{Union{Nothing,Bool}}(nothing)
+function _pooled_frames()
+    r = _POOLED_FRAMES[]
     r === nothing || return r
-    return _GATE_RELEASES[] = hasmethod(KaimonGate._publish_stream_raw, Tuple{String,Vector{UInt8}}, (:release,))
+    return _POOLED_FRAMES[] =
+        hasmethod(KaimonGate._publish_stream_raw, Tuple{String,Vector{UInt8}}, (:release,)) &&
+        isdefined(SlateExtensionsBase, :encode_binary_frame!)
 end
 
 function _emit_binary(channel::String, value::SlateExtensionsBase.SlateBinary)
-    if sizeof(value.data) >= _FRAME_POOL_MIN_BYTES && _gate_releases()
+    if sizeof(value.data) >= _FRAME_POOL_MIN_BYTES && _pooled_frames()
         buf = SlateExtensionsBase.encode_binary_frame!(take_buffer!(_FRAME_POOL), channel, value)
         KaimonGate._publish_stream_raw("slate_emit_bin", buf; release = b -> give_buffer!(_FRAME_POOL, b))
     else
