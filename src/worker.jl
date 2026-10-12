@@ -1961,9 +1961,10 @@ function __slate_project_deps()
     return out
 end
 
-"Read a project's direct deps as `[{name, version, uuid}]`. Versions come from whichever manifest
-resolves that project when present (best-effort), so this works for a project that isn't the
-active one (e.g. the parent). Returns `[]` on any failure."
+"Read a project's direct deps as `[{name, version, uuid, source, origin}]`, in the shape
+`__slate_project_deps` gives. Versions and sources come from whichever manifest resolves that project
+when present (best-effort), so this works for a project that isn't the active one (e.g. the parent).
+Returns `[]` on any failure."
 function _project_deps_at(projdir::AbstractString)
     out = Dict{String,Any}[]
     try
@@ -1971,21 +1972,32 @@ function _project_deps_at(projdir::AbstractString)
         isempty(pf) && return out
         proj = Pkg.TOML.parsefile(pf)
         deps = get(proj, "deps", Dict{String,Any}())
-        # versions: parse the Manifest that RESOLVES this project if present (format differs across
-        # Julia, but each dep entry is a 1-elt array of tables carrying `version`). For a workspace
-        # member that manifest is the shared one at the workspace root, not a sibling file.
-        vers = Dict{String,String}()
+        # Parse the Manifest that RESOLVES this project if present (format differs across Julia, but
+        # each dep entry is a 1-elt array of tables). For a workspace member that manifest is the shared
+        # one at the workspace root, not a sibling file. An entry with a `path` is a dev'd checkout
+        # (relative to the manifest), one with a `repo-url` was added from git.
+        ents = Dict{String,Any}()
         mf = parent_manifest(projdir)
         if !isempty(mf)
             man = Pkg.TOML.parsefile(mf)
             mdeps = get(man, "deps", man)               # Julia ≥1.7 nests under "deps"
             for (nm, entries) in mdeps
-                entries isa AbstractVector && !isempty(entries) && haskey(entries[1], "version") &&
-                    (vers[nm] = string(entries[1]["version"]))
+                entries isa AbstractVector && !isempty(entries) && entries[1] isa AbstractDict &&
+                    (ents[nm] = entries[1])
             end
         end
         for (name, uuid) in deps
-            push!(out, Dict{String,Any}("name" => name, "version" => get(vers, name, ""), "uuid" => string(uuid)))
+            e = get(ents, name, Dict{String,Any}())
+            source, origin = if haskey(e, "path")
+                ("path", normpath(joinpath(dirname(mf), String(e["path"]))))
+            elseif haskey(e, "repo-url")
+                url = String(e["repo-url"]); rev = String(get(e, "repo-rev", ""))
+                ("git", isempty(rev) ? url : url * "#" * rev)
+            else
+                ("registry", "")
+            end
+            push!(out, Dict{String,Any}("name" => name, "version" => string(get(e, "version", "")),
+                                        "uuid" => string(uuid), "source" => source, "origin" => origin))
         end
     catch
     end
