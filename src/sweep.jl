@@ -2547,6 +2547,9 @@ function _read_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
             # write, and the file is never changed.
             out = open(io -> Mmap.mmap(io, Vector{T}, n; shared = false, grow = false),
                        _fetch_runs(p, runs), "r+")
+            # Faulted in a page at a time, a first pass over the selection reads the disk an order of
+            # magnitude slower than reading ahead does. Ask the kernel to load it all, in the background.
+            Sys.isunix() && (m = out; Threads.@spawn (try; Mmap.madvise!(m, Mmap.MADV_WILLNEED); catch; end))
         end
     catch e
         e isa InterruptException && rethrow()
