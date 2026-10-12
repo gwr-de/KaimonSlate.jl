@@ -1046,6 +1046,26 @@ const MS = RE.MemoStore
             finally
                 RE.Sweep.STREAM_MIN_BYTES[], RE.Sweep.BULK_BYTES[], RE.Sweep.CHUNK_BYTES[], RE.Sweep.CACHE_PAGE[] = olds
             end
+            # Each fetch is in the shared transfer log, with the bytes it landed.
+            lg = RE.Sweep.transfer_log(; blob = q.index["blob"])
+            @test !isempty(lg) && all(e -> e.bytes > 0 && e.outcome == "done", lg)
+            @test RE.Sweep.transfer_rate("nohost") === nothing
+            # Readers wanting overlapping bytes at once each get their selection, and between them
+            # they fetch the blob about once: a chunk another reader has claimed is waited for.
+            forget()
+            olds2 = (RE.Sweep.STREAM_MIN_BYTES[], RE.Sweep.BULK_BYTES[], RE.Sweep.CHUNK_BYTES[], RE.Sweep.CACHE_PAGE[])
+            try
+                RE.Sweep.STREAM_MIN_BYTES[] = 1; RE.Sweep.BULK_BYTES[] = 1; RE.Sweep.CHUNK_BYTES[] = 32
+                RE.Sweep.CACHE_PAGE[] = 16
+                n0 = length(RE.Sweep.transfer_log(; blob = q.index["blob"]))
+                ts = [Threads.@spawn(q[:, :, k:5]) for k in (1, 2, 3, 1)]
+                @test all(fetch(t) == A[:, :, k:5] for (t, k) in zip(ts, (1, 2, 3, 1)))
+                landed = sum(e.bytes for e in RE.Sweep.transfer_log(; blob = q.index["blob"])[1:end-n0]; init = 0)
+                @test 60 * 8 <= landed < 2 * 60 * 8
+                @test isempty(RE.Sweep.in_flight(q.index["blob"]))
+            finally
+                RE.Sweep.STREAM_MIN_BYTES[], RE.Sweep.BULK_BYTES[], RE.Sweep.CHUNK_BYTES[], RE.Sweep.CACHE_PAGE[] = olds2
+            end
             # Byte spans: what is missing from what is held.
             @test RE.Sweep._subtract([(0, 10), (20, 30)], [(5, 25)]) == [(0, 5), (25, 30)]
             @test RE.Sweep._subtract([(0, 10)], Tuple{Int,Int}[]) == [(0, 10)]

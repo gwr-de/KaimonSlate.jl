@@ -2609,7 +2609,12 @@ function _await_fetch(f, landed, cancel, total::Integer, label::AbstractString; 
             end
         end
     catch e
-        e isa InterruptException && (try; cancel(); catch; end)
+        if e isa InterruptException
+            # Stopped: the streams are told to stop, and this returns once they have, so whatever the
+            # caller cleans up afterwards is no longer being written.
+            try; cancel(); catch; end
+            try; wait(t); catch; end
+        end
         rethrow()
     finally
         shown && (try; h.progress(1.0, "", true); catch; end)

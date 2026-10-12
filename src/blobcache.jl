@@ -10,8 +10,8 @@
 
 import FileWatching
 
-"Where the cache keeps its blobs: `<cache home>/blobs`."
-blob_cache_dir() = joinpath(SlateHome.cache_home(), "blobs")
+"Where the cache keeps its blobs: `<cache home>/remote-blobs`."
+blob_cache_dir() = joinpath(SlateHome.cache_home(), "remote-blobs")
 _cache_file(blob) = joinpath(blob_cache_dir(), String(blob))
 _have_file(blob) = _cache_file(blob) * ".have"
 _pin_file(blob) = _cache_file(blob) * ".pin"
@@ -132,15 +132,43 @@ function _scatter!(blob, piece, group)
 end
 
 # ── Fetching ─────────────────────────────────────────────────────────────────────────────────
-# Fetches in flight in this process, per blob, so two readers wanting the same bytes fetch them once:
-# the second waits for the first rather than starting its own.
+# The chunks being fetched in this process, per blob. A fetch claims a chunk only as it starts it, so a
+# reader wanting bytes another fetch has planned but not reached fetches them itself, and the other
+# skips them when it gets there. A reader whose bytes are in a chunk already in flight waits for that
+# chunk alone.
 struct _Inflight
     lo::Int
     hi::Int
-    done::Base.Event
+    owner::UInt64
 end
 const _INFLIGHT = Dict{String,Vector{_Inflight}}()
 const _INFLIGHT_LOCK = ReentrantLock()
+
+# Claim the spans of one chunk for `owner`, unless all of it is already here or any of it is in flight.
+function _claim!(blob::String, spans, owner::UInt64)
+    lock(_INFLIGHT_LOCK) do
+        need = _subtract(_merge_spans(spans), cached_spans(blob))
+        isempty(need) && return false
+        fl = get!(() -> _Inflight[], _INFLIGHT, blob)
+        any(x -> any(s -> s[1] < x.hi && x.lo < s[2], need), fl) && return false
+        for (lo, hi) in need; push!(fl, _Inflight(lo, hi, owner)); end
+        return true
+    end
+end
+
+function _release!(blob::String, owner::UInt64)
+    lock(_INFLIGHT_LOCK) do
+        fl = get(_INFLIGHT, blob, nothing)
+        fl === nothing && return
+        filter!(x -> x.owner != owner, fl)
+        isempty(fl) && delete!(_INFLIGHT, blob)
+    end
+end
+
+_in_flight(blob::String, need) = lock(_INFLIGHT_LOCK) do
+    fl = get(_INFLIGHT, blob, _Inflight[])
+    any(x -> any(s -> s[1] < x.hi && x.lo < s[2], need), fl)
+end
 
 "Bytes fetched since the cache was last trimmed. A trim is due past an eighth of the cap."
 const _BLOB_FETCHED = Ref{Int}(0)
@@ -151,43 +179,28 @@ const _BLOB_FETCHED = Ref{Int}(0)
 Make the byte ranges `spans` (`(offset, length)` pairs) of `blob` present in the cache, fetching only
 what it lacks, and return the cache file's path. `limit` is the blob's size, which the page rounding
 must not pass. `hooks` is `(; progress(frac, msg, done), checkpoint())`: `checkpoint` throwing an
-`InterruptException` stops the fetch, and what had already landed is kept.
+`InterruptException` stops the fetch, or the wait for bytes another fetch has in flight, and what had
+already landed is kept.
 """
 function cache_fetch!(src::SshSource, blob::AbstractString, spans;
                       limit::Integer, label::AbstractString = "", hooks = READ_HOOKS[])
     blob = String(blob)
     mkpath(blob_cache_dir())
     want = _merge_spans([(o, o + l) for (o, l) in spans])
-    for _ in 1:3
-        mine = Tuple{Int,Int}[]
-        waits = Base.Event[]
-        ev = Base.Event()
-        lock(_INFLIGHT_LOCK) do
+    total = _span_bytes(want)
+    for _ in 1:4
+        need = _subtract(want, cached_spans(blob))
+        isempty(need) && return _cache_file(blob)
+        _fetch_spans!(src, blob, _subtract(_page_spans(need, limit), cached_spans(blob)); label, hooks)
+        # What another fetch had in flight is waited for here, a chunk at a time.
+        while true
             need = _subtract(want, cached_spans(blob))
-            isempty(need) && return
-            fl = get!(() -> _Inflight[], _INFLIGHT, blob)
-            busy = _merge_spans([(x.lo, x.hi) for x in fl])
-            for x in fl
-                any(s -> s[1] < x.hi && x.lo < s[2], need) && push!(waits, x.done)
-            end
-            mine = _subtract(_subtract(_page_spans(_subtract(need, busy), limit), busy), cached_spans(blob))
-            for (lo, hi) in mine; push!(fl, _Inflight(lo, hi, ev)); end
+            (isempty(need) || !_in_flight(blob, need)) && break
+            hooks === nothing || hooks.checkpoint()
+            hooks === nothing || hooks.progress(1 - _span_bytes(need) / total,
+                                                "waiting for $(label): $(_bytes(_span_bytes(need))) in flight", false)
+            sleep(0.1)
         end
-        if !isempty(mine)
-            try
-                _fetch_spans!(src, blob, mine; label, hooks)
-            finally
-                lock(_INFLIGHT_LOCK) do
-                    fl = get(_INFLIGHT, blob, _Inflight[])
-                    filter!(x -> x.done !== ev, fl)
-                    isempty(fl) && delete!(_INFLIGHT, blob)
-                end
-                notify(ev)
-            end
-        end
-        foreach(wait, waits)
-        isempty(_subtract(want, cached_spans(blob))) && return _cache_file(blob)
-        isempty(mine) && isempty(waits) && break
     end
     missing_ = _span_bytes(_subtract(want, cached_spans(blob)))
     missing_ == 0 && return _cache_file(blob)
@@ -195,10 +208,12 @@ function cache_fetch!(src::SshSource, blob::AbstractString, spans;
 end
 
 # Fetch the merged byte spans `spans` of `blob` into the cache. Large reads are cut into chunks taken by
-# several connections; each chunk is written into the blob's file as soon as it lands, so a stopped or
-# failed read keeps what it got, and other readers see it at once.
+# several connections; each chunk is claimed as it starts, skipped when it is already here or another
+# fetch has it, and written into the blob's file as soon as it lands, so a stopped or failed read keeps
+# what it got and other readers see it at once.
 function _fetch_spans!(src::SshSource, blob::String, spans::Vector{Tuple{Int,Int}};
                        label::AbstractString = "", hooks = READ_HOOKS[])
+    isempty(spans) && return
     total = _span_bytes(spans)
     nchunks = total >= STREAM_MIN_BYTES[] ? max(FETCH_STREAMS[], cld(total, CHUNK_BYTES[])) : 1
     groups = _split_spans([(lo, hi - lo) for (lo, hi) in spans], nchunks)
@@ -208,9 +223,12 @@ function _fetch_spans!(src::SshSource, blob::String, spans::Vector{Tuple{Int,Int
     parts = [pc * ".part" for pc in pieces]
     script = ranges_command(src.root, blob)
     input(g) = Vector{UInt8}(join((string(o, ' ', l, '\n') for (o, l) in g)))
+    owners = [rand(UInt64) for _ in groups]
+    span_of(g) = [(o, o + l) for (o, l) in g]
     committed = falses(length(groups))
     kept = Threads.Atomic{Int}(0)
     clock = ReentrantLock()
+    claim(i) = _claim!(blob, span_of(groups[i]), owners[i])
     function commit(i)
         lock(clock) do
             committed[i] && return
@@ -222,27 +240,36 @@ function _fetch_spans!(src::SshSource, blob::String, spans::Vector{Tuple{Int,Int
             end
             rm(pc; force = true)
         end
+        _release!(blob, owners[i])
     end
     landed() = kept[] + sum((isfile(pt) ? Int(filesize(pt)) : isfile(pc) ? Int(filesize(pc)) : 0
                              for (i, (pt, pc)) in enumerate(zip(parts, pieces)) if !committed[i]); init = 0)
+    t0 = time()
+    outcome = "failed"
     results = try
         _await_fetch(landed, () -> foreach(pt -> (try; cancel_fetch!(pt); catch; end), parts),
                      total, label; hooks) do
             if total < BULK_BYTES[]        # small: one read on the host's session, no new connection
+                claim(1) || return [(true, 0, "")]
                 [fetch_to(src.host, script, pieces[1]; input = input(groups[1]), part = parts[1],
                           name = label, total)]
             else
                 fetch_many(src.host, script, [(input(g), pieces[i], parts[i]) for (i, g) in enumerate(groups)];
                            streams = length(groups) > 1 ? FETCH_STREAMS[] : 1, name = label, total,
-                           on_job = commit)
+                           before_job = claim, on_job = commit)
             end
         end
+    catch e
+        e isa InterruptException && (outcome = "stopped")
+        rethrow()
     finally
         # What landed is kept whether the rest succeeded, failed or was stopped.
         for i in eachindex(groups)
             try; commit(i); catch; end
             rm(parts[i]; force = true); rm(pieces[i]; force = true)
         end
+        all(committed) && (outcome = "done")
+        kept[] > 0 && _log_transfer(t0, time() - t0, src.host, blob, kept[], label, outcome)
     end
     _BLOB_FETCHED[] += kept[]
     if _BLOB_FETCHED[] > blob_cap() ÷ 8
@@ -253,6 +280,69 @@ function _fetch_spans!(src::SshSource, blob::String, spans::Vector{Tuple{Int,Int
     ok || error("reading $(_bytes(total)) of $(label) from $(src.host) failed: " *
                 something((r[3] for r in results if !r[1]), "failed"))
     return
+end
+
+# ── The transfer log ─────────────────────────────────────────────────────────────────────────
+# One line per fetch that landed bytes, kept beside the blobs so every program reading through this
+# cache, notebooks included, writes and reads the same history: when, how long, from where, which
+# blob, how many bytes, for what, and whether it finished.
+
+_transfer_log_file() = joinpath(blob_cache_dir(), "transfers.log")
+
+function _log_transfer(t0, seconds, host, blob, bytes, label, outcome)
+    line = join((round(t0; digits = 3), round(seconds; digits = 3), host, blob, bytes,
+                 replace(String(label), r"[\t\n]" => " "), outcome), '\t') * '\n'
+    try
+        open(io -> write(io, line), _transfer_log_file(); append = true)
+    catch
+    end
+    return
+end
+
+"""
+    transfer_log(; blob = nothing, host = nothing, n = 1000) -> Vector{NamedTuple}
+
+The fetches that landed bytes in this machine's blob cache, newest first:
+`(; at, seconds, host, blob, bytes, label, outcome)`, where `outcome` is "done", "stopped" or "failed".
+"""
+function transfer_log(; blob = nothing, host = nothing, n::Integer = 1000)
+    f = _transfer_log_file()
+    T = NamedTuple{(:at, :seconds, :host, :blob, :bytes, :label, :outcome),
+                   Tuple{Float64,Float64,String,String,Int,String,String}}
+    out = T[]
+    isfile(f) || return out
+    for l in Iterators.reverse(readlines(f))
+        a = split(l, '\t')
+        length(a) == 7 || continue
+        at, sec, b = tryparse(Float64, a[1]), tryparse(Float64, a[2]), tryparse(Int, a[5])
+        (at === nothing || sec === nothing || b === nothing) && continue
+        blob === nothing || a[4] == blob || continue
+        host === nothing || a[3] == host || continue
+        push!(out, T((at, sec, String(a[3]), String(a[4]), b, String(a[6]), String(a[7]))))
+        length(out) >= n && break
+    end
+    return out
+end
+
+"""
+    transfer_rate(host; n = 20) -> Union{Float64,Nothing}
+
+Bytes per second recently achieved fetching from `host`: the bytes over the seconds of its last `n`
+fetches of at least a megabyte, or `nothing` with no history to go on.
+"""
+function transfer_rate(host::AbstractString; n::Integer = 20)
+    b = 0; s = 0.0; k = 0
+    for e in transfer_log(; host = String(host), n = 10n)
+        e.bytes >= 1 << 20 && e.seconds > 0 || continue
+        b += e.bytes; s += e.seconds; k += 1
+        k >= n && break
+    end
+    return s > 0 ? b / s : nothing
+end
+
+"The byte ranges of `blob` this process is fetching right now."
+in_flight(blob::AbstractString) = lock(_INFLIGHT_LOCK) do
+    _merge_spans([(x.lo, x.hi) for x in get(_INFLIGHT, String(blob), _Inflight[])])
 end
 
 # ── Keeping and evicting ─────────────────────────────────────────────────────────────────────

@@ -429,7 +429,8 @@ end
 const FETCH_RETRIES = Ref(3)
 
 """
-    fetch_many(host, script, jobs; streams = 4, name = "", total = -1, on_bytes = nothing, on_job = nothing) -> Vector{(ok, bytes, why)}
+    fetch_many(host, script, jobs; streams = 4, name = "", total = -1, on_bytes = nothing,
+               before_job = nothing, on_job = nothing) -> Vector{(ok, bytes, why)}
 
 `fetch_to` for a list of jobs, each `(input, dest, part)`: `script` runs once per job with the job's
 stdin, writing the job's file. `streams` workers each open one connection (`SshTransport._with_bulk`)
@@ -438,11 +439,12 @@ work rather than holding up the rest. A job that fails goes back on the queue, u
 times, and a worker whose connection has closed opens another. A worker that cannot sign in by key uses
 the host's session. In a worker process the hub runs it. `on_bytes(n)` gets the running total over all
 jobs, counting only the bytes of jobs that completed or are in flight. `on_job(i)` is called as job `i`
-completes, on the stream that ran it; in a worker, where the hub runs the jobs, it is not called.
+completes, on the stream that ran it, and `before_job(i)` as it is about to start: `false` skips the job,
+which then counts as done with no bytes. In a worker, where the hub runs the jobs, neither is called.
 """
 function fetch_many(host::AbstractString, script::AbstractString, jobs::AbstractVector;
                     streams::Integer = 4, name::AbstractString = "", total::Integer = -1,
-                    on_bytes = nothing, on_job = nothing, timeout::Real = 3600.0)
+                    on_bytes = nothing, before_job = nothing, on_job = nothing, timeout::Real = 3600.0)
     if !isempty(host) && has_delegate()
         r = _via(() -> nothing, :fetch_many, (; host = String(host), script = String(script),
                                               jobs = collect(jobs), streams = Int(streams),
@@ -461,6 +463,10 @@ function fetch_many(host::AbstractString, script::AbstractString, jobs::Abstract
     # Run job `i`; a failure that was not a stop puts it back for another try, its bytes uncounted.
     function run!(i, runner)
         j = jobs[i]
+        if before_job !== nothing && !(try; before_job(i); catch; true; end)
+            results[i] = (true, 0, "")
+            return true
+        end
         got = Threads.Atomic{Int}(0)
         each = count === nothing ? (n -> Threads.atomic_add!(got, n)) : (n -> (Threads.atomic_add!(got, n); count(n)))
         r = _fetch_job(runner, h, sc, j[1], String(j[2]), String(j[3]), each, timeout)
