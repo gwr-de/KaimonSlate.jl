@@ -1589,23 +1589,43 @@ function _worker_provenance(k)
     return d
 end
 
-# The cells payload for a NON-live state (inactive/hydrating): the embedded frozen render if present
-# (already `cell_json`-shaped), else the parsed cells rendered un-run.
+# What a cell is, says and is doing: always taken from the live cell, even where the page shows a
+# stored output for it, so the notebook's structure and code are the current ones whatever is shown.
+const _LIVE_CELL_KEYS = ("id", "kind", "source", "hash", "state", "deps", "defs", "tags", "web",
+                         "codeHidden", "collapsed", "slide", "needs", "declares", "opaque",
+                         "blocked", "blockedHost", "blockedAt")
+
+# The cells payload while a notebook boots or is inactive (`hydrating`/`inactive`): the live cells, and
+# for each that has no output from this session yet, its output from the stored render
+# (`meta["preview"]`, already `cell_json`-shaped). A cell whose code changed since that render is
+# marked `previewStale`. Cells added since have no stored output; cells removed since are not shown.
 function _static_cells(nb::LiveNotebook)
-    if haskey(nb.report.meta, "preview")
+    live = _render_cells(nb; live_placeholder = true)
+    p = get(nb.report.meta, "preview", nothing)
+    p isa AbstractVector || return live
+    stored = Dict{String,Any}(String(get(e, "id", "")) => e for e in p if e isa AbstractDict)
+    ran = Set{String}(c.id for c in nb.report.cells if c.output !== nothing)
+    out = Vector{Any}(undef, length(live))
+    for (i, d) in enumerate(live)
+        e = get(stored, d["id"], nothing)
+        if e === nothing || d["id"] in ran
+            out[i] = d
+            continue
+        end
+        m = Dict{String,Any}(String(k) => v for (k, v) in e)
+        for (k, v) in d
+            (k in _LIVE_CELL_KEYS || !haskey(m, k)) && (m[k] = v)
+        end
         # A stored render keeps the `rev` values of the process that saved it. This process counts
         # from zero, and the browser ignores a payload whose `rev` is not above the last one it drew
-        # (`revIsNew` in view.js). A stored rev of 18 thus blocks the live outputs of this run up to
-        # rev 18, and the page keeps the stored output. Give each stored cell a rev below every live
-        # rev, so any live payload replaces it and a late stored payload does not replace a live one.
-        cells = nb.report.meta["preview"]
-        for e in cells
-            e isa AbstractDict && (e["rev"] = -1)
-        end
-        return cells
+        # (`revIsNew` in view.js), so a stored rev of 18 would block this run's live outputs up to
+        # rev 18. A rev below every live rev lets any live payload replace it.
+        m["rev"] = -1
+        m["preview"] = true
+        m["previewStale"] = String(get(e, "hash", "")) != d["hash"]
+        out[i] = m
     end
-    bindref, hostednames = _bind_index(nb.report)
-    return [cell_json(c, bindref, hostednames) for c in nb.report.cells]
+    return out
 end
 
 function state_json(nb::LiveNotebook)

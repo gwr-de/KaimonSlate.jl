@@ -95,8 +95,27 @@ const FIG_HTML = "<div class=\"some-renderer-card\"><canvas></canvas></div>"
         nb = _mknb(SRC)
         nb.report.meta["hydrating"] = true
         nb.report.meta["preview"] = Any[Dict{String,Any}("id" => "fig", "rev" => 18, "output" => "old")]
-        served = only(NS.state_json(nb)["cells"])
-        @test served["id"] == "fig" && served["output"] == "old"
+        served = Dict(c["id"] => c for c in NS.state_json(nb)["cells"])["fig"]
+        @test served["output"] == "old"
         @test served["rev"] < RE.parse_report(SRC).cells[1].rev
+    end
+
+    @testset "a booting notebook shows its live cells, with stored outputs only where none has run" begin
+        # The stored render is the previous session's. Cells renamed, added or edited since, here or
+        # while the notebook boots, are shown as they are now; only their outputs come from the render.
+        nb = _mknb("#%% code id=fig\nplot_it(2)\n\n#%% code id=added\n3\n\n#%% code id=plain\n1 + 1\n")
+        nb.report.meta["hydrating"] = true
+        nb.report.meta["preview"] = Any[
+            Dict{String,Any}("id" => "fig", "source" => "plot_it()", "hash" => "old", "output" => "old fig"),
+            Dict{String,Any}("id" => "gone", "source" => "removed()", "output" => "x"),
+            Dict{String,Any}("id" => "plain", "source" => "1 + 1", "output" => "stored 2",
+                             "hash" => NS.SlateHistory._sha("1 + 1"))]
+        nb.report.cells[3].output = _out("<p>live 2</p>"; live = false)    # ran in this session
+        cells = NS.state_json(nb)["cells"]
+        @test [c["id"] for c in cells] == ["fig", "added", "plain"]
+        fig, added, plain = cells
+        @test fig["source"] == "plot_it(2)" && fig["output"] == "old fig" && fig["previewStale"] === true
+        @test !get(added, "preview", false)
+        @test !get(plain, "preview", false) && occursin("live 2", plain["output"])
     end
 end
