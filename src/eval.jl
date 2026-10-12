@@ -156,10 +156,20 @@ end
 const _BIN_EMIT_REGISTRY = Dict{String,Any}()
 register_bin_emit!(report_id::AbstractString, cb) = _reg_set!(_BIN_EMIT_REGISTRY, report_id, cb)
 unregister_bin_emit!(report_id::AbstractString) = _reg_del!(_BIN_EMIT_REGISTRY, report_id)
-function _do_emit_bin(report_id::AbstractString, frame::Vector{UInt8})
+# `release`, when given, is called exactly once when `frame` is no longer needed: after the last page
+# has sent it, or at once when there is nowhere to send it.
+function _do_emit_bin(report_id::AbstractString, frame::Vector{UInt8}; release = nothing)
     cb = _reg_get(_BIN_EMIT_REGISTRY, report_id)
-    cb === nothing && return nothing
-    try; cb(frame); catch e; @debug "eval: bin emit callback failed" report_id exception = e; end
+    if cb === nothing
+        release === nothing || release()
+        return nothing
+    end
+    try
+        release === nothing ? cb(frame) : cb(frame; release)
+    catch e
+        @debug "eval: bin emit callback failed" report_id exception = e
+        release === nothing || release()
+    end
     return nothing
 end
 

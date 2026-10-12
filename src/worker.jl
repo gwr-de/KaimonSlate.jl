@@ -142,6 +142,65 @@ function _emit_binary(channel::String, value::SlateExtensionsBase.SlateBinary)
     return nothing
 end
 
+include(joinpath(@__DIR__, "emitchannel.jl")) # EmitServer — `slate_emit` on a socket pair of its own
+
+# The worker's emit channel (docs/_emit-channel.md): `slate_emit` traffic goes on it while the hub is
+# attached, and on the gate stream otherwise. Bound on loopback, on ports the system picks, admitting only
+# a client that presents the secret, which the hub learns over the gate (`__slate_ports`).
+const _EMIT = Ref{Union{Nothing,EmitServer}}(nothing)
+const _EMIT_SECRET = Ref("")
+
+# 16 bytes from the system's random source, as hex. Read directly: SlateWorker does not depend on Random.
+_emit_secret() = bytes2hex(Sys.iswindows() ? rand(UInt8, 16) : open(io -> read(io, 16), "/dev/urandom"))
+
+function _start_emit_channel!()
+    try
+        _EMIT_SECRET[] = _emit_secret()
+        _EMIT[] = emit_server!(KaimonGate.ZMQ, "tcp://127.0.0.1:*", "tcp://127.0.0.1:*"; secret = _EMIT_SECRET[])
+    catch e
+        @warn "slate worker: emit channel did not start; emits use the gate stream" exception = e
+        _EMIT[] = nothing
+    end
+    return nothing
+end
+
+# `slate_emit` from a notebook: the emit channel while the hub is attached to it, the gate stream
+# otherwise. A message the channel drops (no credit within its wait) is not resent the other way, so
+# the order of what does arrive is the order of the emits.
+function _slate_emit(channel::String, value)
+    s = _EMIT[]
+    if s !== nothing && emit_attached(s)
+        r = value isa SlateExtensionsBase.SlateBinary ? _emit_binary_channel(s, channel, value) :
+                                                       _emit_json_channel(s, channel, value)
+        r === :detached || return nothing
+    end
+    value isa SlateExtensionsBase.SlateBinary && return _emit_binary(channel, value)
+    KaimonGate._publish_stream("slate_emit",
+        channel * "\x1f" * Base64.base64encode(Serialization.serialize, value))
+    return nothing
+end
+
+# Encoded into a pooled buffer when the notebook's SlateExtensionsBase can; `emit_send!` returns once
+# libzmq has its own copy, so the buffer goes straight back.
+function _emit_binary_channel(s::EmitServer, channel::String, value::SlateExtensionsBase.SlateBinary)
+    if isdefined(SlateExtensionsBase, :encode_binary_frame!)
+        buf = SlateExtensionsBase.encode_binary_frame!(take_buffer!(_FRAME_POOL), channel, value)
+        try
+            return emit_send!(s, EMIT_KIND_BINARY, buf)
+        finally
+            give_buffer!(_FRAME_POOL, buf)
+        end
+    end
+    return emit_send!(s, EMIT_KIND_BINARY, SlateExtensionsBase.encode_binary_frame(channel, value))
+end
+
+function _emit_json_channel(s::EmitServer, channel::String, value)
+    io = IOBuffer()
+    write(io, channel, UInt8(0x1f))
+    Serialization.serialize(io, value)
+    return emit_send!(s, EMIT_KIND_JSON, take!(io))
+end
+
 # Per-notebook execution namespace (warm; reset by replacing the module). Built by the
 # SAME shared contract `_populate_notebook_ns!` as the in-process kernel, so the two
 # namespaces are identical; only `slate_refresh` differs — here it PUBs on the gate
@@ -169,11 +228,9 @@ function _new_ns(m::Module = Module(:NB))
         # channel+meta+dtype+shape+raw bytes) — published via `_publish_stream_raw` (multipart, NO
         # Serialization envelope: the frame moves by reference, copied only once at the wire) → forwarded as
         # a binary WS frame → a TypedArray in the browser. Any other value takes the string path
-        # (Serialization+base64; the hub deserializes + JSON-encodes it).
-        slate_emit = (channel, value) -> value isa SlateExtensionsBase.SlateBinary ?
-            _emit_binary(string(channel), value) :
-            KaimonGate._publish_stream("slate_emit",
-                string(channel) * "\x1f" * Base64.base64encode(Serialization.serialize, value)),
+        # (Serialization+base64; the hub deserializes + JSON-encodes it). While the hub is attached to the
+        # worker's emit channel, both kinds go there instead (`_slate_emit`).
+        slate_emit = (channel, value) -> _slate_emit(string(channel), value),
         # `set_bind(:name, value)` — the bind registry lives in the HUB, so this publishes and the
         # poller applies it (`_do_setbind`). Same `name\x1fb64` wire shape as `slate_emit`.
         set_bind = (name, value) -> KaimonGate._publish_stream("slate_setbind",
@@ -1295,7 +1352,11 @@ picks as a VERIFIED-FREE port (never `gate+2`) so a co-tenant holding `gate+2` o
 it. `blob = 0` until the (boot-deferred) blob server has bound. Never throws."
 function __slate_ports()
     _HUB_SEEN[] = true   # the hub asks this as soon as it has attached
-    return (; stream = _STREAM_PORT[], blob = _BLOB_DATA_PORT[])
+    e = _EMIT[]
+    return (; stream = _STREAM_PORT[], blob = _BLOB_DATA_PORT[],
+              emit = e === nothing ? "" : e.data_endpoint,
+              emit_credit = e === nothing ? "" : e.credit_endpoint,
+              emit_secret = e === nothing ? "" : _EMIT_SECRET[])
 end
 
 # Set when the hub first asks for the ports, which it does as soon as its handshake is through. The
@@ -3425,6 +3486,7 @@ function start(; host::String = "127.0.0.1", port::Int, stream_port::Int,
                data_port::Int = 0, warm_deps::Bool = false, stats_path::String = "",
                blob_curve::Bool = true, blob_bind::String = "", blob_free_port::Bool = false)
     _STREAM_PORT[] = stream_port   # publish for `__slate_ports` (hub-assigned today; the hub owns only the gate)
+    _start_emit_channel!()         # before the gate serves, so `__slate_ports` always reports it
     _reset_image_once_flags!()
     # Install the task-demux as stdout/stderr + a task-local capture display, so cell evaluators can
     # run CONCURRENTLY in this one process while each captures its own output (see demux.jl, capture.jl

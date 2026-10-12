@@ -1061,6 +1061,8 @@ include(joinpath(@__DIR__, "bind.jl"))
 include(joinpath(@__DIR__, "defname.jl"))       # def-name extractor + source-tree digest (envprep's `env_source_fingerprint` needs it)
 include(joinpath(@__DIR__, "envprep.jl"))       # shared notebook-env prep policy (seed/dev-path/staleness; engine + worker + remote)
 include(joinpath(@__DIR__, "clocktrack.jl"))    # ClockTrack — worker↔hub clock delta, tracked not synced
+include(joinpath(@__DIR__, "framepool.jl"))     # FramePool — reused buffers for received emit frames
+include(joinpath(@__DIR__, "emitchannel.jl"))   # EmitClient — a worker's `slate_emit` on a socket pair of its own
 include(joinpath(@__DIR__, "gate_kernel.jl"))   # GateKernel (used when Main.Kaimon present)
 include(joinpath(@__DIR__, "remote.jl"))        # RunTarget + remote worker (provision/sync/CURVE); uses gate_kernel helpers
 include(joinpath(@__DIR__, "region_prepare.jl"))  # preparing a region: site setup + node check, kept in Region.readiness

@@ -1218,7 +1218,83 @@ end
 # Kill a worker process (SIGTERM, then SIGKILL if it ignores it — e.g. wedged in precompile),
 # drop its routing entry, and clear conn/proc. Killing the process EOFs its stdout pipe, which
 # ends the log-pump task (no leak). Shared by respawn (prepare!) and shutdown!.
+# ── The emit channel (docs/_emit-channel.md) ──────────────────────────────────────────────────────────
+# A local worker's `slate_emit` traffic, received on a socket pair of its own rather than the gate
+# stream: one task per worker, off the shared poller. Keyed by the worker's connection name, as
+# `_GATE_SESSION` is, so a message goes to whichever notebook the worker serves now.
+const _EMIT_CLIENTS = Dict{String,Any}()
+const _EMIT_CLIENTS_LOCK = ReentrantLock()
+const _HUB_EMIT_POOL = FramePool(8)
+# Off: the hub attaches to no worker's channel, so every emit takes the gate stream. For comparing the
+# two on the same notebook (`/api/_emit_channel/{on,off}`).
+const EMIT_CHANNEL_ON = Ref(true)
+
+"Turn the emit channel on or off for every local worker of `kernels`, now."
+function set_emit_channel!(on::Bool, kernels)
+    EMIT_CHANNEL_ON[] = on
+    if on
+        foreach(k -> (k isa GateKernel && k.conn !== nothing && !(k.target isa RemoteTarget) && !k.remote) &&
+                     _attach_emit!(k), kernels)
+    else
+        foreach(_detach_emit!, lock(() -> collect(keys(_EMIT_CLIENTS)), _EMIT_CLIENTS_LOCK))
+    end
+    return on
+end
+
+# Attach to `k`'s emit channel, in the background: the worker reports it through `__slate_ports`. A
+# worker without one (older code, or a channel that failed to start) keeps the gate stream.
+function _attach_emit!(k::GateKernel)
+    (EMIT_CHANNEL_ON[] && k.conn !== nothing) || return nothing
+    name = String(k.conn.name)
+    Threads.@spawn try
+        r = _tool(k, "__slate_ports", Dict{String,Any}(); timeout = 15.0)
+        get_(f) = try; String(getproperty(r, f)); catch; ""; end
+        ep, cr = get_(:emit), get_(:emit_credit)
+        (isempty(ep) || isempty(cr)) && return nothing
+        Z = getfield(_kaimon(), :KaimonGate).ZMQ
+        c = emit_client!(Z, ep, cr, (kind, buf, release) -> _on_emit_message(name, kind, buf, release);
+                         secret = get_(:emit_secret), pool = _HUB_EMIT_POOL)
+        old = lock(_EMIT_CLIENTS_LOCK) do
+            o = get(_EMIT_CLIENTS, name, nothing); _EMIT_CLIENTS[name] = c; o
+        end
+        old === nothing || emit_close!(old)
+    catch e
+        @debug "emit channel: attach failed; the worker's emits stay on the gate stream" exception = e
+    end
+    return nothing
+end
+
+function _detach_emit!(name::AbstractString)
+    c = lock(() -> pop!(_EMIT_CLIENTS, String(name), nothing), _EMIT_CLIENTS_LOCK)
+    c === nothing || Threads.@spawn (try; emit_close!(c); catch; end)
+    return nothing
+end
+
+# One message from a worker's emit channel, on its receive task. A binary frame goes to the pages as
+# it is and is released after the last page has sent it; a JSON emit is decoded and released at once.
+function _on_emit_message(name::String, kind::UInt8, buf::Vector{UInt8}, release)
+    rid = lock(_GATE_SESSION_LOCK) do; get(_GATE_SESSION, name, nothing); end
+    rid === nothing && return release()
+    if kind == EMIT_KIND_BINARY
+        _do_emit_bin(rid, buf; release)
+    elseif kind == EMIT_KIND_JSON
+        i = findfirst(==(0x1f), buf)
+        if i === nothing
+            release()
+        else
+            ch = String(buf[1:i-1])
+            val = try; Serialization.deserialize(IOBuffer(view(buf, i+1:length(buf)))); catch; nothing; end
+            release()
+            _do_emit(rid, ch, val)
+        end
+    else
+        release()
+    end
+    return nothing
+end
+
 function _kill_worker!(k::GateKernel; kill_remote::Bool = false)
+    k.conn === nothing || _detach_emit!(k.conn.name)
     # Detaching from a spawned-remote worker PARKS the wire: the live conn + tunnel move into the
     # park cache (see `park_remote!`) so reopening this notebook skips tunnel + dial entirely.
     # The park owns them from here — teardown must not close the tunnel, and the disconnect
@@ -1364,6 +1440,7 @@ function prepare!(k::GateKernel, report::Report; explicit::Bool = false)
             _connect!(k)
             lock(_GATE_SESSION_LOCK) do; _GATE_SESSION[k.conn.name] = report.id; end   # route this worker's stream events back to the notebook
             _ensure_poller!()
+            _attach_emit!(k)                      # its `slate_emit` traffic, on the worker's own channel
             _reconstruct_env!(k)                  # env dir absent but footer has a delta → rebuild it
             # A worker that died took every binding with it. Its connection moved `ns_gen`, which the
             # runner compares before the next cell runs (`_check_side!`), so the cells that ran here

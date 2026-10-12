@@ -307,7 +307,8 @@ function _emit_receive_loop(c::EmitClient, on_message)
             return nothing
         end
         try
-            on_message(isempty(kind) ? 0x00 : kind[1], buf, release)
+            # invokelatest: this task lives as long as the worker, in the world it started in.
+            Base.invokelatest(on_message, isempty(kind) ? 0x00 : kind[1], buf, release)
         catch e
             @debug "emit channel: message handler failed" exception = e
             release()

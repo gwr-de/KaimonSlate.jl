@@ -240,7 +240,15 @@ function _wire_callbacks!(nb::LiveNotebook)
         channel == ReportEngine.Sweep.OP_CHANNEL ? _relay_sshop(nb, payload) :
                                                    _ws_emit!(nb, channel, payload)
     catch; end))   # slate_emit → push over the page WebSocket (NOT the coalescing SSE); payload is a Julia value, JSON-encoded in _ws_emit!
-    register_bin_emit!(nb.report.id, frame -> (try; _ws_broadcast_bin!(nb, frame); catch; end))   # slate_emit_bin → forward the raw binary frame over the page WebSocket as-is
+    # slate_emit_bin → forward the raw binary frame over the page WebSocket as-is; `release` (a frame from
+    # a worker's emit channel) comes back once every page has sent it.
+    register_bin_emit!(nb.report.id, (frame; release = nothing) -> begin
+        try
+            _ws_broadcast_bin!(nb, frame; release)
+        catch
+            release === nothing || release()
+        end
+    end)
     register_cleanup_cells!(nb.report.id, ids -> (try; _cleanup_deleted_cells(nb, ids); catch; end))   # deleted-cell slate_on_cleanup teardown
     register_toolcall!(nb.report.id, p -> (try; server_toolcall(nb, p); catch; end))   # an agent's tool call → a TOOL cell
     # `set_bind(:name, v)` from cell code → the SAME path the browser POST takes. Async because the

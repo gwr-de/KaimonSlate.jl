@@ -88,6 +88,38 @@ end
     @test any(x -> x isa Vector{UInt8} && length(x) == 20 * 2^20, ws.got)
 end
 
+# A frame's "sent" callback runs once per page: after the write, at once when the frame is dropped, and
+# when the page goes away with the frame still queued. The emit channel's buffers and credit depend on it.
+@testset "a frame's sent callback runs once, whatever becomes of it" begin
+    # Sent: after the stand-in socket has it.
+    ws = MockWS(); c = _wsconn(1024); c.ws = ws
+    drain = @async try; _ws_drain!(c); catch; end
+    n = Threads.Atomic{Int}(0); f = zeros(UInt8, 100)
+    _ws_send!(c, f; on_sent = () -> Threads.atomic_add!(n, 1))
+    t0 = time(); while n[] == 0 && time() - t0 < 5; sleep(0.01); end
+    @test n[] == 1
+    @test any(x -> x === f, ws.got)
+    @test isempty(c.onsent)
+    close(c.out)
+
+    # Dropped: the queue is over its byte bound, so the callback runs at once.
+    c2 = _wsconn(1024; maxbytes = 100)
+    lock(c2.wlock)                                   # nothing drains
+    _ws_send!(c2, zeros(UInt8, 80))
+    m = Threads.Atomic{Int}(0)
+    _ws_send!(c2, zeros(UInt8, 80); on_sent = () -> Threads.atomic_add!(m, 1))
+    @test m[] == 1 && isempty(c2.onsent)
+
+    # The page went away with frames still queued: their callbacks run when it is torn down.
+    k = Threads.Atomic{Int}(0)
+    c3 = _wsconn(1024)
+    for _ in 1:3; _ws_send!(c3, zeros(UInt8, 10); on_sent = () -> Threads.atomic_add!(k, 1)); end
+    close(c3.out); NS._ws_release_pending!(c3)
+    @test k[] == 3
+    _ws_send!(c3, zeros(UInt8, 10); on_sent = () -> Threads.atomic_add!(k, 1))   # closed: at once
+    @test k[] == 4
+end
+
 # Overflow keeps its old contract: drop, count, and say so — never silently coalesce.
 @testset "overflow still reports itself" begin
     ws = MockWS(0.01)

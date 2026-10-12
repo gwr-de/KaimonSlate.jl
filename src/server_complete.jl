@@ -2003,6 +2003,15 @@ function _make_router(h::Hub)
         end
         _json(Dict("ok" => true, "name" => name))
     end)
+    # The emit channel on or off for every local worker (docs/_emit-channel.md): off sends every
+    # `slate_emit` over the gate stream, for comparing the two on the same notebook.
+    for (path, on) in (("/api/_emit_channel/on", true), ("/api/_emit_channel/off", false))
+        HTTP.register!(router, "POST", path, _ -> begin
+            nbs = lock(() -> collect(values(h.notebooks)), h.lock)
+            ks = reduce(vcat, (_nb_kernels(nb) for nb in nbs); init = Any[])
+            _json(Dict("on" => ReportEngine.set_emit_channel!(on, ks)))
+        end)
+    end
     # Instrumentation, off unless asked for. See `SlateDiag`.
     HTTP.register!(router, "GET", "/api/_diag", _ -> _json(SlateDiag.diag_snapshot()))
     HTTP.register!(router, "POST", "/api/_diag/on", _ -> _json(Dict("enabled" => SlateDiag.diag_enable!(true))))
@@ -3630,12 +3639,16 @@ mutable struct _WSConn
     # each, so a bound on the frame count alone lets a page that falls behind hold gigabytes here.
     queued::Threads.Atomic{Int}
     maxbytes::Int
+    # Frames queued with a "sent" callback (`_ws_send!`'s `on_sent`), called once the frame has been
+    # written to the socket, or when it can no longer be (dropped, or the page went away). Guarded by
+    # `qlock`. This is how a frame's buffer and its sender's credit come back (`_ws_broadcast!`).
+    onsent::IdDict{Any,Any}
 end
 # The most a page's queue holds, in bytes. A frame larger than this still goes when the queue is empty.
 const WS_QUEUE_BYTES = Ref(256 * 1024 * 1024)
 _wsconn(cap::Int; maxbytes::Integer = WS_QUEUE_BYTES[]) =
     _WSConn(Channel{Union{String,Vector{UInt8}}}(cap), Threads.Atomic{Int}(0), nothing,
-            ReentrantLock(), ReentrantLock(), Threads.Atomic{Int}(0), Int(maxbytes))
+            ReentrantLock(), ReentrantLock(), Threads.Atomic{Int}(0), Int(maxbytes), IdDict{Any,Any}())
 
 # The one place bytes reach the socket. A named function rather than an inline call so the ordering
 # rules below can be tested against a stand-in socket — they are concurrency invariants, and a real
@@ -3659,10 +3672,28 @@ function _ws_drain!(c::_WSConn)
                     _raw_send(c.ws, f)
                 finally
                     Threads.atomic_sub!(c.queued, sizeof(f))
+                    _ws_sent!(c, f)
                 end
             end
         end
     end
+end
+
+# The "sent" callback of frame `f`, if it has one, now that the drain has written it. `invokelatest`: the
+# drain task lives as long as the page and stays in the world it started in, so a callback defined after
+# that would not be callable from it.
+function _ws_sent!(c::_WSConn, f)
+    f isa Vector{UInt8} || return nothing
+    cb = lock(c.qlock) do; isempty(c.onsent) ? nothing : pop!(c.onsent, f, nothing); end
+    cb === nothing || (try; Base.invokelatest(cb); catch; end)
+    return nothing
+end
+
+# A page that went away: whatever it still had queued will never be sent, so its callbacks run now.
+function _ws_release_pending!(c::_WSConn)
+    cbs = lock(c.qlock) do; v = collect(values(c.onsent)); empty!(c.onsent); v; end
+    foreach(cb -> (try; Base.invokelatest(cb); catch; end), cbs)
+    return nothing
 end
 
 const _WS_CONNS = Dict{String,Vector{_WSConn}}()   # nb id → live page sockets (slate_emit push targets)
@@ -3675,21 +3706,25 @@ end
 # Enqueue one frame to a connection, NON-blocking. Full queue ⇒ drop + count; the next successful
 # enqueue is preceded by a `{t:"dropped",n}` marker so the client knows it fell behind. Thread-safe:
 # emits arrive on the poller task, replies on per-call tasks — `put!` is safe, the count is atomic.
-function _ws_send!(c::_WSConn, msg::Union{AbstractString,Vector{UInt8}})
-    isopen(c.out) || return nothing
+# `on_sent`, when given, is called once the frame has been written, or at once if it is dropped.
+function _ws_send!(c::_WSConn, msg::Union{AbstractString,Vector{UInt8}}; on_sent = nothing)
+    if !isopen(c.out)
+        on_sent === nothing || on_sent()
+        return nothing
+    end
     frame = msg isa AbstractString ? String(msg) : msg
     # Check and enqueue under one lock. Two things made the un-synchronized version block the very
     # caller it promises never to block: a marker plus a frame is TWO puts behind a check that
     # reserved one slot, and two producers (an emit on the poller, a reply on its own task) could both
     # pass the check and then both put. Reserve what this call will actually use, while holding it.
-    lock(c.qlock) do
+    queued = lock(c.qlock) do
         d = c.dropped[]
         need = d > 0 ? 2 : 1                       # the `dropped` marker rides in front of the frame
         marker = d > 0 ? "{\"t\":\"dropped\",\"n\":$d}" : ""
         bytes = sizeof(frame) + sizeof(marker)
         q = c.queued[]
         if c.out.sz_max - Base.n_avail(c.out) < need || (q > 0 && q + bytes > c.maxbytes)
-            Threads.atomic_add!(c.dropped, 1); return nothing
+            Threads.atomic_add!(c.dropped, 1); return false
         end
         # Claimed only once there is room for it. Taking the count first and then failing to enqueue
         # is how a drop episode went unreported: the client is never told it fell behind.
@@ -3704,25 +3739,37 @@ function _ws_send!(c::_WSConn, msg::Union{AbstractString,Vector{UInt8}})
             # page stalls the poller — and with it every notebook's stream, not just the slow one's. A
             # test measured 2.6s to emit 50 frames at a 50ms client. The wake is worth paying; this
             # guarantee is not for sale.
+            on_sent === nothing || (c.onsent[frame] = on_sent)   # before the put: the drain may send it at once
             Threads.atomic_add!(c.queued, sizeof(frame)); put!(c.out, frame)
         catch
             d > 0 && Threads.atomic_add!(c.dropped, d)   # closed mid-send — keep owing the report
+            on_sent === nothing || delete!(c.onsent, frame)
+            return false
         end
-        return nothing
+        return true
     end
+    queued || on_sent === nothing || on_sent()
     return nothing
 end
 
 # Send a pre-built frame (a JSON text frame, or a raw binary numeric frame) to every live page socket of a
-# notebook (no-op when none are connected).
-function _ws_broadcast!(nb::LiveNotebook, frame::Union{AbstractString,Vector{UInt8}})
+# notebook (no-op when none are connected). With `release`, it is called once every page has sent the
+# frame (or dropped it, or gone away), and at once when no page is open.
+function _ws_broadcast!(nb::LiveNotebook, frame::Union{AbstractString,Vector{UInt8}}; release = nothing)
     conns = lock(_WS_LOCK) do; v = get(_WS_CONNS, nb.id, nothing); v === nothing ? _WSConn[] : copy(v); end
-    for c in conns; _ws_send!(c, frame); end
+    if release === nothing
+        for c in conns; _ws_send!(c, frame); end
+        return nothing
+    end
+    isempty(conns) && (release(); return nothing)
+    left = Threads.Atomic{Int}(length(conns))
+    done = () -> (Threads.atomic_sub!(left, 1) == 1 && release(); nothing)
+    for c in conns; _ws_send!(c, frame; on_sent = done); end
     return nothing
 end
 # slate_emit_bin → forward the raw binary frame (SlateExtensionsBase.encode_binary_frame) to every page
 # socket as a WebSocket BINARY frame, untouched. Channel + meta + dtype + shape are inside the frame.
-_ws_broadcast_bin!(nb::LiveNotebook, frame::Vector{UInt8}) = _ws_broadcast!(nb, frame)
+_ws_broadcast_bin!(nb::LiveNotebook, frame::Vector{UInt8}; release = nothing) = _ws_broadcast!(nb, frame; release)
 
 # slate_emit → push `{t:"emit",channel,data}` to every live page socket. `value` is a Julia value (the
 # slate_emit unification); JSON-encoded once here on the hub.
@@ -4114,6 +4161,7 @@ function _ws_calls(stream, nb::LiveNotebook; app::Bool = false)
         finally
             _ws_unregister!(nb, c)
             close(c.out)                         # ends the writer task
+            _ws_release_pending!(c)              # what it still held will not be sent
         end
     end
     return nothing
