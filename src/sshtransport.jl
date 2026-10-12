@@ -810,7 +810,10 @@ function _exec_io(s::Session, cmd::AbstractString, input::Union{Vector{UInt8},IO
     # With a `sink`, stdout goes there as it arrives (a file, for bulk data) and none of it is kept.
     out = sink === nothing ? IOBuffer() : sink; err = IOBuffer()
     status = _finish(s, ch, out, err, timeout)
-    return (status == 0, sink === nothing ? take!(out) : UInt8[], String(take!(err)))
+    why = String(take!(err))
+    status == TIMED_OUT && (why *= "\n[no end within $(round(Int, timeout))s, or its reader stopped]")
+    status == LOST && (why *= "\n[the connection failed before the command ended]")
+    return (status == 0, sink === nothing ? take!(out) : UInt8[], why)
 end
 
 # ── port forwarding ──────────────────────────────────────────────────────────────────────────
