@@ -429,7 +429,7 @@ end
 const FETCH_RETRIES = Ref(3)
 
 """
-    fetch_many(host, script, jobs; streams = 4, name = "", total = -1, on_bytes = nothing) -> Vector{(ok, bytes, why)}
+    fetch_many(host, script, jobs; streams = 4, name = "", total = -1, on_bytes = nothing, on_job = nothing) -> Vector{(ok, bytes, why)}
 
 `fetch_to` for a list of jobs, each `(input, dest, part)`: `script` runs once per job with the job's
 stdin, writing the job's file. `streams` workers each open one connection (`SshTransport._with_bulk`)
@@ -437,11 +437,12 @@ and take the next job whenever they finish one, so a connection the path treats 
 work rather than holding up the rest. A job that fails goes back on the queue, up to `FETCH_RETRIES`
 times, and a worker whose connection has closed opens another. A worker that cannot sign in by key uses
 the host's session. In a worker process the hub runs it. `on_bytes(n)` gets the running total over all
-jobs, counting only the bytes of jobs that completed or are in flight.
+jobs, counting only the bytes of jobs that completed or are in flight. `on_job(i)` is called as job `i`
+completes, on the stream that ran it; in a worker, where the hub runs the jobs, it is not called.
 """
 function fetch_many(host::AbstractString, script::AbstractString, jobs::AbstractVector;
                     streams::Integer = 4, name::AbstractString = "", total::Integer = -1,
-                    on_bytes = nothing, timeout::Real = 3600.0)
+                    on_bytes = nothing, on_job = nothing, timeout::Real = 3600.0)
     if !isempty(host) && has_delegate()
         r = _via(() -> nothing, :fetch_many, (; host = String(host), script = String(script),
                                               jobs = collect(jobs), streams = Int(streams),
@@ -464,7 +465,7 @@ function fetch_many(host::AbstractString, script::AbstractString, jobs::Abstract
         each = count === nothing ? (n -> Threads.atomic_add!(got, n)) : (n -> (Threads.atomic_add!(got, n); count(n)))
         r = _fetch_job(runner, h, sc, j[1], String(j[2]), String(j[3]), each, timeout)
         results[i] = r
-        r[1] && return true
+        r[1] && (on_job === nothing || (try; on_job(i); catch; end); return true)
         count === nothing || count(-got[])
         r[3] == "stopped" && return false
         lock(qlock) do

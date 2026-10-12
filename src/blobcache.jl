@@ -1,0 +1,342 @@
+# ── The local blob cache ─────────────────────────────────────────────────────────────────────
+# A blob in a store this machine cannot open is copied here a byte range at a time, into one sparse
+# file per blob named by the blob's hash, with `<hash>.have` listing the byte ranges the file holds.
+# A read fetches only the ranges it lacks: a selection that overlaps one already read costs only the
+# difference, and every reader of the blob shares one copy — whichever host it came through, and
+# whether it is a notebook, a worker or another program loading this module. The name is the
+# content, so an entry can never be stale.
+#
+# Included into `Sweep` after `SshSource`, `_split_spans` and the fetch constants it uses.
+
+import FileWatching
+
+"Where the cache keeps its blobs: `<cache home>/blobs`."
+blob_cache_dir() = joinpath(SlateHome.cache_home(), "blobs")
+_cache_file(blob) = joinpath(blob_cache_dir(), String(blob))
+_have_file(blob) = _cache_file(blob) * ".have"
+_pin_file(blob) = _cache_file(blob) * ".pin"
+
+"Fetches are rounded out to pages of this many bytes, so reads of neighbouring bytes coalesce."
+const CACHE_PAGE = Ref(1024 * 1024)
+
+# ── Byte spans ───────────────────────────────────────────────────────────────────────────────
+# Half-open `(lo, hi)` byte intervals. A merged list is sorted and has no two that touch.
+
+function _merge_spans(v)
+    isempty(v) && return Tuple{Int,Int}[]
+    s = sort!(Tuple{Int,Int}[(Int(a), Int(b)) for (a, b) in v if b > a]; by = first)
+    out = Tuple{Int,Int}[]
+    for (lo, hi) in s
+        if !isempty(out) && lo <= out[end][2]
+            out[end] = (out[end][1], max(out[end][2], hi))
+        else
+            push!(out, (lo, hi))
+        end
+    end
+    return out
+end
+
+# The parts of `want` that `have` does not cover. Both merged.
+function _subtract(want, have)
+    out = Tuple{Int,Int}[]
+    j = 1
+    for (lo, hi) in want
+        while j <= length(have) && have[j][2] <= lo; j += 1; end
+        cur, k = lo, j
+        while cur < hi
+            if k > length(have) || have[k][1] >= hi
+                push!(out, (cur, hi)); break
+            end
+            have[k][1] > cur && push!(out, (cur, have[k][1]))
+            cur = max(cur, have[k][2]); k += 1
+        end
+    end
+    return out
+end
+
+_span_bytes(v) = sum(s -> s[2] - s[1], v; init = 0)
+
+# `spans` widened to whole cache pages and clipped to the blob's `limit`, so a stepped selection's
+# thousands of short runs become a few contiguous reads.
+function _page_spans(spans, limit::Integer)
+    pg = CACHE_PAGE[]
+    return _merge_spans([(lo - lo % pg, min(Int(limit), cld(hi, pg) * pg)) for (lo, hi) in spans])
+end
+
+# ── What the cache holds ─────────────────────────────────────────────────────────────────────
+
+# In-process serialisation of `.have` updates; the pidfile serialises them across processes.
+const _HAVE_LOCK = ReentrantLock()
+
+_with_blob_lock(f, blob) = lock(_HAVE_LOCK) do
+    FileWatching.Pidfile.mkpidlock(f, _have_file(blob) * ".lock"; stale_age = 60)
+end
+
+function _read_have(blob)
+    f = _have_file(blob)
+    out = Tuple{Int,Int}[]
+    isfile(f) || return out
+    for l in eachline(f)
+        a = split(l)
+        length(a) == 2 || continue
+        lo, hi = tryparse(Int, a[1]), tryparse(Int, a[2])
+        (lo === nothing || hi === nothing) || push!(out, (lo, hi))
+    end
+    return _merge_spans(out)
+end
+
+"The byte ranges of `blob` present in the cache (none when its file is gone or shorter than claimed)."
+function cached_spans(blob::AbstractString)
+    have = _read_have(blob)
+    isempty(have) && return have
+    p = _cache_file(blob)
+    (isfile(p) && filesize(p) >= have[end][2]) || return Tuple{Int,Int}[]
+    return have
+end
+
+function _add_have!(blob, spans)
+    isempty(spans) && return
+    f = _have_file(blob)
+    _with_blob_lock(blob) do
+        have = _merge_spans(vcat(_read_have(blob), spans))
+        tmp = string(f, ".", getpid(), ".", string(rand(UInt32); base = 16))
+        open(tmp, "w") do io
+            for (lo, hi) in have; println(io, lo, ' ', hi); end
+        end
+        mv(tmp, f; force = true)
+    end
+    return
+end
+
+# Copy a landed piece — the bytes of `group` ((offset, length) pairs) back to back — into the blob's
+# file at their offsets. Writing past the end leaves a hole, which is what keeps the file sparse.
+function _scatter!(blob, piece, group)
+    path = _cache_file(blob)
+    touch(path)                       # creates without truncating, and marks the blob used
+    buf = Vector{UInt8}(undef, 4 << 20)
+    open(path, "r+") do out
+        open(piece, "r") do inp
+            for (off, len) in group
+                seek(out, off)
+                left = len
+                while left > 0
+                    n = readbytes!(inp, buf, min(left, length(buf)))
+                    n == 0 && error("piece $(basename(piece)) is shorter than its ranges")
+                    write(out, view(buf, 1:n))
+                    left -= n
+                end
+            end
+        end
+    end
+    _add_have!(blob, [(o, o + l) for (o, l) in group])
+end
+
+# ── Fetching ─────────────────────────────────────────────────────────────────────────────────
+# Fetches in flight in this process, per blob, so two readers wanting the same bytes fetch them once:
+# the second waits for the first rather than starting its own.
+struct _Inflight
+    lo::Int
+    hi::Int
+    done::Base.Event
+end
+const _INFLIGHT = Dict{String,Vector{_Inflight}}()
+const _INFLIGHT_LOCK = ReentrantLock()
+
+"Bytes fetched since the cache was last trimmed. A trim is due past an eighth of the cap."
+const _BLOB_FETCHED = Ref{Int}(0)
+
+"""
+    cache_fetch!(src::SshSource, blob, spans; limit, label = "", hooks = READ_HOOKS[]) -> path
+
+Make the byte ranges `spans` (`(offset, length)` pairs) of `blob` present in the cache, fetching only
+what it lacks, and return the cache file's path. `limit` is the blob's size, which the page rounding
+must not pass. `hooks` is `(; progress(frac, msg, done), checkpoint())`: `checkpoint` throwing an
+`InterruptException` stops the fetch, and what had already landed is kept.
+"""
+function cache_fetch!(src::SshSource, blob::AbstractString, spans;
+                      limit::Integer, label::AbstractString = "", hooks = READ_HOOKS[])
+    blob = String(blob)
+    mkpath(blob_cache_dir())
+    want = _merge_spans([(o, o + l) for (o, l) in spans])
+    for _ in 1:3
+        mine = Tuple{Int,Int}[]
+        waits = Base.Event[]
+        ev = Base.Event()
+        lock(_INFLIGHT_LOCK) do
+            need = _subtract(want, cached_spans(blob))
+            isempty(need) && return
+            fl = get!(() -> _Inflight[], _INFLIGHT, blob)
+            busy = _merge_spans([(x.lo, x.hi) for x in fl])
+            for x in fl
+                any(s -> s[1] < x.hi && x.lo < s[2], need) && push!(waits, x.done)
+            end
+            mine = _subtract(_subtract(_page_spans(_subtract(need, busy), limit), busy), cached_spans(blob))
+            for (lo, hi) in mine; push!(fl, _Inflight(lo, hi, ev)); end
+        end
+        if !isempty(mine)
+            try
+                _fetch_spans!(src, blob, mine; label, hooks)
+            finally
+                lock(_INFLIGHT_LOCK) do
+                    fl = get(_INFLIGHT, blob, _Inflight[])
+                    filter!(x -> x.done !== ev, fl)
+                    isempty(fl) && delete!(_INFLIGHT, blob)
+                end
+                notify(ev)
+            end
+        end
+        foreach(wait, waits)
+        isempty(_subtract(want, cached_spans(blob))) && return _cache_file(blob)
+        isempty(mine) && isempty(waits) && break
+    end
+    missing_ = _span_bytes(_subtract(want, cached_spans(blob)))
+    missing_ == 0 && return _cache_file(blob)
+    error("reading $(label) from $(src.host): $(_bytes(missing_)) of the selection could not be fetched")
+end
+
+# Fetch the merged byte spans `spans` of `blob` into the cache. Large reads are cut into chunks taken by
+# several connections; each chunk is written into the blob's file as soon as it lands, so a stopped or
+# failed read keeps what it got, and other readers see it at once.
+function _fetch_spans!(src::SshSource, blob::String, spans::Vector{Tuple{Int,Int}};
+                       label::AbstractString = "", hooks = READ_HOOKS[])
+    total = _span_bytes(spans)
+    nchunks = total >= STREAM_MIN_BYTES[] ? max(FETCH_STREAMS[], cld(total, CHUNK_BYTES[])) : 1
+    groups = _split_spans([(lo, hi - lo) for (lo, hi) in spans], nchunks)
+    dir = blob_cache_dir()
+    tag = string(getpid(), ".", string(rand(UInt32); base = 16))
+    pieces = [joinpath(dir, string(blob, ".piece.", tag, ".", i)) for i in eachindex(groups)]
+    parts = [pc * ".part" for pc in pieces]
+    script = ranges_command(src.root, blob)
+    input(g) = Vector{UInt8}(join((string(o, ' ', l, '\n') for (o, l) in g)))
+    committed = falses(length(groups))
+    kept = Threads.Atomic{Int}(0)
+    clock = ReentrantLock()
+    function commit(i)
+        lock(clock) do
+            committed[i] && return
+            pc = pieces[i]
+            if isfile(pc) && filesize(pc) == sum(last, groups[i]; init = 0)
+                _scatter!(blob, pc, groups[i])
+                committed[i] = true
+                Threads.atomic_add!(kept, Int(filesize(pc)))
+            end
+            rm(pc; force = true)
+        end
+    end
+    landed() = kept[] + sum((isfile(pt) ? Int(filesize(pt)) : isfile(pc) ? Int(filesize(pc)) : 0
+                             for (i, (pt, pc)) in enumerate(zip(parts, pieces)) if !committed[i]); init = 0)
+    results = try
+        _await_fetch(landed, () -> foreach(pt -> (try; cancel_fetch!(pt); catch; end), parts),
+                     total, label; hooks) do
+            if total < BULK_BYTES[]        # small: one read on the host's session, no new connection
+                [fetch_to(src.host, script, pieces[1]; input = input(groups[1]), part = parts[1],
+                          name = label, total)]
+            else
+                fetch_many(src.host, script, [(input(g), pieces[i], parts[i]) for (i, g) in enumerate(groups)];
+                           streams = length(groups) > 1 ? FETCH_STREAMS[] : 1, name = label, total,
+                           on_job = commit)
+            end
+        end
+    finally
+        # What landed is kept whether the rest succeeded, failed or was stopped.
+        for i in eachindex(groups)
+            try; commit(i); catch; end
+            rm(parts[i]; force = true); rm(pieces[i]; force = true)
+        end
+    end
+    _BLOB_FETCHED[] += kept[]
+    if _BLOB_FETCHED[] > blob_cap() ÷ 8
+        _BLOB_FETCHED[] = 0
+        try; trim_blob_cache!(); catch; end   # best-effort: a full cache is not a failed read
+    end
+    ok = all(first, results)
+    ok || error("reading $(_bytes(total)) of $(label) from $(src.host) failed: " *
+                something((r[3] for r in results if !r[1]), "failed"))
+    return
+end
+
+# ── Keeping and evicting ─────────────────────────────────────────────────────────────────────
+
+"Keep `blob` in the cache whatever its size and age; `trim_blob_cache!` never evicts a pinned blob."
+pin!(blob::AbstractString) = (mkpath(blob_cache_dir()); touch(_pin_file(blob)); nothing)
+unpin!(blob::AbstractString) = (rm(_pin_file(blob); force = true); nothing)
+pinned(blob::AbstractString) = isfile(_pin_file(blob))
+
+# Disk a file actually takes: a sparse blob's apparent size is the whole blob.
+_on_disk(f) = (s = stat(f); s.blocks > 0 ? Int(s.blocks) * 512 : Int(s.size))
+
+"""
+    cache_entries() -> Vector{NamedTuple}
+
+Every blob in the cache: `(; blob, bytes, on_disk, pinned, used)`, where `bytes` is what `.have`
+records as present and `used` the last time it was read (unix time), most recent first.
+"""
+function cache_entries(dir::AbstractString = blob_cache_dir())
+    out = NamedTuple{(:blob, :bytes, :on_disk, :pinned, :used),Tuple{String,Int,Int,Bool,Float64}}[]
+    isdir(dir) || return out
+    for name in readdir(dir)
+        occursin('.', name) && continue
+        f = joinpath(dir, name)
+        isfile(f) || continue
+        push!(out, (; blob = name, bytes = _span_bytes(cached_spans(name)), on_disk = _on_disk(f),
+                      pinned = pinned(name), used = Float64(mtime(f))))
+    end
+    return sort!(out; by = e -> -e.used)
+end
+
+"Bytes the blob cache may hold, pinned blobs included. Free disk / 16, clamped, or `KAIMONSLATE_BLOB_CAP_GB`."
+function _default_blob_cap()::Int
+    free = try; Base.diskstat(dirname(blob_cache_dir())).available; catch; 0; end
+    gb = 1024^3
+    # A sixteenth rather than the memo store's quarter, and a lower ceiling: re-fetching costs
+    # seconds on the connection that is already open, where recomputing a memo entry can cost hours.
+    return free <= 0 ? 4gb : clamp(round(Int, free ÷ 16), gb, 8gb)
+end
+const _BLOB_CAP = Ref{Int}(0)
+blob_cap() = (_BLOB_CAP[] > 0 ? _BLOB_CAP[] : (_BLOB_CAP[] =
+    (v = tryparse(Float64, get(ENV, "KAIMONSLATE_BLOB_CAP_GB", "")); v !== nothing && v > 0 ?
+        round(Int, v * 1024^3) : _default_blob_cap())))
+
+"""
+    trim_blob_cache!(dir = blob_cache_dir(); cap, grace = 300.0) -> Int
+
+Evict least-recently-used blobs until the cache fits `cap`, returning the bytes freed. Pinned blobs
+count toward the total but are never evicted. `grace` (seconds) covers two races: a piece another
+process is still writing, and a blob this process has just returned to a caller about to map it.
+"""
+function trim_blob_cache!(dir::AbstractString = blob_cache_dir();
+                          cap::Integer = blob_cap(), grace::Real = 300.0)
+    isdir(dir) || return 0
+    now = time()
+    live = Tuple{String,Float64,Int}[]
+    total = 0
+    for name in readdir(dir)
+        f = joinpath(dir, name)
+        isfile(f) || continue
+        mt = try; Float64(mtime(f)); catch; continue; end
+        if occursin(".piece.", name) || (occursin(".have.", name) && !endswith(name, ".lock"))
+            # Litter from a fetch or an update that died. Past the grace window nothing is writing it.
+            now - mt > grace && try; rm(f; force = true); catch; end
+            continue
+        end
+        occursin('.', name) && continue
+        sz = try; _on_disk(f); catch; continue; end
+        total += sz
+        (now - mt > grace && !pinned(name)) && push!(live, (name, mt, sz))
+    end
+    total <= cap && return 0
+    sort!(live; by = x -> x[2])                          # least recently used first
+    freed = 0
+    for (name, _, sz) in live
+        total - freed <= cap && break
+        try
+            _with_blob_lock(name) do
+                rm(_have_file(name); force = true)       # first, so no reader trusts a file being removed
+                rm(joinpath(dir, name); force = true)
+            end
+            freed += sz
+        catch
+        end
+    end
+    return freed
+end

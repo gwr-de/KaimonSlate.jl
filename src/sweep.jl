@@ -1741,72 +1741,8 @@ function read_range(s::SshSource, blob, offset::Integer, len::Integer)
     return b
 end
 
-# A chunk fetched from a store the hub cannot see, kept so a second look at the same rows is free.
-# Content-addressed, so the cache can never be stale: a blob's name IS its bytes.
-_blob_cache_dir() = joinpath(SlateHome.cache_home(), "remote-blobs")
-
-# ── Bounding the cache ───────────────────────────────────────────────────────────────────────
-# This is a PURE cache, which is what makes it simple: every file is content-addressed, nothing
-# references it, and losing one costs a re-fetch of a few hundred kilobytes. So it wants a plain
-# LRU with a size cap, not the refcounting and pinning `MemoStore.gc` needs for a store whose
-# entries are the only copy of what they hold.
-#
-# It needs a bound at all because `fetch` on an ARTIFACT lands here too, and an artifact is the
-# unbounded case by definition — weights, a checkpoint, a rendered video. A cache that only ever
-# held chunk-sized pieces could be ignored; one that holds whatever a unit chose to leave behind
-# cannot.
-
-"Bytes the remote-blob cache may hold. Free disk / 16, clamped, or `KAIMONSLATE_BLOB_CAP_GB`."
-function _default_blob_cap()::Int
-    free = try; Base.diskstat(dirname(_blob_cache_dir())).available; catch; 0; end
-    gb = 1024^3
-    # A sixteenth rather than the memo store's quarter, and a lower ceiling: re-fetching costs
-    # seconds on the connection that is already open, where recomputing a memo entry can cost hours.
-    return free <= 0 ? 4gb : clamp(round(Int, free ÷ 16), gb, 8gb)
-end
-const _BLOB_CAP = Ref{Int}(0)
-blob_cap() = (_BLOB_CAP[] > 0 ? _BLOB_CAP[] : (_BLOB_CAP[] =
-    (v = tryparse(Float64, get(ENV, "KAIMONSLATE_BLOB_CAP_GB", "")); v !== nothing && v > 0 ?
-        round(Int, v * 1024^3) : _default_blob_cap())))
-
-# Sweeping walks the directory, so it must not run per read. Bytes fetched since the last sweep are
-# counted and one is due past an eighth of the cap — the walk is amortised over roughly that much
-# traffic, whatever size the pieces happen to be.
-const _BLOB_FETCHED = Ref{Int}(0)
-
-"""
-    trim_blob_cache!(dir = _blob_cache_dir(); cap, grace = 300.0) -> Int
-
-Evict least-recently-used entries until the cache fits `cap`, returning the bytes freed. `grace`
-(seconds) covers two races at once: a `.part.` file another process is still writing, and an entry
-this process has just returned to a caller that is about to mmap it.
-"""
-function trim_blob_cache!(dir::AbstractString = _blob_cache_dir();
-                          cap::Integer = blob_cap(), grace::Real = 300.0)
-    isdir(dir) || return 0
-    now = time()
-    live = Tuple{String,Float64,Int}[]
-    total = 0
-    for f in readdir(dir; join = true)
-        isfile(f) || continue
-        mt, sz = try; (Float64(mtime(f)), Int(filesize(f))); catch; continue; end
-        if occursin(".part.", basename(f))
-            # Litter from a fetch that died. Past the grace window nothing is still writing it.
-            now - mt > grace && try; rm(f; force = true); catch; end
-            continue
-        end
-        total += sz
-        now - mt > grace && push!(live, (f, mt, sz))     # young entries are counted, never candidates
-    end
-    total <= cap && return 0
-    sort!(live; by = x -> x[2])                          # least recently used first
-    freed = 0
-    for (f, _, sz) in live
-        total - freed <= cap && break
-        try; rm(f; force = true); freed += sz; catch; end
-    end
-    return freed
-end
+# Blobs of a store the hub cannot see, kept on this machine a byte range at a time.
+Base.include(@__MODULE__, joinpath(@__DIR__, "blobcache.jl"))
 
 # How big the store actually is, asked where the data is. See the docstring above.
 store_size(s::LocalSource) = store_size(s.root)
@@ -1825,30 +1761,12 @@ function store_size(s::SshSource)
     return (; bytes = ns[2] * 1024, blobs = ns[1])
 end
 
-"A local path holding this blob, fetching it once if the store is remote."
+"A local path holding this whole blob, fetched into the blob cache if the store is remote."
 blob_file(s::LocalSource, blob, _bytes = 0) = MemoStore.blob_path(s.root, String(blob))
 function blob_file(s::SshSource, blob, nbytes::Integer)
-    dir = _blob_cache_dir(); mkpath(dir)
-    p = joinpath(dir, String(blob))
-    if isfile(p) && filesize(p) == nbytes
-        try; touch(p); catch; end         # mtime is the recency the trim sorts on, so a hit refreshes it
-        return p
-    end
     nbytes > 0 || error("cannot fetch blob $(blob): its size is not recorded")
-    tmp = p * ".part.$(getpid())"
-    try
-        write(tmp, read_range(s, blob, 0, nbytes))
-        mv(tmp, p; force = true)          # atomic: a partial fetch never lands under the real name
-    catch
-        rm(tmp; force = true); rethrow()
-    end
-    # Trim AFTER the fetch, and never on the hot path more often than the cap's eighth. The entry
-    # just written is inside the grace window, so this cannot delete what it is about to return.
-    _BLOB_FETCHED[] += nbytes
-    if _BLOB_FETCHED[] > blob_cap() ÷ 8
-        _BLOB_FETCHED[] = 0
-        try; trim_blob_cache!(dir); catch; end     # best-effort: a full cache is not a failed read
-    end
+    p = cache_fetch!(s, String(blob), [(0, Int(nbytes))]; limit = nbytes, label = String(blob)[1:min(end, 12)])
+    try; touch(p); catch; end         # mtime is the recency the trim sorts on, so a hit refreshes it
     return p
 end
 
@@ -2537,12 +2455,13 @@ function _read_ahead(a::Array)
 end
 
 # The elements of `runs` (linear ranges) of an array part, back to back. Locally each is an mmap of its
-# window, so the pages outside it are never faulted in. From a remote store all of them are one stream
-# written into this machine's blob cache (`_fetch_runs`), however many runs there are, and the result
-# is a read-only mapping of that file: the selection is on disk once, paged in as it is used, and its
-# pages are the file's, which the system can drop and read back rather than this process's memory. A
-# caller that wants to change it copies it.
-function _read_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
+# window, so the pages outside it are never faulted in. From a remote store the bytes the runs cover
+# are made present in this machine's blob cache (`cache_fetch!`), fetching only what it lacks. A
+# selection that is one contiguous span is a read-only mapping of the cached blob: on disk once, paged
+# in as it is used, and its pages are the file's, which the system can drop and read back rather than
+# this process's memory. A caller that wants to change it copies it. A selection of several spans is
+# gathered from the cached file into an array of its own.
+function _read_runs(p::DatasetPart, runs::Vector{UnitRange{Int}}; hooks = READ_HOOKS[])
     t0 = time()
     T = SlateTask.eltype_of(String(p.index["eltype"]))
     n = sum(length, runs; init = 0)
@@ -2557,19 +2476,57 @@ function _read_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
                 at += length(r)
             end
         else
-            # Shared and read-only. A private writable mapping gives each page this process touches a
-            # copy of its own, counted against the process and only ever written to swap.
-            out = open(io -> Mmap.mmap(io, Vector{T}, n; shared = true, grow = false),
-                       _fetch_runs(p, runs), "r")
-            # Faulted in a page at a time, a first pass over the selection reads the disk an order of
-            # magnitude slower than reading ahead does. Ask the kernel to load it all, in the background.
-            Sys.isunix() && (m = out; Threads.@spawn _read_ahead(m))
+            blob, spans = _run_spans(p, runs)
+            path = cache_fetch!(p.src, blob, spans; limit = _blob_end(p), label = p.label, hooks)
+            out = if length(spans) == 1
+                # Shared and read-only. A private writable mapping gives each page this process touches
+                # a copy of its own, counted against the process and only ever written to swap.
+                m = open(io -> Mmap.mmap(io, Vector{T}, n, spans[1][1]; shared = true, grow = false), path, "r")
+                # Faulted in a page at a time, a first pass over the selection reads the disk an order
+                # of magnitude slower than reading ahead does. Ask the kernel to load it, in the background.
+                Sys.isunix() && Threads.@spawn _read_ahead(m)
+                m
+            else
+                _gather(path, spans, T, n)
+            end
         end
     catch e
         e isa InterruptException && rethrow()
         _explain_missing(p, e)
     end
     _record!(p.label, p.root, :elements, n * Int(p.index["elsize"]), length(runs), (time() - t0) * 1000)
+    return out
+end
+
+# The (offset, length) byte spans of `runs` in the part's blob, adjacent ones merged.
+function _run_spans(p::DatasetPart, runs::Vector{UnitRange{Int}})
+    spans = Tuple{Int,Int}[]
+    blob = String(p.index["blob"])
+    for r in runs
+        _, off, nb, _ = SlateTask.array_range(p.index, r)
+        if !isempty(spans) && spans[end][1] + spans[end][2] == off
+            spans[end] = (spans[end][1], spans[end][2] + nb)
+        else
+            push!(spans, (off, nb))
+        end
+    end
+    return blob, spans
+end
+
+# Where an array part's elements end in its blob: no fetch reaches past it.
+_blob_end(p::DatasetPart) = Int(p.index["offset"]) + Int(p.index["rows"]) * Int(p.index["elsize"])
+
+# The bytes of `spans` in the file at `path`, back to back, as `n` elements of `T`.
+function _gather(path, spans, ::Type{T}, n) where {T}
+    out = Vector{T}(undef, n)
+    open(path, "r") do io
+        at = 0
+        GC.@preserve out for (off, len) in spans
+            seek(io, off)
+            unsafe_read(io, pointer(out) + at, len)
+            at += len
+        end
+    end
     return out
 end
 
@@ -2597,79 +2554,6 @@ for line in sys.stdin:
         if not d: sys.exit(3)
         o.write(d); n -= len(d)
 """
-
-# The bytes of `runs` of a part in a remote store, as one file in the blob cache. Adjacent runs merge
-# into one range; the file is named by the host, store, blob and ranges, so reading the same selection
-# again opens what is already here.
-function _fetch_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
-    spans = Tuple{Int,Int}[]
-    blob = ""
-    for r in runs
-        b, off, nb, _ = SlateTask.array_range(p.index, r)
-        blob = b
-        if !isempty(spans) && spans[end][1] + spans[end][2] == off
-            spans[end] = (spans[end][1], spans[end][2] + nb)
-        else
-            push!(spans, (off, nb))
-        end
-    end
-    total = sum(last, spans; init = 0)
-    ranges = join((string(o, ' ', l, '\n') for (o, l) in spans))
-    key = bytes2hex(SHA.sha256(string(p.src.host, '\n', p.src.root, '\n', blob, '\n', ranges)))
-    dir = _blob_cache_dir(); mkpath(dir)
-    dest = joinpath(dir, "range-" * key[1:40])
-    if isfile(dest) && filesize(dest) == total
-        try; touch(dest); catch; end
-        return dest
-    end
-    # A large selection is read in chunks by several connections, each taking the next chunk when it
-    # finishes one: on a lossy path the connections lose and recover separately, and one the path
-    # treats badly ends up doing less of the work instead of holding up the rest. Each chunk lands in
-    # a piece of its own, and the pieces are joined in order.
-    nchunks = total >= STREAM_MIN_BYTES[] ? max(FETCH_STREAMS[], cld(total, CHUNK_BYTES[])) : 1
-    groups = _split_spans(spans, nchunks)
-    tag = string(getpid(), ".", string(rand(UInt32); base = 16))
-    pieces = [string(dest, ".piece.", tag, ".", i) for i in eachindex(groups)]
-    parts = [pc * ".part" for pc in pieces]
-    script = ranges_command(p.src.root, blob)
-    input(g) = Vector{UInt8}(join((string(o, ' ', l, '\n') for (o, l) in g)))
-    landed() = sum((isfile(pt) ? Int(filesize(pt)) : isfile(pc) ? Int(filesize(pc)) : 0
-                    for (pt, pc) in zip(parts, pieces)); init = 0)
-    results = try
-        _await_fetch(landed, () -> foreach(pt -> (try; cancel_fetch!(pt); catch; end), parts), total, p.label) do
-            if total < BULK_BYTES[]        # small: one read on the host's session, no new connection
-                [fetch_to(p.src.host, script, pieces[1]; input = input(groups[1]), part = parts[1],
-                          name = p.label, total)]
-            else
-                fetch_many(p.src.host, script, [(input(g), pieces[i], parts[i]) for (i, g) in enumerate(groups)];
-                           streams = length(groups) > 1 ? FETCH_STREAMS[] : 1, name = p.label, total)
-            end
-        end
-    catch
-        foreach(pc -> rm(pc; force = true), pieces)
-        rethrow()
-    end
-    ok = all(first, results)
-    n = sum(r -> r[2], results; init = 0)
-    why = ok ? "" : something((r[3] for r in results if !r[1]), "failed")
-    if ok && n == total
-        tmp = string(dest, ".join.", tag)
-        open(tmp, "w") do io
-            for pc in pieces; open(src -> write(io, src), pc); end
-        end
-        mv(tmp, dest; force = true)
-    end
-    foreach(pc -> rm(pc; force = true), pieces)
-    (ok && n == total) ||
-        error("reading $(_bytes(total)) of $(p.label) from $(p.src.host) failed: " *
-              (ok ? "got $(_bytes(n))" : why))
-    _BLOB_FETCHED[] += total
-    if _BLOB_FETCHED[] > blob_cap() ÷ 8
-        _BLOB_FETCHED[] = 0
-        try; trim_blob_cache!(dir); catch; end
-    end
-    return dest
-end
 
 "How many connections a large remote read uses, the size below which it is one, and the chunk size."
 const FETCH_STREAMS = Ref(4)
@@ -2699,15 +2583,17 @@ end
 
 """
 How a long read reports on the running cell and hears its Stop: `(; progress(frac, msg, done),
-checkpoint())`, set by a worker. `nothing` elsewhere, where a read just waits.
+checkpoint())`, set by a worker. `nothing` elsewhere, where a read just waits. The default for every
+read; `selection` and `prefetch!` take their own, which is how a program running several reads at once
+watches and stops each.
 """
 const READ_HOOKS = Ref{Any}(nothing)
 
-# Run the fetch `f` while reporting how much of `total` has landed (`landed()`), and stop it
-# (`cancel()`) when the cell is stopped. The wait is on the cell's own task, which is where its Stop
-# is visible.
-function _await_fetch(f, landed, cancel, total::Integer, label::AbstractString)
-    h = READ_HOOKS[]
+# Run the fetch `f` while reporting how much of `total` has landed (`landed()`) through `hooks`, and
+# stop it (`cancel()`) when `hooks.checkpoint()` throws. The wait is on the caller's own task, which is
+# where a cell's Stop is visible.
+function _await_fetch(f, landed, cancel, total::Integer, label::AbstractString; hooks = READ_HOOKS[])
+    h = hooks
     h === nothing && return f()
     t = Threads.@spawn f()
     t0 = time()
@@ -2731,17 +2617,15 @@ function _await_fetch(f, landed, cancel, total::Integer, label::AbstractString)
     return Base.fetch(t)          # this module's own `fetch` is for artifacts
 end
 
-"""
-    part[i, j, k, …]   -> the selection, shaped as the same indices would shape an Array
+# An index of one dimension of an array part.
+const PartIndex = Union{Colon,Integer,AbstractRange{<:Integer}}
 
-An array part indexed by its dimensions, with integers, ranges (a positive step, `1:2:100`, included)
-and `:`. The selection is read as the contiguous runs it covers: whole leading dimensions and a range
-of the next one are one run, so a block of frames along the last dimension is a single read, and a slab
-in an inner dimension, or a stepped range, is one run per index of the dimensions after it. From a
-remote store all the runs arrive as one stream.
-"""
-function Base.getindex(p::DatasetPart, I::Vararg{Union{Colon,Integer,AbstractRange{<:Integer}},N}) where {N}
+# The ranges `I` selects in each dimension, checked against the part's shape, and the linear runs of
+# elements they cover. Whole leading dimensions and a gapless range of the next one are one run; past
+# that, a stepped range makes each of its indices a run of its own.
+function _selection_runs(p::DatasetPart, I::Tuple)
     dims = Int[d for d in get(p.index, "dims", Int[])]
+    N = length(I)
     N == length(dims) ||
         throw(DimensionMismatch("this part has $(length(dims)) dimensions ($(join(dims, "×"))), " *
                                 "indexed with $(N)"))
@@ -2753,7 +2637,7 @@ function Base.getindex(p::DatasetPart, I::Vararg{Union{Colon,Integer,AbstractRan
     runs = UnitRange{Int}[]
     if all(!isempty, rs)
         # `f` is the first dimension not taken whole: everything before it, and its range when it has
-        # no gaps, is one run. A stepped range makes each of its indices a run of its own.
+        # no gaps, is one run.
         f = something(findfirst(d -> length(rs[d]) != dims[d], 1:N), N)
         strides = cumprod([1; dims[1:end-1]])
         g = step(rs[f]) == 1 ? f + 1 : f                 # the first dimension iterated over runs
@@ -2764,10 +2648,113 @@ function Base.getindex(p::DatasetPart, I::Vararg{Union{Colon,Integer,AbstractRan
             push!(runs, start:start+runlen-1)
         end
     end
-    out = reshape(_read_runs(p, runs), map(length, rs))
+    return rs, runs
+end
+
+"""
+    part[i, j, k, …]   -> the selection, shaped as the same indices would shape an Array
+
+An array part indexed by its dimensions, with integers, ranges (a positive step, `1:2:100`, included)
+and `:`. The selection is read as the contiguous runs it covers: whole leading dimensions and a range
+of the next one are one run, so a block of frames along the last dimension is a single read, and a slab
+in an inner dimension, or a stepped range, is one run per index of the dimensions after it. From a
+remote store only the bytes this machine's blob cache lacks are fetched. `selection` is the same read
+with its own progress and stop.
+"""
+Base.getindex(p::DatasetPart, I::Vararg{PartIndex,N}) where {N} = selection(p, I...)
+
+"""
+    selection(part, i, j, …; hooks = READ_HOOKS[]) -> Array
+
+`part[i, j, …]`, reporting through `hooks` (`(; progress(frac, msg, done), checkpoint())`) and stopped
+by `checkpoint` throwing an `InterruptException`. A stopped read keeps what had landed, so asking again
+fetches only the rest.
+"""
+function selection(p::DatasetPart, I::Vararg{PartIndex,N}; hooks = READ_HOOKS[]) where {N}
+    rs, runs = _selection_runs(p, I)
+    out = reshape(_read_runs(p, runs; hooks), map(length, rs))
     all(i -> i isa Integer, I) && return out[1]
     return reshape(out, Tuple(length(rs[d]) for d in 1:N if !(I[d] isa Integer)))
 end
+
+"""
+    prefetch!(part, i, j, …; hooks = READ_HOOKS[]) -> NamedTuple
+
+Make the selection present in this machine's blob cache without reading it, and return
+`query_cost` for it afterwards. Nothing to do for a store this machine opens directly.
+"""
+function prefetch!(p::DatasetPart, I::Vararg{PartIndex,N}; hooks = READ_HOOKS[]) where {N}
+    if p.src isa SshSource
+        _, runs = _selection_runs(p, I)
+        if !isempty(runs)
+            blob, spans = _run_spans(p, runs)
+            cache_fetch!(p.src, blob, spans; limit = _blob_end(p), label = p.label, hooks)
+        end
+    end
+    return query_cost(p, I...)
+end
+
+"""
+    query_cost(part, i, j, …) -> NamedTuple
+
+What reading `part[i, j, …]` would move, before reading it: `bytes` the selection holds, `missing`
+the part of it not yet in this machine's blob cache, and `fetch` what fetching that would transfer
+once it is rounded out to whole cache pages. Answered from the index and the cache, with no I/O on
+the store.
+"""
+function query_cost(p::DatasetPart, I::Vararg{PartIndex,N}) where {N}
+    _, runs = _selection_runs(p, I)
+    es = Int(p.index["elsize"])
+    bytes = sum(length, runs; init = 0) * es
+    miss = fetch = 0
+    if p.src isa SshSource && !isempty(runs)
+        blob, spans = _run_spans(p, runs)
+        have = cached_spans(blob)
+        need = _subtract(_merge_spans([(o, o + l) for (o, l) in spans]), have)
+        miss = _span_bytes(need)
+        fetch = _span_bytes(_subtract(_page_spans(need, _blob_end(p)), have))
+    end
+    return (; bytes, missing = miss, fetch, local_ = bytes - miss, pretty = _bytes(bytes),
+              pretty_fetch = _bytes(fetch))
+end
+
+"""
+    coverage(part) -> NamedTuple
+    coverage(part, d) -> BitVector
+
+How much of a part is in this machine's blob cache: `(; bytes, present, fraction)` for the whole
+part, or, along dimension `d`, which indices have every element of their slab present (for the last
+dimension, which frames can be read without a fetch). A part in a store this machine opens directly
+is all present.
+"""
+function coverage(p::DatasetPart)
+    es = Int(get(p.index, "elsize", 0))
+    bytes = Int(get(p.index, "rows", 0)) * es
+    p.src isa SshSource || return (; bytes, present = bytes, fraction = 1.0)
+    lo = Int(p.index["offset"])
+    have = cached_spans(String(p.index["blob"]))
+    present = bytes - _span_bytes(_subtract([(lo, lo + bytes)], have))
+    return (; bytes, present, fraction = bytes > 0 ? present / bytes : 1.0)
+end
+function coverage(p::DatasetPart, d::Integer)
+    dims = size(p)
+    1 <= d <= length(dims) || throw(BoundsError("dimension $(d) of a $(join(dims, "×")) part"))
+    p.src isa SshSource || return trues(dims[d])
+    have = cached_spans(String(p.index["blob"]))
+    isempty(have) && return falses(dims[d])
+    out = falses(dims[d])
+    for i in 1:dims[d]
+        _, runs = _selection_runs(p, ntuple(k -> k == d ? (i:i) : Colon(), length(dims)))
+        _, spans = _run_spans(p, runs)
+        out[i] = isempty(_subtract(_merge_spans([(o, o + l) for (o, l) in spans]), have))
+    end
+    return out
+end
+
+"Keep this part's bytes in the blob cache whatever its size and age (`unpin!` to release them)."
+pin!(p::DatasetPart) = (p.src isa SshSource && pin!(String(p.index["blob"])); nothing)
+unpin!(p::DatasetPart) = (p.src isa SshSource && unpin!(String(p.index["blob"])); nothing)
+pinned(p::DatasetPart) = p.src isa SshSource && pinned(String(p.index["blob"]))
 
 # ── Adopting a file in a notebook cell ───────────────────────────────────────────────────────
 # A sweep unit's `adopt` is stored by the unit's runner. A notebook cell's is stored here, at once:
@@ -2825,12 +2812,30 @@ the region's `datadir()`, or absolute there. The index is read from the region's
 slices over ssh through its login host, so nothing on the region has to be running.
 """
 function adopted(region::AbstractString, path::AbstractString)
-    e = get(_ctx_clusters(), region_target_name(region), nothing)
-    e === nothing && error("no region `$(region)` with a data root is known to this notebook")
+    host, dr = region_store(region)
+    return _open_adopted(host, dr * "/.datasets", isabspath(path) ? String(path) : dr * "/" * String(path))
+end
+
+"""
+    region_store(region) -> (host, data_root)
+
+The host bulk reads of `region`'s data go through (its machine's data transfer host when it names one,
+else its login host) and its data root as that host sees it. Resolved from the running cell's context,
+or outside a notebook from this machine's configured regions.
+"""
+function region_store(region::AbstractString)
+    key = region_target_name(region)
+    e = get(_ctx_clusters(), key, nothing)
+    if e === nothing
+        for c in _hub_clusters(; tested = false)
+            string(get(c, "name", "")) == key && (e = c; break)
+        end
+    end
+    e === nothing && error("no region `$(region)` with a data root is known here")
     # Bulk reads go through the machine's data transfer host when it names one, else its login host.
-    host = String(get(e, "transfer_host", ""))
-    isempty(host) && (host = String(get(e, "host", "")))
-    dr = String(get(e, "data_root", ""))
+    host = string(get(e, "transfer_host", ""))
+    isempty(host) && (host = string(get(e, "host", "")))
+    dr = string(get(e, "data_root", ""))
     isempty(dr) && error("region `$(region)` has no data root, so `adopt` there stores under the " *
                          "project and `adopted` cannot find it; give the region a data root")
     if startswith(dr, "~")
@@ -2838,8 +2843,38 @@ function adopted(region::AbstractString, path::AbstractString)
         ok || error("could not resolve the home directory on $(host)")
         dr = String(strip(out)) * dr[2:end]
     end
-    dr = rstrip(dr, '/')
-    return _open_adopted(host, dr * "/.datasets", isabspath(path) ? String(path) : dr * "/" * String(path))
+    return host, String(rstrip(dr, '/'))
+end
+
+"""
+    adoptions(region) -> Vector{NamedTuple}
+
+Every file adopted on `region`, newest first, read from its dataset store in one round trip:
+`(; file, rel, created, bytes, vars, dataset)`, where `rel` is the path under the region's data root
+(what `adopted` takes) and `dataset` the group dataset itself, opened without another read.
+"""
+function adoptions(region::AbstractString)
+    host, dr = region_store(region)
+    root = dr * "/.datasets"
+    script = string("cd ", shq(root * "/manifests"), " 2>/dev/null || exit 0; ",
+                    "for f in \$(ls -t adopt-*.toml 2>/dev/null); do echo \"#=== \$f\"; cat \"\$f\"; done")
+    ok, out = run_there(host, script)
+    ok || error("could not list the adoptions on $(region) ($(host)): " * strip(out))
+    entries = NamedTuple[]
+    for chunk in split(out, "#=== ")[2:end]
+        body = chunk[something(findfirst('\n', chunk), length(chunk)):end]
+        m = try; TOML.parse(body); catch; continue; end
+        get(m, "kind", "") == "adopted" || continue
+        paths = String[String(x) for x in get(m, "paths", String[])]
+        isempty(paths) && continue
+        file = paths[1]
+        ds = _adopted_dataset(host, root, m, file)
+        idx = ds.parts[1].index
+        push!(entries, (; file, rel = startswith(file, dr * "/") ? file[length(dr)+2:end] : file,
+                          created = Int(get(m, "created", 0)), bytes = Int(get(idx, "bytes", 0)),
+                          vars = keys(ds), dataset = ds))
+    end
+    return entries
 end
 
 # The newest adoption of `file` in the dataset store at `root` on `host` ("" for this machine).
@@ -2850,7 +2885,11 @@ function _open_adopted(host::AbstractString, root::AbstractString, file::Abstrac
     ok, out = run_there(String(host), script)
     ok || error("$(file) has not been adopted" * (isempty(host) ? "" : " on $(host)") *
                 " — run `adopt` on it in a cell there first")
-    m = TOML.parse(out)
+    return _adopted_dataset(host, root, TOML.parse(out), file)
+end
+
+# The group dataset an adoption manifest `m` describes, read from the store at `root` on `host`.
+function _adopted_dataset(host::AbstractString, root::AbstractString, m::AbstractDict, file::AbstractString)
     idx = Dict{String,Any}(String(k) => v for (k, v) in m["dataset"])
     src = isempty(host) ? LocalSource(String(root)) : SshSource(String(host), String(root))
     lbl = basename(file)

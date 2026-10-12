@@ -411,7 +411,7 @@ const MS = RE.MemoStore
         mktempdir() do dir
             old, new = joinpath(dir, "old"), joinpath(dir, "new")
             write(old, repeat("o", 4096)); write(new, repeat("n", 4096))
-            part = joinpath(dir, "abc.part.999"); write(part, "half a fetch")
+            part = joinpath(dir, "abc.piece.999.1.part"); write(part, "half a fetch")
             touch(new)                                       # `new` is the more recently used
             back = time() - 3600                             # backdate, so age is not a race on the clock
             for p in (old, part)
@@ -430,6 +430,17 @@ const MS = RE.MemoStore
             # about to mmap, and on a fresh fetch that caller is the line below `mv`.
             @test S.trim_blob_cache!(dir; cap = 0, grace = 3600) == 0 && isfile(new)
             @test S.trim_blob_cache!(joinpath(dir, "nope")) == 0         # no cache yet is not an error
+            # A pinned blob is kept whatever the cap; unpinned, it is an ordinary entry again.
+            withenv("KAIMONSLATE_CACHE_HOME" => dir) do
+                b = joinpath(mkpath(S.blob_cache_dir()), "aaa")
+                write(b, repeat("a", 4096))
+                h = Base.Filesystem.open(b, Base.Filesystem.JL_O_RDWR)
+                try; Base.Filesystem.futime(h, back, back); finally; close(h); end
+                S.pin!("aaa")
+                @test S.pinned("aaa") && S.trim_blob_cache!(; cap = 0, grace = 1.0) == 0 && isfile(b)
+                S.unpin!("aaa")
+                @test S.trim_blob_cache!(; cap = 0, grace = 1.0) == 4096 && !isfile(b)
+            end
         end
         @test S.blob_cap() > 0                                # adaptive default resolves
         withenv("KAIMONSLATE_BLOB_CAP_GB" => "2") do
@@ -993,7 +1004,11 @@ const MS = RE.MemoStore
             c = copy(w); c[1] = -1
             @test q[:, :, 1:2][1] == A[1]
             RE.Sweep._read_ahead(w)                      # the read-ahead takes any mapped array
+            # Drop this blob from the cache, so the next read has to fetch.
+            forget() = (rm(RE.Sweep._cache_file(q.index["blob"]); force = true);
+                        rm(RE.Sweep._have_file(q.index["blob"]); force = true))
             # In a worker a read waits on the cell's task, reporting progress and checking its Stop.
+            forget()
             calls = Ref(0)
             RE.Sweep.READ_HOOKS[] = (; progress = (f, m, d) -> nothing, checkpoint = () -> (calls[] += 1))
             try
@@ -1011,15 +1026,30 @@ const MS = RE.MemoStore
                 @test flat == reduce(vcat, [collect(o:o+l-1) for (o, l) in sp])
             end
             # Small enough to read as many chunks shared by several connections (here, local streams).
-            olds = (RE.Sweep.STREAM_MIN_BYTES[], RE.Sweep.BULK_BYTES[], RE.Sweep.CHUNK_BYTES[])
+            # Pages of a few elements, so each read fetches only part of the blob and the next fills in.
+            olds = (RE.Sweep.STREAM_MIN_BYTES[], RE.Sweep.BULK_BYTES[], RE.Sweep.CHUNK_BYTES[], RE.Sweep.CACHE_PAGE[])
             try
                 RE.Sweep.STREAM_MIN_BYTES[] = 1; RE.Sweep.BULK_BYTES[] = 1; RE.Sweep.CHUNK_BYTES[] = 24
+                RE.Sweep.CACHE_PAGE[] = 16
+                forget()
+                @test RE.Sweep.query_cost(q, :, :, :).missing == 60 * 8
                 @test q[:, 3, :] == A[:, 3, :]
+                @test 0 < RE.Sweep.coverage(q).present < 60 * 8
+                @test !any(RE.Sweep.coverage(q, 3))          # no frame is whole yet
+                c = RE.Sweep.query_cost(q, :, :, 2)
+                @test 0 < c.missing < c.bytes && c.fetch >= c.missing
                 @test q[1:2:4, 1:3, 2:5] == A[1:2:4, 1:3, 2:5]
+                @test RE.Sweep.prefetch!(q, :, :, 4:5).missing == 0
+                @test all(RE.Sweep.coverage(q, 3)[4:5])
                 @test q[:, :, :] == A
+                @test RE.Sweep.coverage(q).fraction == 1.0
             finally
-                RE.Sweep.STREAM_MIN_BYTES[], RE.Sweep.BULK_BYTES[], RE.Sweep.CHUNK_BYTES[] = olds
+                RE.Sweep.STREAM_MIN_BYTES[], RE.Sweep.BULK_BYTES[], RE.Sweep.CHUNK_BYTES[], RE.Sweep.CACHE_PAGE[] = olds
             end
+            # Byte spans: what is missing from what is held.
+            @test RE.Sweep._subtract([(0, 10), (20, 30)], [(5, 25)]) == [(0, 5), (25, 30)]
+            @test RE.Sweep._subtract([(0, 10)], Tuple{Int,Int}[]) == [(0, 10)]
+            @test RE.Sweep._merge_spans([(5, 8), (0, 5), (10, 12)]) == [(0, 8), (10, 12)]
             # Every job runs once, whatever order the streams take them in.
             mktempdir() do jd
                 jobs = [("", joinpath(jd, "out$i"), joinpath(jd, "out$i.part")) for i in 1:9]
@@ -1037,10 +1067,15 @@ const MS = RE.MemoStore
                 rs = RE.Sweep.fetch_many("", "echo broken >&2; exit 1", jobs[1:1])
                 @test !rs[1][1] && occursin("broken", rs[1][3])
             end
-            cached() = filter(startswith("range-"), readdir(RE.Sweep._blob_cache_dir()))
-            before = cached()
-            @test q[:, 2, :] == A[:, 2, :]               # the same selection again: no new fetch
-            @test cached() == before
+            # Everything read so far is in the blob cache once: reading it again, or any part of it,
+            # fetches nothing, and the cost of a selection says so before it is read.
+            blobf = RE.Sweep._cache_file(q.index["blob"])
+            @test RE.Sweep.coverage(q).fraction == 1.0 && all(RE.Sweep.coverage(q, 3))
+            @test RE.Sweep.query_cost(q, :, 2, :).missing == 0
+            stamp = read(RE.Sweep._have_file(q.index["blob"]), String)
+            @test q[:, 2, :] == A[:, 2, :] && q[2:3, 1:2, 4] == A[2:3, 1:2, 4]
+            @test read(RE.Sweep._have_file(q.index["blob"]), String) == stamp
+            @test isfile(blobf)
             # The host side reads the ranges given on stdin, back to back.
             blob = p.index["blob"]; off = p.index["offset"]
             script = RE.Sweep.ranges_command(abspath(store), blob)
