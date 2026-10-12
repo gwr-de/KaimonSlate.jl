@@ -3622,9 +3622,16 @@ mutable struct _WSConn
     # prevent. Held only across a put into a channel already known to have room, so it never waits on
     # the socket and can't itself become the stall.
     qlock::ReentrantLock
+    # Bytes in the queue, and the most it may hold. A numeric stream's frames can be tens of megabytes
+    # each, so a bound on the frame count alone lets a page that falls behind hold gigabytes here.
+    queued::Threads.Atomic{Int}
+    maxbytes::Int
 end
-_wsconn(cap::Int) = _WSConn(Channel{Union{String,Vector{UInt8}}}(cap), Threads.Atomic{Int}(0), nothing,
-                            ReentrantLock(), ReentrantLock())
+# The most a page's queue holds, in bytes. A frame larger than this still goes when the queue is empty.
+const WS_QUEUE_BYTES = Ref(256 * 1024 * 1024)
+_wsconn(cap::Int; maxbytes::Integer = WS_QUEUE_BYTES[]) =
+    _WSConn(Channel{Union{String,Vector{UInt8}}}(cap), Threads.Atomic{Int}(0), nothing,
+            ReentrantLock(), ReentrantLock(), Threads.Atomic{Int}(0), Int(maxbytes))
 
 # The one place bytes reach the socket. A named function rather than an inline call so the ordering
 # rules below can be tested against a stand-in socket — they are concurrency invariants, and a real
@@ -3642,7 +3649,14 @@ function _ws_drain!(c::_WSConn)
     while true
         wait(c.out)
         lock(c.wlock) do
-            while isready(c.out); _raw_send(c.ws, take!(c.out)); end
+            while isready(c.out)
+                f = take!(c.out)
+                try
+                    _raw_send(c.ws, f)
+                finally
+                    Threads.atomic_sub!(c.queued, sizeof(f))
+                end
+            end
         end
     end
 end
@@ -3667,20 +3681,26 @@ function _ws_send!(c::_WSConn, msg::Union{AbstractString,Vector{UInt8}})
     lock(c.qlock) do
         d = c.dropped[]
         need = d > 0 ? 2 : 1                       # the `dropped` marker rides in front of the frame
-        if c.out.sz_max - Base.n_avail(c.out) < need
+        marker = d > 0 ? "{\"t\":\"dropped\",\"n\":$d}" : ""
+        bytes = sizeof(frame) + sizeof(marker)
+        q = c.queued[]
+        if c.out.sz_max - Base.n_avail(c.out) < need || (q > 0 && q + bytes > c.maxbytes)
             Threads.atomic_add!(c.dropped, 1); return nothing
         end
         # Claimed only once there is room for it. Taking the count first and then failing to enqueue
         # is how a drop episode went unreported: the client is never told it fell behind.
         Threads.atomic_sub!(c.dropped, d)
         try
-            d > 0 && put!(c.out, "{\"t\":\"dropped\",\"n\":$d}")
+            # Counted before the put: the drain may take and send it before this task runs again.
+            if d > 0
+                Threads.atomic_add!(c.queued, sizeof(marker)); put!(c.out, marker)
+            end
             # Always through the queue. Writing straight to the socket here would save a task wake per
             # frame, and it was tried: it blocks the CALLER for the duration of the write, so one slow
             # page stalls the poller — and with it every notebook's stream, not just the slow one's. A
             # test measured 2.6s to emit 50 frames at a 50ms client. The wake is worth paying; this
             # guarantee is not for sale.
-            put!(c.out, frame)
+            Threads.atomic_add!(c.queued, sizeof(frame)); put!(c.out, frame)
         catch
             d > 0 && Threads.atomic_add!(c.dropped, d)   # closed mid-send — keep owing the report
         end

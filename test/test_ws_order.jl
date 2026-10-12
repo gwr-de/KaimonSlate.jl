@@ -66,6 +66,28 @@ end
     @test elapsed < 0.5                  # 50 frames would be 2.5s if we waited on the socket
 end
 
+# Large frames are bounded by their bytes, not only their count: a page that falls behind a stream of
+# big binary frames holds at most `maxbytes` here, and is told about the rest.
+@testset "a slow page's queue is bounded in bytes" begin
+    ws = MockWS(0.05)
+    c = _wsconn(1024; maxbytes = 10 * 2^20); c.ws = ws
+    drain = @async try; _ws_drain!(c); catch; end
+    peak = 0
+    for i in 1:40
+        _ws_send!(c, zeros(UInt8, 4 * 2^20))
+        peak = max(peak, c.queued[])
+    end
+    @test peak <= 10 * 2^20
+    @test c.dropped[] > 0
+    t0 = time(); while Base.n_avail(c.out) > 0 && time() - t0 < 5; sleep(0.01); end
+    sleep(0.1)
+    @test c.queued[] == 0                 # every byte counted in is counted out
+    _ws_send!(c, zeros(UInt8, 20 * 2^20))  # larger than the bound, into an empty queue: still sent
+    t0 = time(); while !any(x -> x isa Vector{UInt8} && length(x) == 20 * 2^20, ws.got) && time() - t0 < 5; sleep(0.01); end
+    close(c.out); sleep(0.05)
+    @test any(x -> x isa Vector{UInt8} && length(x) == 20 * 2^20, ws.got)
+end
+
 # Overflow keeps its old contract: drop, count, and say so — never silently coalesce.
 @testset "overflow still reports itself" begin
     ws = MockWS(0.01)
