@@ -121,9 +121,9 @@ end
     @test got3 == fill(false, 4)
 end
 
-# A page that stops reading keeps a full queue forever. Once it has gone `WS_STALL_S` without a write,
-# the next drop closes it, and the frame being written when that happens keeps its callback until the
-# write ends.
+# A page that stops reading keeps a full queue forever. Once one write has gone on too long for its
+# size, the next drop closes it, and the frame being written when that happens keeps its callback until
+# the write ends.
 mutable struct StuckWS
     aborted::Bool
     gate::Channel{Nothing}
@@ -142,11 +142,27 @@ NS._raw_abort(ws::StuckWS) = (ws.aborted = true; close(ws.gate))
     @test !ws.aborted && isopen(c.out)
     NS._ws_release_pending!(c)
     @test isempty(got)                                              # the blocked write still owns its buffer
-    c.wrote_at[] = time() - NS.WS_STALL_S[] - 1
+    c.writing_since[] = time() - NS.WS_STALL_S[] - 1
+    c.writing_bytes[] = 20 * 2^20
+    _ws_send!(c, zeros(UInt8, 80))                                  # a large frame, still in its allowance
+    @test !ws.aborted && isopen(c.out)
+    c.writing_bytes[] = 80
     _ws_send!(c, zeros(UInt8, 80))                                  # dropped, and stalled: closed
     @test ws.aborted && !isopen(c.out)
     t0 = time(); while isempty(got) && time() - t0 < 5; sleep(0.01); end
     @test got == [false]                                            # the aborted write ends unwritten
+end
+
+# A page idle for a long time is not stalled: its first drop after the idle spell, with no write under
+# way, leaves it open.
+@testset "a drop with no write under way leaves the page open" begin
+    ws = StuckWS(false, Channel{Nothing}(0))
+    c = _wsconn(1024; maxbytes = 100); c.ws = ws
+    lock(c.wlock)                                                   # no drain runs, so nothing is writing
+    _ws_send!(c, zeros(UInt8, 80))
+    _ws_send!(c, zeros(UInt8, 80))                                  # dropped
+    @test c.dropped[] == 1 && !ws.aborted && isopen(c.out)
+    unlock(c.wlock); close(c.out)
 end
 
 # Overflow keeps its old contract: drop, count, and say so — never silently coalesce.

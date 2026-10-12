@@ -3644,18 +3644,28 @@ mutable struct _WSConn
     # `qlock`. This is how a frame's buffer and its sender's credit come back (`_ws_broadcast!`). The
     # callback is told whether the frame was written (`true`) or not.
     onsent::IdDict{Any,Any}
-    # When the drain last finished a write. A page whose queue is full and has not taken a frame for
-    # `WS_STALL_S` is no longer reading, and is closed (`_ws_abandon!`).
-    wrote_at::Threads.Atomic{Float64}
+    # The write under way: when it started (0 when none is) and its size. A page that drops a frame
+    # while one write has gone on too long for its size is no longer reading, and is closed
+    # (`_ws_abandon!`). An idle page, or one still taking a large frame at a reasonable rate, is not.
+    writing_since::Threads.Atomic{Float64}
+    writing_bytes::Threads.Atomic{Int}
 end
 # The most a page's queue holds, in bytes. A frame larger than this still goes when the queue is empty.
 const WS_QUEUE_BYTES = Ref(256 * 1024 * 1024)
-# How long a page with a full queue may go without completing a write before it is closed.
+# How long one write may take before its page counts as stalled: `WS_STALL_S`, plus its bytes at
+# `WS_MIN_RATE` bytes per second, so a slow link taking a large frame is not mistaken for a dead one.
 const WS_STALL_S = Ref(10.0)
+const WS_MIN_RATE = Ref(1024.0 * 1024.0)
 _wsconn(cap::Int; maxbytes::Integer = WS_QUEUE_BYTES[]) =
     _WSConn(Channel{Union{String,Vector{UInt8}}}(cap), Threads.Atomic{Int}(0), nothing,
             ReentrantLock(), ReentrantLock(), Threads.Atomic{Int}(0), Int(maxbytes), IdDict{Any,Any}(),
-            Threads.Atomic{Float64}(time()))
+            Threads.Atomic{Float64}(0.0), Threads.Atomic{Int}(0))
+
+# Whether `c`'s current write has gone on too long for its size.
+function _ws_stalled(c::_WSConn)
+    t = c.writing_since[]
+    return t > 0 && time() - t > WS_STALL_S[] + c.writing_bytes[] / WS_MIN_RATE[]
+end
 
 # The one place bytes reach the socket. A named function rather than an inline call so the ordering
 # rules below can be tested against a stand-in socket — they are concurrency invariants, and a real
@@ -3683,11 +3693,12 @@ function _ws_drain!(c::_WSConn)
                 cb = _ws_take_cb!(c, f)
                 t0 = time_ns()
                 ok = false
+                c.writing_bytes[] = sizeof(f); c.writing_since[] = time()
                 try
                     _raw_send(c.ws, f)
                     ok = true
-                    c.wrote_at[] = time()
                 finally
+                    c.writing_since[] = 0.0
                     # With SlateDiag on: each socket write, by kind, as a route of its own, so the
                     # time a page's socket takes per frame shows beside the hub's requests.
                     SlateDiag.diag_enabled() &&
@@ -3755,7 +3766,7 @@ function _ws_send!(c::_WSConn, msg::Union{AbstractString,Vector{UInt8}}; on_sent
         if c.out.sz_max - Base.n_avail(c.out) < need || (q > 0 && q + bytes > c.maxbytes)
             Threads.atomic_add!(c.dropped, 1)
             SlateDiag.diag_enabled() && SlateDiag.diag_record!("WS drop", 0, bytes, false)
-            time() - c.wrote_at[] > WS_STALL_S[] && _ws_abandon!(c)
+            _ws_stalled(c) && _ws_abandon!(c)
             return false
         end
         # Claimed only once there is room for it. Taking the count first and then failing to enqueue
