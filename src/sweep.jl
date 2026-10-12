@@ -2523,11 +2523,25 @@ Base.length(p::DatasetPart) = p.rows
 "An array part's dimensions, from its index."
 Base.size(p::DatasetPart) = Tuple(Int(d) for d in get(p.index, "dims", Int[]))
 
+# Ask the kernel to read all of a mapped array's pages ahead of use. It can take seconds for a large
+# mapping, so the call is GC-safe: a collection on another thread does not wait for it.
+function _read_ahead(a::Array)
+    ps = UInt(Mmap.PAGESIZE)
+    GC.@preserve a begin
+        p = UInt(pointer(a))
+        base = p - p % ps
+        @ccall gc_safe = true madvise(Ptr{Cvoid}(base)::Ptr{Cvoid}, (sizeof(a) + p - base)::Csize_t,
+                                      Cint(Mmap.MADV_WILLNEED)::Cint)::Cint
+    end
+    return nothing
+end
+
 # The elements of `runs` (linear ranges) of an array part, back to back. Locally each is an mmap of its
 # window, so the pages outside it are never faulted in. From a remote store all of them are one stream
 # written into this machine's blob cache (`_fetch_runs`), however many runs there are, and the result
-# is a private mapping of that file: the selection is on disk once and paged in as it is used, and
-# writing to it changes this process's copy only.
+# is a read-only mapping of that file: the selection is on disk once, paged in as it is used, and its
+# pages are the file's, which the system can drop and read back rather than this process's memory. A
+# caller that wants to change it copies it.
 function _read_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
     t0 = time()
     T = SlateTask.eltype_of(String(p.index["eltype"]))
@@ -2543,13 +2557,13 @@ function _read_runs(p::DatasetPart, runs::Vector{UnitRange{Int}})
                 at += length(r)
             end
         else
-            # Opened for writing only so the private mapping is writable: its pages are copied on
-            # write, and the file is never changed.
-            out = open(io -> Mmap.mmap(io, Vector{T}, n; shared = false, grow = false),
-                       _fetch_runs(p, runs), "r+")
+            # Shared and read-only. A private writable mapping gives each page this process touches a
+            # copy of its own, counted against the process and only ever written to swap.
+            out = open(io -> Mmap.mmap(io, Vector{T}, n; shared = true, grow = false),
+                       _fetch_runs(p, runs), "r")
             # Faulted in a page at a time, a first pass over the selection reads the disk an order of
             # magnitude slower than reading ahead does. Ask the kernel to load it all, in the background.
-            Sys.isunix() && (m = out; Threads.@spawn (try; Mmap.madvise!(m, Mmap.MADV_WILLNEED); catch; end))
+            Sys.isunix() && (m = out; Threads.@spawn _read_ahead(m))
         end
     catch e
         e isa InterruptException && rethrow()

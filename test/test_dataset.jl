@@ -986,10 +986,13 @@ const MS = RE.MemoStore
             @test q[2:3, 1:2:3, 2:2:4] == A[2:3, 1:2:3, 2:2:4]
             @test p[:, :, 1:2:5] == A[:, :, 1:2:5]       # …and locally
             @test q[1:7] == A[1:7]
-            # A remote read maps the cached selection privately: writing to it leaves the cache alone.
+            # A remote read is a read-only mapping of the cached selection: a write is refused, so the
+            # cache can never be changed through it, and a copy is the caller's to change.
             w = q[:, :, 1:2]
-            w[1] = -1
+            @test_throws ReadOnlyMemoryError (w[1] = -1)
+            c = copy(w); c[1] = -1
             @test q[:, :, 1:2][1] == A[1]
+            RE.Sweep._read_ahead(w)                      # the read-ahead takes any mapped array
             # In a worker a read waits on the cell's task, reporting progress and checking its Stop.
             calls = Ref(0)
             RE.Sweep.READ_HOOKS[] = (; progress = (f, m, d) -> nothing, checkpoint = () -> (calls[] += 1))
