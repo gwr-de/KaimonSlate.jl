@@ -161,6 +161,24 @@ release_all!(r::Recorder) = lock(() -> (foreach(f -> f(), r.releases); empty!(r.
         end
     end
 
+    @testset "credit below a grant's chunk comes back once nothing is left ungranted" begin
+        # The window is 16 000, so grants go in chunks of 1000 bytes: a 10-byte message alone would
+        # never be granted, and a message larger than the window waits for the whole window.
+        s = server()
+        r = Recorder()
+        h = client(s, handler(r); window = 16_000)
+        try
+            @test waitfor(() -> emit_attached(s))
+            @test emit_send!(s, EMIT_KIND_BINARY, zeros(UInt8, 10)) === :sent
+            @test waitfor(() -> received(r) == 1)
+            @test waitfor(() -> lock(() -> s.credit, s.cond) == 16_000; timeout = 3)
+            @test emit_send!(s, EMIT_KIND_BINARY, zeros(UInt8, 20_000); wait_s = 2) === :sent
+            @test s.stalls[] == 0
+        finally
+            emit_close!(h); emit_close!(s)
+        end
+    end
+
     @testset "a hub that detaches tells the worker, which stops using the channel at once" begin
         s = server()
         r = Recorder()

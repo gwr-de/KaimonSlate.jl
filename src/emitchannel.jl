@@ -277,7 +277,10 @@ mutable struct EmitClient
     task::Any
     # Released bytes not yet granted back. Grants go in chunks of `grant_every` bytes: one per message
     # would be a message back to the worker, and a wake of its credit task, for every frame received.
+    # The grant that leaves no message ungranted (`inflight` reaching 0) sends the rest, so once the
+    # pages have taken everything the worker holds its whole window again.
     ungranted::Threads.Atomic{Int}
+    inflight::Threads.Atomic{Int}
     grant_every::Int
     window::Int
 end
@@ -307,8 +310,8 @@ function emit_client!(Z::Module, data_endpoint::AbstractString, credit_endpoint:
     Z.connect(data, String(data_endpoint))
     Z.connect(cs, String(credit_endpoint))
     c = EmitClient(Z, ctx, data, cs, ReentrantLock(), pool, Threads.Atomic{Int}(0),
-                   Threads.Atomic{Bool}(true), nothing, Threads.Atomic{Int}(0), max(1, Int(window) ÷ 16),
-                   Int(window))
+                   Threads.Atomic{Bool}(true), nothing, Threads.Atomic{Int}(0), Threads.Atomic{Int}(0),
+                   max(1, Int(window) ÷ 16), Int(window))
     lock(() -> Z.send(cs, "H" * string(Int(window))), c.lock)
     # On the interactive pool where there is one, as the hub's gate-stream poller is: this task wakes for
     # every message, and on the default pool each wake scans a run queue per thread.
@@ -317,9 +320,13 @@ function emit_client!(Z::Module, data_endpoint::AbstractString, credit_endpoint:
     return c
 end
 
+# Called once per received message. Its bytes are added before `inflight` is decremented, so the grant
+# that takes `inflight` to 0 sees every byte released before it.
 function _emit_grant!(c::EmitClient, n::Integer)
-    (n > 0 && c.running[]) || return nothing
-    Threads.atomic_add!(c.ungranted, Int(n)) + n < c.grant_every && return nothing
+    total = Threads.atomic_add!(c.ungranted, Int(n)) + n
+    left = Threads.atomic_sub!(c.inflight, 1) - 1
+    c.running[] || return nothing
+    (total >= c.grant_every || left <= 0) || return nothing
     g = Threads.atomic_xchg!(c.ungranted, 0)
     g > 0 && lock(() -> (try; c.Z.send(c.credit_sock, "C" * string(g)); catch; end), c.lock)
     return nothing
@@ -368,6 +375,7 @@ function _emit_receive_loop(c::EmitClient, on_message)
             continue
         end
         Threads.atomic_add!(c.received, 1)
+        Threads.atomic_add!(c.inflight, 1)
         n = length(buf)
         granted = Threads.Atomic{Bool}(false)
         released = Threads.Atomic{Bool}(false)
