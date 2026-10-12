@@ -2440,6 +2440,7 @@ Base.getindex(p::DatasetPart, i::Integer) = p[i:i][1]
 Base.length(p::DatasetPart) = p.rows
 "An array part's dimensions, from its index."
 Base.size(p::DatasetPart) = Tuple(Int(d) for d in get(p.index, "dims", Int[]))
+Base.size(p::DatasetPart, d::Integer) = size(p)[d]
 
 # Ask the kernel to read all of a mapped array's pages ahead of use. It can take seconds for a large
 # mapping, so the call is GC-safe: a collection on another thread does not wait for it.
