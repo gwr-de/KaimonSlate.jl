@@ -131,6 +131,20 @@ release_all!(r::Recorder) = lock(() -> (foreach(f -> f(), r.releases); empty!(r.
         end
     end
 
+    @testset "a hub that detaches tells the worker, which stops using the channel at once" begin
+        s = server()
+        r = Recorder()
+        h = client(s, handler(r); window = 1 << 20)
+        try
+            @test waitfor(() -> emit_attached(s))
+            emit_close!(h)
+            @test waitfor(() -> !emit_attached(s); timeout = 3)   # no send needed to find out
+            @test (@elapsed emit_send!(s, EMIT_KIND_JSON, UInt8[1])) < 0.5
+        finally
+            emit_close!(s)
+        end
+    end
+
     @testset "a hub that goes away detaches the channel instead of blocking it" begin
         s = server()
         r = Recorder()

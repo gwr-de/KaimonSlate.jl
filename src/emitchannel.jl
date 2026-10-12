@@ -140,6 +140,8 @@ function _emit_credit_loop(s::EmitServer)
                     s.window = n; s.credit = n; s.attached = true
                 elseif msg[1] == 'C'
                     s.credit += n
+                elseif msg[1] == 'D'           # the hub is detaching: emits take the gate stream from now
+                    s.attached = false
                 end
                 notify(s.cond)
             end
@@ -317,6 +319,11 @@ function _emit_receive_loop(c::EmitClient, on_message)
 end
 
 function emit_close!(c::EmitClient)
+    # Tell the worker first, so its next emit takes the gate stream at once instead of waiting out a
+    # send to a hub that is gone. The credit socket lingers long enough to deliver it.
+    lock(c.lock) do
+        try; c.credit_sock.linger = 1000; c.Z.send(c.credit_sock, "D0"); catch; end
+    end
     c.running[] = false
     try; wait(c.task); catch; end
     try; close(c.data); catch; end
