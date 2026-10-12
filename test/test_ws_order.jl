@@ -89,15 +89,16 @@ end
 end
 
 # A frame's "sent" callback runs once per page: after the write, at once when the frame is dropped, and
-# when the page goes away with the frame still queued. The emit channel's buffers and credit depend on it.
+# when the page goes away with the frame still queued. It is told which: only a write grants the emit
+# channel its credit back. The emit channel's buffers and credit depend on it.
 @testset "a frame's sent callback runs once, whatever becomes of it" begin
     # Sent: after the stand-in socket has it.
     ws = MockWS(); c = _wsconn(1024); c.ws = ws
     drain = @async try; _ws_drain!(c); catch; end
-    n = Threads.Atomic{Int}(0); f = zeros(UInt8, 100)
-    _ws_send!(c, f; on_sent = () -> Threads.atomic_add!(n, 1))
-    t0 = time(); while n[] == 0 && time() - t0 < 5; sleep(0.01); end
-    @test n[] == 1
+    got = Bool[]; f = zeros(UInt8, 100)
+    _ws_send!(c, f; on_sent = w -> push!(got, w))
+    t0 = time(); while isempty(got) && time() - t0 < 5; sleep(0.01); end
+    @test got == [true]
     @test any(x -> x === f, ws.got)
     @test isempty(c.onsent)
     close(c.out)
@@ -106,18 +107,46 @@ end
     c2 = _wsconn(1024; maxbytes = 100)
     lock(c2.wlock)                                   # nothing drains
     _ws_send!(c2, zeros(UInt8, 80))
-    m = Threads.Atomic{Int}(0)
-    _ws_send!(c2, zeros(UInt8, 80); on_sent = () -> Threads.atomic_add!(m, 1))
-    @test m[] == 1 && isempty(c2.onsent)
+    got2 = Bool[]
+    _ws_send!(c2, zeros(UInt8, 80); on_sent = w -> push!(got2, w))
+    @test got2 == [false] && isempty(c2.onsent)
 
     # The page went away with frames still queued: their callbacks run when it is torn down.
-    k = Threads.Atomic{Int}(0)
+    got3 = Bool[]
     c3 = _wsconn(1024)
-    for _ in 1:3; _ws_send!(c3, zeros(UInt8, 10); on_sent = () -> Threads.atomic_add!(k, 1)); end
+    for _ in 1:3; _ws_send!(c3, zeros(UInt8, 10); on_sent = w -> push!(got3, w)); end
     close(c3.out); NS._ws_release_pending!(c3)
-    @test k[] == 3
-    _ws_send!(c3, zeros(UInt8, 10); on_sent = () -> Threads.atomic_add!(k, 1))   # closed: at once
-    @test k[] == 4
+    @test got3 == [false, false, false]
+    _ws_send!(c3, zeros(UInt8, 10); on_sent = w -> push!(got3, w))   # closed: at once
+    @test got3 == fill(false, 4)
+end
+
+# A page that stops reading keeps a full queue forever. Once it has gone `WS_STALL_S` without a write,
+# the next drop closes it, and the frame being written when that happens keeps its callback until the
+# write ends.
+mutable struct StuckWS
+    aborted::Bool
+    gate::Channel{Nothing}
+end
+NS._raw_send(ws::StuckWS, frame) = take!(ws.gate)
+NS._raw_abort(ws::StuckWS) = (ws.aborted = true; close(ws.gate))
+@testset "a page that stops reading is closed" begin
+    ws = StuckWS(false, Channel{Nothing}(0))
+    c = _wsconn(1024; maxbytes = 100); c.ws = ws
+    drain = @async try; _ws_drain!(c); catch; end
+    got = Bool[]
+    _ws_send!(c, zeros(UInt8, 80); on_sent = w -> push!(got, w))   # taken by the drain, write blocks
+    t0 = time(); while Base.n_avail(c.out) > 0 && time() - t0 < 5; sleep(0.01); end
+    _ws_send!(c, zeros(UInt8, 80))                                  # queued behind it
+    _ws_send!(c, zeros(UInt8, 80))                                  # dropped, but not stalled long
+    @test !ws.aborted && isopen(c.out)
+    NS._ws_release_pending!(c)
+    @test isempty(got)                                              # the blocked write still owns its buffer
+    c.wrote_at[] = time() - NS.WS_STALL_S[] - 1
+    _ws_send!(c, zeros(UInt8, 80))                                  # dropped, and stalled: closed
+    @test ws.aborted && !isopen(c.out)
+    t0 = time(); while isempty(got) && time() - t0 < 5; sleep(0.01); end
+    @test got == [false]                                            # the aborted write ends unwritten
 end
 
 # Overflow keeps its old contract: drop, count, and say so — never silently coalesce.

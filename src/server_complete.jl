@@ -3641,19 +3641,29 @@ mutable struct _WSConn
     maxbytes::Int
     # Frames queued with a "sent" callback (`_ws_send!`'s `on_sent`), called once the frame has been
     # written to the socket, or when it can no longer be (dropped, or the page went away). Guarded by
-    # `qlock`. This is how a frame's buffer and its sender's credit come back (`_ws_broadcast!`).
+    # `qlock`. This is how a frame's buffer and its sender's credit come back (`_ws_broadcast!`). The
+    # callback is told whether the frame was written (`true`) or not.
     onsent::IdDict{Any,Any}
+    # When the drain last finished a write. A page whose queue is full and has not taken a frame for
+    # `WS_STALL_S` is no longer reading, and is closed (`_ws_abandon!`).
+    wrote_at::Threads.Atomic{Float64}
 end
 # The most a page's queue holds, in bytes. A frame larger than this still goes when the queue is empty.
 const WS_QUEUE_BYTES = Ref(256 * 1024 * 1024)
+# How long a page with a full queue may go without completing a write before it is closed.
+const WS_STALL_S = Ref(10.0)
 _wsconn(cap::Int; maxbytes::Integer = WS_QUEUE_BYTES[]) =
     _WSConn(Channel{Union{String,Vector{UInt8}}}(cap), Threads.Atomic{Int}(0), nothing,
-            ReentrantLock(), ReentrantLock(), Threads.Atomic{Int}(0), Int(maxbytes), IdDict{Any,Any}())
+            ReentrantLock(), ReentrantLock(), Threads.Atomic{Int}(0), Int(maxbytes), IdDict{Any,Any}(),
+            Threads.Atomic{Float64}(time()))
 
 # The one place bytes reach the socket. A named function rather than an inline call so the ordering
 # rules below can be tested against a stand-in socket — they are concurrency invariants, and a real
 # WebSocket is the one thing a test of them does not need.
 _raw_send(ws, frame) = HTTP.WebSockets.send(ws, frame)
+# Close the connection under the socket without the closing handshake, which would itself have to be
+# written to a peer that is not reading. The read loop then ends and tears the page down.
+_raw_abort(ws) = ws.close_transport!()
 
 # Drain whatever is queued, in order, until the channel closes: one wake clears the whole backlog, so a
 # burst costs one wakeup rather than one per frame. `wait` parks until something is queued WITHOUT
@@ -3668,11 +3678,15 @@ function _ws_drain!(c::_WSConn)
         lock(c.wlock) do
             while isready(c.out)
                 f = take!(c.out)
+                # Its callback leaves the table before the write, so a teardown while the write blocks
+                # cannot hand back a buffer that is still being written.
+                cb = _ws_take_cb!(c, f)
                 t0 = time_ns()
                 ok = false
                 try
                     _raw_send(c.ws, f)
                     ok = true
+                    c.wrote_at[] = time()
                 finally
                     # With SlateDiag on: each socket write, by kind, as a route of its own, so the
                     # time a page's socket takes per frame shows beside the hub's requests.
@@ -3680,27 +3694,34 @@ function _ws_drain!(c::_WSConn)
                         SlateDiag.diag_record!(f isa Vector{UInt8} ? "WS send binary" : "WS send text",
                                                time_ns() - t0, sizeof(f), ok)
                     Threads.atomic_sub!(c.queued, sizeof(f))
-                    _ws_sent!(c, f)
+                    _ws_sent!(cb, ok)
                 end
             end
         end
     end
 end
 
-# The "sent" callback of frame `f`, if it has one, now that the drain has written it. `invokelatest`: the
-# drain task lives as long as the page and stays in the world it started in, so a callback defined after
-# that would not be callable from it.
-function _ws_sent!(c::_WSConn, f)
-    f isa Vector{UInt8} || return nothing
-    cb = lock(c.qlock) do; isempty(c.onsent) ? nothing : pop!(c.onsent, f, nothing); end
-    cb === nothing || (try; Base.invokelatest(cb); catch; end)
-    return nothing
-end
+# The "sent" callback of frame `f`, if it has one, taken out of the table.
+_ws_take_cb!(c::_WSConn, f) = f isa Vector{UInt8} ?
+    lock(c.qlock) do; isempty(c.onsent) ? nothing : pop!(c.onsent, f, nothing); end : nothing
+
+# Run a frame's "sent" callback. `invokelatest`: the drain task lives as long as the page and stays in
+# the world it started in, so a callback defined after that would not be callable from it.
+_ws_sent!(cb, written::Bool) = (cb === nothing || (try; Base.invokelatest(cb, written); catch; end); nothing)
 
 # A page that went away: whatever it still had queued will never be sent, so its callbacks run now.
 function _ws_release_pending!(c::_WSConn)
     cbs = lock(c.qlock) do; v = collect(values(c.onsent)); empty!(c.onsent); v; end
-    foreach(cb -> (try; Base.invokelatest(cb); catch; end), cbs)
+    foreach(cb -> _ws_sent!(cb, false), cbs)
+    return nothing
+end
+
+# Close a page that has stopped reading. Its queue is full and stays full, so every frame for it is
+# dropped. A page that is still alive reconnects.
+function _ws_abandon!(c::_WSConn)
+    SlateDiag.diag_enabled() && SlateDiag.diag_record!("WS page abandoned", 0, c.queued[], false)
+    close(c.out)
+    c.ws === nothing || (try; _raw_abort(c.ws); catch; end)
     return nothing
 end
 
@@ -3717,7 +3738,7 @@ end
 # `on_sent`, when given, is called once the frame has been written, or at once if it is dropped.
 function _ws_send!(c::_WSConn, msg::Union{AbstractString,Vector{UInt8}}; on_sent = nothing)
     if !isopen(c.out)
-        on_sent === nothing || on_sent()
+        on_sent === nothing || on_sent(false)
         return nothing
     end
     frame = msg isa AbstractString ? String(msg) : msg
@@ -3732,7 +3753,10 @@ function _ws_send!(c::_WSConn, msg::Union{AbstractString,Vector{UInt8}}; on_sent
         bytes = sizeof(frame) + sizeof(marker)
         q = c.queued[]
         if c.out.sz_max - Base.n_avail(c.out) < need || (q > 0 && q + bytes > c.maxbytes)
-            Threads.atomic_add!(c.dropped, 1); return false
+            Threads.atomic_add!(c.dropped, 1)
+            SlateDiag.diag_enabled() && SlateDiag.diag_record!("WS drop", 0, bytes, false)
+            time() - c.wrote_at[] > WS_STALL_S[] && _ws_abandon!(c)
+            return false
         end
         # Claimed only once there is room for it. Taking the count first and then failing to enqueue
         # is how a drop episode went unreported: the client is never told it fell behind.
@@ -3756,13 +3780,15 @@ function _ws_send!(c::_WSConn, msg::Union{AbstractString,Vector{UInt8}}; on_sent
         end
         return true
     end
-    queued || on_sent === nothing || on_sent()
+    queued || on_sent === nothing || on_sent(false)
     return nothing
 end
 
 # Send a pre-built frame (a JSON text frame, or a raw binary numeric frame) to every live page socket of a
 # notebook (no-op when none are connected). With `release`, it is called once every page has sent the
-# frame (or dropped it, or gone away), and at once when no page is open; `grant`, once the first has.
+# frame (or dropped it, or gone away), and at once when no page is open; `grant`, once the first page
+# has WRITTEN it. A drop does not grant: a page that has stopped reading drops every frame at once, and
+# granting on that would let the sender run ahead of every page that is still reading.
 function _ws_broadcast!(nb::LiveNotebook, frame::Union{AbstractString,Vector{UInt8}}; release = nothing,
                        grant = nothing)
     conns = lock(_WS_LOCK) do; v = get(_WS_CONNS, nb.id, nothing); v === nothing ? _WSConn[] : copy(v); end
@@ -3776,8 +3802,8 @@ function _ws_broadcast!(nb::LiveNotebook, frame::Union{AbstractString,Vector{UIn
     end
     left = Threads.Atomic{Int}(length(conns))
     first_done = Threads.Atomic{Bool}(false)
-    done = () -> begin
-        grant === nothing || Threads.atomic_xchg!(first_done, true) || grant()
+    done = written -> begin
+        grant === nothing || !written || Threads.atomic_xchg!(first_done, true) || grant()
         Threads.atomic_sub!(left, 1) == 1 && release()
         nothing
     end
