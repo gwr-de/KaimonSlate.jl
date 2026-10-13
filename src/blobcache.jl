@@ -94,41 +94,122 @@ function cached_spans(blob::AbstractString)
     return have
 end
 
+# Replace the recorded spans of `blob`. The caller holds the blob's lock.
+function _write_have!(blob, have)
+    f = _have_file(blob)
+    tmp = string(f, ".", getpid(), ".", string(rand(UInt32); base = 16))
+    open(tmp, "w") do io
+        for (lo, hi) in have; println(io, lo, ' ', hi); end
+    end
+    mv(tmp, f; force = true)
+end
+
 function _add_have!(blob, spans)
     isempty(spans) && return
-    f = _have_file(blob)
-    _with_blob_lock(blob) do
-        have = _merge_spans(vcat(_read_have(blob), spans))
-        tmp = string(f, ".", getpid(), ".", string(rand(UInt32); base = 16))
-        open(tmp, "w") do io
-            for (lo, hi) in have; println(io, lo, ' ', hi); end
-        end
-        mv(tmp, f; force = true)
-    end
+    _with_blob_lock(() -> _write_have!(blob, _merge_spans(vcat(_read_have(blob), spans))), blob)
     return
 end
 
-# Copy a landed piece — the bytes of `group` ((offset, length) pairs) back to back — into the blob's
-# file at their offsets. Writing past the end leaves a hole, which is what keeps the file sparse.
-function _scatter!(blob, piece, group)
+# ── Keeping blob files sparse ────────────────────────────────────────────────────────────────
+# A blob file holds only the ranges fetched; the rest must take no disk. A filesystem may or may not
+# leave a hole when a write lands past the end of a file, so the gap is deallocated explicitly:
+# F_PUNCHHOLE on macOS, fallocate(PUNCH_HOLE) on Linux. Elsewhere, or where the filesystem refuses,
+# the file is merely larger on disk than it needs to be.
+
+const _HOLE_ALIGN = 4096
+
+# Deallocate [lo, hi) of the open file `io`, rounded inward to whole filesystem blocks.
+function _punch_hole!(io::IOStream, lo::Integer, hi::Integer)
+    a = cld(lo, _HOLE_ALIGN) * _HOLE_ALIGN
+    b = fld(hi, _HOLE_ALIGN) * _HOLE_ALIGN
+    b > a || return false
+    fd = Base.Libc.fd(io)
+    if Sys.isapple()
+        # struct fpunchhole { unsigned int fp_flags; unsigned int reserved; off_t fp_offset; off_t fp_length; }
+        arg = Ref((Cuint(0), Cuint(0), Int64(a), Int64(b - a)))
+        return ccall(:fcntl, Cint, (Cint, Cint, Ptr{Cvoid}...), fd, 99, arg) == 0   # F_PUNCHHOLE
+    elseif Sys.islinux()
+        return ccall(:fallocate, Cint, (Cint, Cint, Int64, Int64), fd, 0x03, a, b - a) == 0  # PUNCH_HOLE | KEEP_SIZE
+    end
+    return false
+end
+
+"""
+    compact_blob!(blob) -> Int
+
+Give back to the filesystem every part of `blob`'s cache file outside the ranges it holds, returning
+the bytes the file takes on disk afterwards.
+"""
+function compact_blob!(blob::AbstractString)
     path = _cache_file(blob)
-    touch(path)                       # creates without truncating, and marks the blob used
-    buf = Vector{UInt8}(undef, 4 << 20)
-    open(path, "r+") do out
-        open(piece, "r") do inp
-            for (off, len) in group
-                seek(out, off)
-                left = len
-                while left > 0
-                    n = readbytes!(inp, buf, min(left, length(buf)))
-                    n == 0 && error("piece $(basename(piece)) is shorter than its ranges")
-                    write(out, view(buf, 1:n))
-                    left -= n
-                end
+    isfile(path) || return 0
+    _with_blob_lock(blob) do
+        gaps = _subtract([(0, filesize(path))], _merge_spans(_read_have(blob)))
+        open(path, "r+") do io
+            for (lo, hi) in gaps
+                _punch_hole!(io, lo, hi)
             end
         end
     end
-    _add_have!(blob, [(o, o + l) for (o, l) in group])
+    return _on_disk(path)
+end
+
+"""
+    evict!(blob, spans) -> Int
+
+Remove the byte ranges `spans` (`(lo, hi)` half-open) of `blob` from the cache: they are dropped from
+its record and their disk given back. Returns the bytes the file takes on disk afterwards. Evicting
+everything removes the file.
+"""
+function evict!(blob::AbstractString, spans)
+    path = _cache_file(blob)
+    isfile(path) || return 0
+    drop = _merge_spans(spans)
+    _with_blob_lock(blob) do
+        have = _subtract(_merge_spans(_read_have(blob)), drop)
+        if isempty(have)
+            rm(_have_file(blob); force = true)
+            rm(path; force = true)
+            return
+        end
+        _write_have!(blob, have)
+        open(path, "r+") do io
+            for (lo, hi) in _subtract([(0, filesize(path))], have)
+                _punch_hole!(io, lo, hi)
+            end
+        end
+    end
+    return isfile(path) ? _on_disk(path) : 0
+end
+
+# Copy a landed piece — the bytes of `group` ((offset, length) pairs) back to back — into the blob's
+# file at their offsets. A write past the end leaves the gap before it as a hole.
+function _scatter!(blob, piece, group)
+    path = _cache_file(blob)
+    buf = Vector{UInt8}(undef, 4 << 20)
+    # The bytes and the record of them change together, under the blob's lock: compaction and
+    # eviction deallocate what the record does not list, so they must never see one without the other.
+    _with_blob_lock(blob) do
+        touch(path)                   # creates without truncating, and marks the blob used
+        eof0 = filesize(path)
+        open(path, "r+") do out
+            open(piece, "r") do inp
+                for (off, len) in group
+                    seek(out, off)
+                    left = len
+                    while left > 0
+                        n = readbytes!(inp, buf, min(left, length(buf)))
+                        n == 0 && error("piece $(basename(piece)) is shorter than its ranges")
+                        write(out, view(buf, 1:n))
+                        left -= n
+                    end
+                end
+            end
+            start = minimum(first, group)
+            start > eof0 && _punch_hole!(out, eof0, start)
+        end
+        _write_have!(blob, _merge_spans(vcat(_read_have(blob), [(o, o + l) for (o, l) in group])))
+    end
 end
 
 # ── Fetching ─────────────────────────────────────────────────────────────────────────────────

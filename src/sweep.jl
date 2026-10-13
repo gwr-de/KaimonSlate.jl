@@ -2757,6 +2757,28 @@ function coverage(p::DatasetPart, d::Integer)
     return out
 end
 
+"""
+    evict!(part)             -> Int
+    evict!(part, i, j, …)    -> Int
+
+Remove the part, or a selection of it, from this machine's blob cache, freeing its disk. Returns the
+bytes the blob's file still takes. Nothing to do for a store this machine opens directly.
+"""
+function evict!(p::DatasetPart, I::Vararg{PartIndex,N}) where {N}
+    p.src isa SshSource || return 0
+    blob = String(p.index["blob"])
+    if N == 0
+        lo = Int(p.index["offset"])
+        return evict!(blob, [(lo, _blob_end(p))])
+    end
+    _, runs = _selection_runs(p, I)
+    _, spans = _run_spans(p, runs)
+    # Whole cache pages only: a page shared with what stays is kept.
+    pg = CACHE_PAGE[]
+    inner = [(cld(o, pg) * pg, fld(o + l, pg) * pg) for (o, l) in spans]
+    return evict!(blob, [(a, b) for (a, b) in inner if b > a])
+end
+
 "Keep this part's bytes in the blob cache whatever its size and age (`unpin!` to release them)."
 pin!(p::DatasetPart) = (p.src isa SshSource && pin!(String(p.index["blob"])); nothing)
 unpin!(p::DatasetPart) = (p.src isa SshSource && unpin!(String(p.index["blob"])); nothing)

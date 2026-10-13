@@ -1066,6 +1066,24 @@ const MS = RE.MemoStore
             finally
                 RE.Sweep.STREAM_MIN_BYTES[], RE.Sweep.BULK_BYTES[], RE.Sweep.CHUNK_BYTES[], RE.Sweep.CACHE_PAGE[] = olds2
             end
+            # Evicting frames drops them from the record and frees their disk; the rest stays readable.
+            # Evicting the whole part removes the file.
+            olds3 = RE.Sweep.CACHE_PAGE[]
+            try
+                RE.Sweep.CACHE_PAGE[] = 8
+                @test q[:, :, :] == A
+                RE.Sweep.evict!(q, :, :, 2:3)
+                @test RE.Sweep.coverage(q, 3) == Bool[1, 0, 0, 1, 1]
+                @test RE.Sweep.query_cost(q, :, :, 4:5).missing == 0
+                @test q[:, :, 4] == A[:, :, 4]
+                @test RE.Sweep.compact_blob!(q.index["blob"]) >= 0
+                @test q[:, :, 1:5] == A                      # the evicted frames are fetched again
+                RE.Sweep.evict!(q)
+                @test !isfile(RE.Sweep._cache_file(q.index["blob"])) && RE.Sweep.coverage(q).present == 0
+                @test q[:, :, :] == A                        # read back in, for what follows
+            finally
+                RE.Sweep.CACHE_PAGE[] = olds3
+            end
             # Byte spans: what is missing from what is held.
             @test RE.Sweep._subtract([(0, 10), (20, 30)], [(5, 25)]) == [(0, 5), (25, 30)]
             @test RE.Sweep._subtract([(0, 10)], Tuple{Int,Int}[]) == [(0, 10)]
