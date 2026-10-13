@@ -2773,10 +2773,9 @@ function evict!(p::DatasetPart, I::Vararg{PartIndex,N}) where {N}
     end
     _, runs = _selection_runs(p, I)
     _, spans = _run_spans(p, runs)
-    # Whole cache pages only: a page shared with what stays is kept.
-    pg = CACHE_PAGE[]
-    inner = [(cld(o, pg) * pg, fld(o + l, pg) * pg) for (o, l) in spans]
-    return evict!(blob, [(a, b) for (a, b) in inner if b > a])
+    # The selection's exact bytes leave the record; only the disk given back is rounded inward, to
+    # whole filesystem blocks, so a block shared with what stays is kept for it.
+    return evict!(blob, [(o, o + l) for (o, l) in spans])
 end
 
 "Keep this part's bytes in the blob cache whatever its size and age (`unpin!` to release them)."

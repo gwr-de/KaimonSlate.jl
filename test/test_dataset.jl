@@ -1074,6 +1074,7 @@ const MS = RE.MemoStore
                 @test q[:, :, :] == A
                 RE.Sweep.evict!(q, :, :, 2:3)
                 @test RE.Sweep.coverage(q, 3) == Bool[1, 0, 0, 1, 1]
+                @test RE.Sweep.query_cost(q, :, :, 2:3).missing == 2 * 12 * 8   # all of them, to the byte
                 @test RE.Sweep.query_cost(q, :, :, 4:5).missing == 0
                 @test q[:, :, 4] == A[:, :, 4]
                 @test RE.Sweep.compact_blob!(q.index["blob"]) >= 0

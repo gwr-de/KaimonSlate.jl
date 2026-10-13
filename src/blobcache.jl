@@ -327,8 +327,10 @@ function _fetch_spans!(src::SshSource, blob::String, spans::Vector{Tuple{Int,Int
                              for (i, (pt, pc)) in enumerate(zip(parts, pieces)) if !committed[i]); init = 0)
     t0 = time()
     outcome = "failed"
+    got = Ref{Any}(nothing)                 # the results, for the cleanup below to read
+    thrown = Ref("")                        # …or what the fetch threw instead
     results = try
-        _await_fetch(landed, () -> foreach(pt -> (try; cancel_fetch!(pt); catch; end), parts),
+        got[] = _await_fetch(landed, () -> foreach(pt -> (try; cancel_fetch!(pt); catch; end), parts),
                      total, label; hooks) do
             if total < BULK_BYTES[]        # small: one read on the host's session, no new connection
                 claim(1) || return [(true, 0, "")]
@@ -341,7 +343,7 @@ function _fetch_spans!(src::SshSource, blob::String, spans::Vector{Tuple{Int,Int
             end
         end
     catch e
-        e isa InterruptException && (outcome = "stopped")
+        e isa InterruptException ? (outcome = "stopped") : (thrown[] = first(sprint(showerror, e), 300))
         rethrow()
     finally
         # What landed is kept whether the rest succeeded, failed or was stopped.
@@ -349,8 +351,12 @@ function _fetch_spans!(src::SshSource, blob::String, spans::Vector{Tuple{Int,Int
             try; commit(i); catch; end
             rm(parts[i]; force = true); rm(pieces[i]; force = true)
         end
-        all(committed) && (outcome = "done")
-        kept[] > 0 && _log_transfer(t0, time() - t0, src.host, blob, kept[], label, outcome)
+        # Done when every chunk landed, here or by a reader that had claimed it; a chunk skipped for
+        # another reader counts as done.
+        fails = got[] === nothing ? String[] : String[r[3] for r in got[] if !r[1]]
+        got[] !== nothing && isempty(fails) && (outcome = "done")
+        why = outcome != "failed" ? "" : isempty(fails) ? thrown[] : fails[1]
+        kept[] > 0 && _log_transfer(t0, time() - t0, src.host, blob, kept[], label, outcome, why)
     end
     _BLOB_FETCHED[] += kept[]
     if _BLOB_FETCHED[] > blob_cap() ÷ 8
@@ -359,20 +365,21 @@ function _fetch_spans!(src::SshSource, blob::String, spans::Vector{Tuple{Int,Int
     end
     ok = all(first, results)
     ok || error("reading $(_bytes(total)) of $(label) from $(src.host) failed: " *
-                something((r[3] for r in results if !r[1]), "failed"))
+                something(findfirst(r -> !r[1], results) |> (i -> i === nothing ? nothing : results[i][3]), "failed"))
     return
 end
 
 # ── The transfer log ─────────────────────────────────────────────────────────────────────────
 # One line per fetch that landed bytes, kept beside the blobs so every program reading through this
 # cache, notebooks included, writes and reads the same history: when, how long, from where, which
-# blob, how many bytes, for what, and whether it finished.
+# blob, how many bytes, for what, whether it finished, and why not when it failed.
 
 _transfer_log_file() = joinpath(blob_cache_dir(), "transfers.log")
 
-function _log_transfer(t0, seconds, host, blob, bytes, label, outcome)
+function _log_transfer(t0, seconds, host, blob, bytes, label, outcome, why = "")
+    clean(x) = replace(String(x), r"[\t\n]" => " ")
     line = join((round(t0; digits = 3), round(seconds; digits = 3), host, blob, bytes,
-                 replace(String(label), r"[\t\n]" => " "), outcome), '\t') * '\n'
+                 clean(label), outcome, first(clean(why), 300)), '\t') * '\n'
     try
         open(io -> write(io, line), _transfer_log_file(); append = true)
     catch
@@ -384,22 +391,24 @@ end
     transfer_log(; blob = nothing, host = nothing, n = 1000) -> Vector{NamedTuple}
 
 The fetches that landed bytes in this machine's blob cache, newest first:
-`(; at, seconds, host, blob, bytes, label, outcome)`, where `outcome` is "done", "stopped" or "failed".
+`(; at, seconds, host, blob, bytes, label, outcome, why)`, where `outcome` is "done", "stopped" or
+"failed" and `why` the failure's reason.
 """
 function transfer_log(; blob = nothing, host = nothing, n::Integer = 1000)
     f = _transfer_log_file()
-    T = NamedTuple{(:at, :seconds, :host, :blob, :bytes, :label, :outcome),
-                   Tuple{Float64,Float64,String,String,Int,String,String}}
+    T = NamedTuple{(:at, :seconds, :host, :blob, :bytes, :label, :outcome, :why),
+                   Tuple{Float64,Float64,String,String,Int,String,String,String}}
     out = T[]
     isfile(f) || return out
     for l in Iterators.reverse(readlines(f))
         a = split(l, '\t')
-        length(a) == 7 || continue
+        length(a) >= 7 || continue
         at, sec, b = tryparse(Float64, a[1]), tryparse(Float64, a[2]), tryparse(Int, a[5])
         (at === nothing || sec === nothing || b === nothing) && continue
         blob === nothing || a[4] == blob || continue
         host === nothing || a[3] == host || continue
-        push!(out, T((at, sec, String(a[3]), String(a[4]), b, String(a[6]), String(a[7]))))
+        push!(out, T((at, sec, String(a[3]), String(a[4]), b, String(a[6]), String(a[7]),
+                      length(a) >= 8 ? String(a[8]) : "")))
         length(out) >= n && break
     end
     return out
