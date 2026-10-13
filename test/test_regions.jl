@@ -2692,7 +2692,7 @@ end
             @test under(RE._slate_cache_dir())
             @test under(RE._overflow_dir())
             @test under(NS._memo_root())
-            @test under(RE.Sweep._blob_cache_dir())
+            @test under(RE.Sweep.blob_cache_dir())
             @test under(RE.Sweep.RemoteStore("", "/x").mirror)
             @test under(NS._chat_log_file("k"))
             @test under(NS._doc_cache_file())
