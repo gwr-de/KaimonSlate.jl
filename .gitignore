@@ -39,3 +39,7 @@ build/cm6/package-lock.json
 /.wrangler/
 dev/node_modules/
 dev/package-lock.json
+
+# Working notes: design drafts, audits, handoffs. Kept on disk, never committed.
+docs/_*
+dev/*.md
