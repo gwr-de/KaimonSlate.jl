@@ -1,7 +1,8 @@
-# Buffers for large binary stream frames, reused from frame to frame. A frame is encoded into a buffer
-# taken here, the gate's broadcaster sends it, and its release callback gives the buffer back once
-# `send` has copied the bytes into libzmq. Without this, every frame of a stream of large frames was a
-# new allocation of the frame's size, and the collector ran full collections to keep up.
+# Buffers for binary stream frames on the emit channel, reused from frame to frame. The worker encodes a
+# frame into a buffer taken here and gives it back once `send` has copied the bytes into libzmq; the hub
+# receives into one and gives it back once every page has sent it. Without this, every frame of a stream
+# of large frames was a new allocation of the frame's size, and the collector ran full collections to
+# keep up.
 #
 # At most `cap` idle buffers are kept, so a stream that has stopped holds no more than that. A buffer
 # taken while none is idle is a new one, and one given back to a full pool is dropped: either way the
