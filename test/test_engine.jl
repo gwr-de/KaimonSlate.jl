@@ -248,15 +248,15 @@ mean(data)
     @testset "progress-logging bridge → cell meter" begin
         rec = NamedTuple[]   # (id, frac, msg, done)
         lg = ReportEngine._CellLogger(Logging.NullLogger(),
-                                          (i, f, m, d) -> push!(rec, (id = i, frac = f, msg = m, done = d)), "fit")
-        cells = Logging.with_logger(lg) do
+                                          (i, f, m, d) -> push!(rec, (id = i, frac = f, msg = m, done = d)))
+        cells = Logging.with_logger(lg) do; Base.ScopedValues.with(ReportEngine._CELL_ID => "fit") do
             Logging.@logmsg Logging.LogLevel(-1) "train" progress = 0.5 _id = :bar1
             Logging.@logmsg Logging.LogLevel(-1) "inner" progress = 0.25 _id = :bar2   # a SECOND scope id
             Logging.@logmsg Logging.LogLevel(-1) "train" progress = "done" _id = :bar1
             @info "ordinary log — not progress"        # must NOT reach the sink
-            # Progress is attributed to the cell through its logger, which a spawned task inherits.
+            # Progress is attributed to the cell its eval scoped, which a spawned task inherits.
             (ReportEngine._current_cell_id(), fetch(Threads.@spawn ReportEngine._current_cell_id()))
-        end
+        end; end
         @test cells == ("fit", "fit")
         @test ReportEngine._current_cell_id() == ""                # outside a cell eval
         @test length(rec) == 3
