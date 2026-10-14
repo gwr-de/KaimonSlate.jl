@@ -419,6 +419,16 @@ _CellLogger(parent::Logging.AbstractLogger, sink) =
         min_level = min(Logging.LogLevel(-1), Logging.min_enabled_level(parent)),
         shouldlog = (_...) -> true)                                     # filter in `_cell_log`
 
+# The cell that progress reported from the current task belongs to. Set around the cell's evaluation,
+# and a task the cell spawns inherits it, so a `Threads.@spawn`ed loop calling `slate_progress` is
+# attributed to the cell that started it. "" outside a cell eval.
+const _CELL_ID = Base.ScopedValues.ScopedValue("")
+function _current_cell_id()
+    c = _CELL_ID[]
+    isempty(c) || return c
+    return String(get(task_local_storage(), :slate_cell, ""))
+end
+
 _progress_frac(p) = p === nothing                  ? 0.0 :
                     p isa AbstractString           ? (p == "done" ? 1.0 : 0.0) :
                     p isa Real                     ? (isnan(p) ? 0.0 : clamp(Float64(p), 0.0, 1.0)) : 0.0
@@ -1040,7 +1050,7 @@ function run_capture(mod::Module, source::AbstractString, filename::AbstractStri
         # spans. Wrapped so ProgressLogging `@progress` records drive the cell meter instead of printing.
         _logger = _CellLogger(Logging.ConsoleLogger(_logio(capture)), _progress_sink(mod))
         Logging.with_logger(_logger) do
-            Base.ScopedValues.with(_STOP_FLAG => stop) do
+            Base.ScopedValues.with(_STOP_FLAG => stop, _CELL_ID => String(cid)) do
                 value = _profiled(() -> _eval_cell_source(mod, source, filename), cid; mod = mod)   # profile.jl: when armed
             end
         end

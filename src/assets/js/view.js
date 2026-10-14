@@ -1577,8 +1577,12 @@ function cancelSource(id) {
 // store. renderAll/updateStates now just publish the state + refresh the chrome; the component
 // diffs cells by id (so editors survive structural ops) and does per-cell output processing in
 // effects. The old full-wipe rebuild and the in-place patch collapse into one publish.
-function renderAll(state)    { _publishState(state); window.loadScratch && window.loadScratch(state && state.scratch); }
-function updateStates(state) { _publishState(state); window.loadScratch && window.loadScratch(state && state.scratch); }
+function renderAll(state)    { _publishState(state); _afterFullState(state); }
+function updateStates(state) { _publishState(state); _afterFullState(state); }
+function _afterFullState(state) {
+  window.loadScratch && window.loadScratch(state && state.scratch);
+  window.onRunState && state && window.onRunState(state);   // a page loaded mid-run picks the run up here
+}
 // Targeted live refresh (SSE `refresh:` / `celldone:`): merge ONLY the changed cells into the state
 // and publish, with no full-state GET.
 //
@@ -1655,7 +1659,7 @@ function markBlank(el, c) {
   el.classList.toggle('cell-blank', blank);
 }
 window.slateMarkBlank = markBlank;
-function resetCellRevs() { for (const k in _cellRev) delete _cellRev[k]; _stateVersion = -1; }
+function resetCellRevs() { for (const k in _cellRev) delete _cellRev[k]; _stateVersion = -1; window.slateRunForgetRevs && window.slateRunForgetRevs(); }
 window.slateRevIsNew = revIsNew;
 window.slateRevMark = revMark;
 window.slateResetCellRevs = resetCellRevs;

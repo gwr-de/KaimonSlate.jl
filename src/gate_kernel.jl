@@ -740,7 +740,7 @@ function _ensure_poller!()
                 pending = Dict{String,Dict{String,String}}()
                 srcnames = Dict{String,Set{String}}()   # parent /src edits → changed def-names
                 srcerr = Dict{String,String}()          # parent /src parse/apply errors
-                prog = Dict{Tuple{String,String},Tuple{Float64,String,Bool}}()   # (notebook, bar id) → LATEST (frac,msg,done)
+                prog = Dict{Tuple{String,String,String},Tuple{Float64,String,Bool}}()   # (notebook, cell, bar id) → LATEST (frac,msg,done)
                 # Ordered `slate_emit` pushes, JSON and binary in one list so they reach the page in the order
                 # they were emitted: (rid, channel, deserialized VALUE), or (rid, nothing, raw binary frame)
                 # forwarded to the page WS as-is. NOT coalesced; each event matters.
@@ -786,11 +786,11 @@ function _ensure_poller!()
                         end
                     elseif m.channel == "slate_revise_err"    # a /src save didn't parse/apply
                         srcerr[rid] = String(m.data)
-                    elseif m.channel == "slate_progress"      # "id|frac|done|msg" — one bar per id
-                        parts = split(String(m.data), "|"; limit = 4)
-                        if length(parts) == 4
-                            prog[(rid, String(parts[1]))] =
-                                (something(tryparse(Float64, parts[2]), 0.0), String(parts[4]), parts[3] == "1")
+                    elseif m.channel == "slate_progress"      # "cid\x1fid\x1ffrac\x1fdone\x1fmsg" — one bar per (cell, id)
+                        parts = split(String(m.data), '\x1f'; limit = 5)
+                        if length(parts) == 5
+                            prog[(rid, String(parts[1]), String(parts[2]))] =
+                                (something(tryparse(Float64, parts[3]), 0.0), String(parts[5]), parts[4] == "1")
                         end
                     elseif m.channel == "slate_cellout"       # "cid\x1fstdout\x1fstderr" — a running cell's output so far
                         parts = split(String(m.data), '\x1f'; limit = 3)
@@ -840,8 +840,8 @@ function _ensure_poller!()
                 for ((rid, cid), (out, err)) in cellouts
                     _do_cellout(rid, cid, out, err)
                 end
-                for ((rid, bid), (frac, msg, done)) in prog
-                    _do_userprog(rid, frac, msg, bid, done)
+                for ((rid, cid, bid), (frac, msg, done)) in prog
+                    _do_userprog(rid, cid, bid, frac, msg, done)
                 end
                 for (rid, json) in prepares
                     _do_prepare(rid, json)

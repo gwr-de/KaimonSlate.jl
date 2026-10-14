@@ -218,15 +218,14 @@ function _wire_callbacks!(nb::LiveNotebook)
     register_srcchange!(nb.report.id, (names, err) -> server_src_changed(nb, names, err))  # parent /src reloaded (Revise)
     register_progress!(nb.report.id, c -> _broadcast_progress(nb, c))                      # stream per-cell run status to the UI
     register_runbatch!(nb.report.id, (n, fresh) -> (try; _broadcast(nb, "runbatch:$n:$(fresh ? 1 : 0)"); catch; end))   # run size + is-this-a-new-run → stable k/N
-    register_userprog!(nb.report.id, (frac, msg, id, done) -> begin
-        # Record before broadcasting: an agent BLOCKED on this run samples the latest reading
-        # from its own task (see `_note_run_progress`) rather than being pushed every frame,
-        # so a cell calling slate_progress at 10 Hz can't flood the agent's context. The
-        # browser keeps the unthrottled stream below — it drives a live progress bar.
-        lock(_USERPROG_LOCK) do
-            _LAST_USERPROG[nb.id] = (Float64(frac), String(msg), String(id), done === true, time())
-        end
-        try; _broadcast(nb, "cellprog:" * JSON.json(Dict("frac" => frac, "msg" => msg, "id" => id, "done" => done))); catch; end
+    register_userprog!(nb.report.id, (cid, id, frac, msg, done) -> begin
+        # Record before broadcasting. A page that loads mid-run reads the bars from /api/state, and
+        # an agent BLOCKED on this run samples the latest reading from its own task (see
+        # `_note_run_progress`) rather than being pushed every frame, so a cell calling
+        # slate_progress at 10 Hz can't flood the agent's context. The browser keeps the
+        # unthrottled stream below.
+        _live_progress!(nb, cid, id, frac, msg, done)
+        try; _broadcast(nb, "cellprog:" * JSON.json(Dict("cid" => cid, "frac" => frac, "msg" => msg, "id" => id, "done" => done))); catch; end
     end)
     # A running cell's output so far (already cooked worker-side). Sent as TEXT, not HTML: the page
     # renders it with the same `slateAnsiHtml` it uses for the build log and the worker log, and a
@@ -261,9 +260,9 @@ function _wire_callbacks!(nb::LiveNotebook)
     return nb
 end
 function _unwire_callbacks!(nb::LiveNotebook)
-    # A notebook id is REUSED the instant the same file is reopened, so a leftover reading here
+    # A notebook id is REUSED the instant the same file is reopened, so a leftover record here
     # would be reported against the new notebook's first run as if it described it.
-    lock(_USERPROG_LOCK) do; delete!(_LAST_USERPROG, nb.id); end
+    _live_clear!(nb)
     unregister_refresh!(nb.report.id); unregister_srcchange!(nb.report.id)
     unregister_progress!(nb.report.id); unregister_runbatch!(nb.report.id)
     unregister_userprog!(nb.report.id); unregister_emit!(nb.report.id)
@@ -904,15 +903,18 @@ function server_asset_changed(nb::LiveNotebook, changed::Vector{String})
 end
 
 # Live per-cell run status (registered via `register_progress!` per notebook): `eval_cell!` calls
-# this as each cell STARTS and FINISHES running. A start pushes a lightweight `cellrun:<id>` so the
-# UI marks that cell live (spinner + ticking timer + the topbar run pill); a finish pushes the single
+# this as each cell STARTS and FINISHES running. A start pushes a lightweight `cellrun:{id,rev}` so the
+# UI marks that cell live (spinner + ticking timer + the topbar run pill); the rev lets the page tell a
+# full state taken before this start from one taken after it finished. A finish pushes the single
 # cell's fresh `celldone:<cell_json>` so its result/error lights up the INSTANT it lands, mid-run,
 # instead of only when the whole run ends. Best-effort — a push must never disturb evaluation.
 function _broadcast_progress(nb::LiveNotebook, cell)
     try
         if is_running(cell)
-            _broadcast(nb, "cellrun:" * cell.id)
+            _live_start!(nb, cell.id)
+            _broadcast(nb, "cellrun:" * JSON.json(Dict("id" => cell.id, "rev" => cell.rev)))
         else
+            _live_finish!(nb, cell.id)
             bindref, hostednames = _bind_index(nb.report)
             bibctx = _bib_link_ctx(nb)
             figidx = figure_index(nb.report)
@@ -4491,9 +4493,9 @@ function _region_presync!(nb::LiveNotebook, cell::Cell, dst_k; dst_side::Abstrac
             f = done / total
             (f - lastfrac[] >= 0.02 || done >= total) || return nothing
             lastfrac[] = f
-            ReportEngine._do_userprog(nb.report.id, f,
+            ReportEngine._do_userprog(nb.report.id, cell.id, "xfer-" * cell.id, f,
                 "⇄ $(r): $(round(Int, done / 2^20))/$(round(Int, total / 2^20)) MB $arrow $whost",
-                "xfer-" * cell.id, done >= total)
+                done >= total)
             return nothing
         end
         t0 = time()
@@ -5620,9 +5622,79 @@ end
 # the caller's deadline and say what's happening, NOT to mirror the browser's progress bar. The
 # reading is latest-value-wins, so a burst of slate_progress frames collapses into one line.
 const _AGENT_PROGRESS_EVERY = 15.0
-# nb.id → the most recent slate_progress reading (frac, msg, bar id, done, when).
-const _LAST_USERPROG = Dict{String,Tuple{Float64,String,String,Bool,Float64}}()
-const _USERPROG_LOCK = ReentrantLock()
+
+# What a page loading mid-run can't learn from the event stream: when each running cell started and
+# the progress bars it shows now. Kept per cell, so `state_json` gives it to every page load and
+# resync, and cells running in parallel keep separate bars. Also what the agent progress line reads.
+mutable struct _CellLive
+    started::Float64                                    # epoch seconds
+    bars::Vector{Tuple{String,Float64,String,Float64}}  # (bar id, frac, msg, when), in order of appearance
+end
+const _CELL_LIVE = Dict{String,Dict{String,_CellLive}}()   # nb.id → cell id → live state
+const _CELL_LIVE_LOCK = ReentrantLock()
+
+# A cell started running. A region cell is marked RUNNING twice (while its worker comes up, then to
+# run), and the first is when the reader saw it start, so an existing record is kept.
+function _live_start!(nb::LiveNotebook, cid::AbstractString)
+    lock(_CELL_LIVE_LOCK) do
+        get!(() -> _CellLive(time(), Tuple{String,Float64,String,Float64}[]),
+             get!(Dict{String,_CellLive}, _CELL_LIVE, nb.id), String(cid))
+    end
+    return nothing
+end
+
+function _live_finish!(nb::LiveNotebook, cid::AbstractString)
+    lock(_CELL_LIVE_LOCK) do
+        d = get(_CELL_LIVE, nb.id, nothing)
+        d === nothing || delete!(d, String(cid))
+    end
+    return nothing
+end
+
+_live_clear!(nb::LiveNotebook) = (lock(_CELL_LIVE_LOCK) do; delete!(_CELL_LIVE, nb.id); end; nothing)
+
+# One bar reading. Only a cell with a live record takes it: a task that outlives its cell can go on
+# reporting, and there is no run left to attach that to.
+function _live_progress!(nb::LiveNotebook, cid::AbstractString, bid::AbstractString, frac::Float64,
+                         msg::AbstractString, done::Bool)
+    lock(_CELL_LIVE_LOCK) do
+        live = get(get(_CELL_LIVE, nb.id, Dict{String,_CellLive}()), String(cid), nothing)
+        live === nothing && return
+        i = findfirst(b -> b[1] == bid, live.bars)
+        if done
+            i === nothing || deleteat!(live.bars, i)
+        elseif i === nothing
+            push!(live.bars, (String(bid), frac, String(msg), time()))
+        else
+            live.bars[i] = (String(bid), frac, String(msg), time())
+        end
+    end
+    return nothing
+end
+
+# The running cells' live records, for `state_json`. A record whose cell is no longer RUNNING is
+# dropped here: most runs end through `_broadcast_progress`, but a reset (restart, worker loss) can
+# move a cell on without one.
+function _live_snapshot!(nb::LiveNotebook)
+    running = Set(c.id for c in nb.report.cells if is_running(c))
+    lock(_CELL_LIVE_LOCK) do
+        d = get(_CELL_LIVE, nb.id, nothing)
+        d === nothing && return Dict{String,_CellLive}()
+        filter!(kv -> kv.first in running, d)
+        return Dict(k => _CellLive(v.started, copy(v.bars)) for (k, v) in d)
+    end
+end
+
+# The most recent bar reading across the notebook's running cells (frac, msg, when), or nothing.
+function _live_latest(nbid::AbstractString)
+    lock(_CELL_LIVE_LOCK) do
+        best = nothing
+        for live in values(get(_CELL_LIVE, String(nbid), Dict{String,_CellLive}())), b in live.bars
+            (best === nothing || b[4] > best[3]) && (best = (b[2], b[3], b[4]))
+        end
+        best
+    end
+end
 
 # One agent-visible status line for a run we're blocked on: which cell, how far in, how much is
 # left, and whatever the cell last reported through `slate_progress`.
@@ -5634,10 +5706,9 @@ function _note_run_progress(nb::LiveNotebook, wait_for::AbstractString, t0::Floa
                    (isempty(wait_for) ? "draining" : "waiting on $wait_for") :
                    "running " * join(running, ", ")]
     pending > 1 && push!(parts, "$pending pending")
-    up = lock(_USERPROG_LOCK) do; get(_LAST_USERPROG, nb.id, nothing); end
-    # Ignore a stale reading: a leftover from an earlier cell would otherwise be reported as if
-    # it described the one running now.
-    if up !== nothing && !up[4] && time() - up[5] <= 2 * _AGENT_PROGRESS_EVERY
+    up = _live_latest(nb.id)
+    # Ignore a reading that has stopped moving: it no longer says how far along the run is.
+    if up !== nothing && time() - up[3] <= 2 * _AGENT_PROGRESS_EVERY
         frac, msg = up[1], up[2]
         pct = (isfinite(frac) && 0.0 <= frac <= 1.0) ? "$(round(Int, 100 * frac))%" : ""
         detail = strip(join(filter(!isempty, [pct, strip(msg)]), " "))

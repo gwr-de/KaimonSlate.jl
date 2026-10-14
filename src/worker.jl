@@ -191,9 +191,10 @@ function _new_ns(m::Module = Module(:NB))
         echart = echart, EChart = EChart, slate_table = slate_table, SlateTable = SlateTable,
         slate_query = slate_query,
         slate_refresh = (vars...) -> KaimonGate._publish_stream("slate_refresh", join(string.(vars), ",")),
-        # wire: "id|frac|done|msg" (id/frac/done are |-free; msg is the rest — split limit=4)
+        # wire: "cid\x1fid\x1ffrac\x1fdone\x1fmsg" — the cell the bar belongs to, then the bar itself
         slate_progress = (frac; msg = "", id = "", done = false) ->
-            KaimonGate._publish_stream("slate_progress", string(id, "|", Float64(frac), "|", done === true ? 1 : 0, "|", msg)),
+            KaimonGate._publish_stream("slate_progress", string(_current_cell_id(), "\x1f", id, "\x1f", Float64(frac),
+                                                                "\x1f", done === true ? 1 : 0, "\x1f", msg)),
         # Live cell output (capture.jl's streaming watchdog). Wire: "cid\x1fstdout\x1fstderr" — the
         # unit separator, as elsewhere, because the payload is arbitrary text and `|` is not.
         slate_cellout = (cid, out, err) ->
@@ -2753,7 +2754,7 @@ function _install_sshop_delegate!()
     # A long read reports on the running cell, and ends at the cell's Stop.
     Sweep.READ_HOOKS[] = (;
         progress = (frac, msg, done) -> KaimonGate._publish_stream("slate_progress",
-            string("slate-read|", Float64(frac), "|", done ? 1 : 0, "|", msg)),
+            string(_current_cell_id(), "\x1f", "slate-read", "\x1f", Float64(frac), "\x1f", done ? 1 : 0, "\x1f", msg)),
         checkpoint = slate_checkpoint)
     Sweep.set_delegate!() do op, args
         if op === :connected
