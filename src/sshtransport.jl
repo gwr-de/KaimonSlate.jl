@@ -280,13 +280,38 @@ Session(ep, fd, ptr, req, owner, prompter, alive, err, fwds; bulk::Bool = false)
 function _free_channel!(s::Session, ch::Ptr{Cvoid})
     ch == C_NULL && return nothing
     rc = ccall((:libssh2_channel_free, LIB), Cint, (Ptr{Cvoid},), ch)
-    rc == EAGAIN && push!(s.dying, ch)
+    rc == EAGAIN ? push!(s.dying, ch) : _note_freed!(ch)
     return nothing
 end
 
 # Free the channels whose close has gone through since. Under `s.lk`; called on each pump pass.
 _reap_dying!(s::Session) =
-    isempty(s.dying) || filter!(ch -> ccall((:libssh2_channel_free, LIB), Cint, (Ptr{Cvoid},), ch) == EAGAIN, s.dying)
+    isempty(s.dying) || filter!(s.dying) do ch
+        freed = ccall((:libssh2_channel_free, LIB), Cint, (Ptr{Cvoid},), ch) != EAGAIN
+        freed && _note_freed!(ch)
+        !freed
+    end
+
+# The command channels open now, with their host, command and start: the account given when a server refuses another
+# channel. A channel stays here until it is freed, which for a command whose far end has not finished is not yet.
+const _OPEN_CMDS = Dict{Ptr{Cvoid},Tuple{String,String,Float64}}()
+const _OPEN_CMDS_LOCK = ReentrantLock()
+const _REFUSAL_REPORTED = Dict{String,Float64}()
+_note_open!(s::Session, ch, cmd) = lock(() -> (_OPEN_CMDS[ch] = (s.ep.alias, first(String(cmd), 120), time())), _OPEN_CMDS_LOCK)
+_note_freed!(ch) = lock(() -> (delete!(_OPEN_CMDS, ch); nothing), _OPEN_CMDS_LOCK)
+
+# What the session holds when the server refuses a channel, at most once a minute per host
+function _report_refusal(s::Session, why::AbstractString)
+    host = s.ep.alias
+    now = time()
+    lock(_OPEN_CMDS_LOCK) do
+        now - get(_REFUSAL_REPORTED, host, 0.0) < 60 && return nothing
+        _REFUSAL_REPORTED[host] = now
+        mine = sort!([(t, cmd) for (_, (h, cmd, t)) in _OPEN_CMDS if h == host]; by = first)
+        @warn "ssh: $host refused a channel" why commands_running = s.busy[] forwards = s.ntun[] closing = length(s.dying) open_commands = length(mine) oldest = [string(round(Int, now - t), "s  ", cmd) for (t, cmd) in mine[1:min(end, 12)]]
+    end
+    nothing
+end
 
 # libssh2's global setup, which must not run twice at once. Once per process.
 const _LIBSSH2_INIT_LOCK = ReentrantLock()
@@ -712,6 +737,7 @@ function _open_started(s::Session, cmd::AbstractString; merge::Bool)
         if ch == C_NULL
             err in _TRANSPORT_ERRS && (_channel_dead!(s, why); return (C_NULL, why))
             attempt < 3 && (sleep(0.3 * attempt); continue)
+            _report_refusal(s, why)
             return (C_NULL, why)
         end
         # stderr arrives on the same stream as stdout, in the order it was written. Read separately,
@@ -719,7 +745,7 @@ function _open_started(s::Session, cmd::AbstractString; merge::Bool)
         merge && _again(s, () -> ccall((:libssh2_channel_handle_extended_data2, LIB), Cint, (Ptr{Cvoid}, Cint),
                                        ch, EXTENDED_DATA_MERGE))
         rc, m = _start(s, ch, cmd)
-        rc == 0 && return (ch, "")
+        rc == 0 && (_note_open!(s, ch, cmd); return (ch, ""))
         lock(() -> _free_channel!(s, ch), s.lk)
         why = "exec: " * m * " (libssh2 $rc)"
         (attempt < 3 && rc in _CHANNEL_REFUSED) || return (C_NULL, why)
@@ -1148,6 +1174,12 @@ function _open!(s::Session, ask)
     _authed(s) || error("$(s.ep.alias): authentication did not complete")
     s.alive = true
     s.bulk || errormonitor(Threads.@spawn _announce_connect(s.ep.alias))
+    # Which login node the session landed on (an address can be shared by several) and the pid of its sshd there:
+    # where to look for what the session holds when the server refuses it a channel
+    s.bulk || errormonitor(Threads.@spawn begin
+        ok, out, _ = Base.acquire(() -> _exec(s, "hostname; echo \$PPID"; timeout = 15.0), s.slots)
+        ok && @info "ssh: $(s.ep.alias) session on $(join(split(strip(out)), ", sshd pid "))"
+    end)
     # Keep the session warm. Between runs a region holds nothing but an idle control session, and an
     # idle session dies to the server's own timeout or a NAT dropping the flow - after which the only
     # way back is an interactive second factor. Configuring an interval here and sending on a timer
