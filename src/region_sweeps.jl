@@ -126,7 +126,7 @@ function _drive_region_sweep!(r, store::AbstractString)
     end
     wanted = Set{String}(c for w in values(q.wants) for c in w.chunks)
     mine = lock(_SWEEPERS_LOCK) do; [s for s in values(_SWEEPERS) if s.region == r.name]; end
-    foreach(s -> _check_worker!(s, r, wanted), mine)
+    foreach(s -> _check_worker!(s, r, q, wanted), mine)
     byparent = Dict{String,Vector{String}}()    # environment → its wants
     for (n, w) in q.wants
         push!(get!(Vector{String}, byparent, w.parent), n)
@@ -168,8 +168,10 @@ function _drive_region_sweep!(r, store::AbstractString)
 end
 
 # What the worker is doing. One whose chunk is no longer wanted was cancelled with its want: it is
-# stopped, and the units it landed stay landed. One that does not answer is gone.
-function _check_worker!(s::_RegionSweeper, r, wanted::Set{String})
+# stopped, and the units it landed stay landed. A unit can hold every thread of the worker, or a long
+# collection can stop it, so a call it does not answer in time does not mean it is gone: the timer that
+# refreshes its chunk's claim does, once the claim has gone stale.
+function _check_worker!(s::_RegionSweeper, r, q, wanted::Set{String})
     w = s.worker
     w === nothing && return nothing
     st = try
@@ -179,7 +181,16 @@ function _check_worker!(s::_RegionSweeper, r, wanted::Set{String})
                            first(sprint(showerror, e), 120))
         nothing
     end
-    st === nothing && (_stop_task_worker!(w); s.worker = nothing; return nothing)
+    if st === nothing
+        BL = ReportEngine.Sweep.BatchLauncher
+        if any(cl -> cl.owner == w.kernel.label && cl.age < BL.CLAIM_STALE_S, values(q.claims))
+            w.busy = true
+            return nothing
+        end
+        ReportEngine._rlog("region[$(r.name)]: task worker $(w.kernel.label) holds no live claim — stopping it")
+        _stop_task_worker!(w); s.worker = nothing
+        return nothing
+    end
     state = String(get(st, "state", "idle"))
     w.chunk = String(get(st, "chunk", ""))
     w.busy = state == "running"
