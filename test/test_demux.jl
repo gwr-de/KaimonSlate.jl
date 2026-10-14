@@ -50,6 +50,27 @@ include(joinpath(@__DIR__, "..", "src", "demux.jl"))
         end
     end
 
+    @testset "a redirect to a file puts the demux back when it ends" begin
+        prev = install_demux!()
+        path = tempname()
+        try
+            open(path, "w") do io
+                redirect_stdio(stdout = io, stderr = io) do
+                    println("to file")
+                    println(stderr, "err to file")
+                end
+            end
+            @test Base.stdout isa DemuxIO && Base.stdout.fallback === prev[1]
+            @test Base.stderr isa DemuxIO && Base.stderr.fallback === prev[2]
+            @test read(path, String) == "to file\nerr to file\n"
+            res = with_captured_output(() -> (print("after"); print(stderr, "after err")))
+            @test res.stdout == "after" && res.stderr == "after err"
+        finally
+            restore_streams!(prev)
+            rm(path; force = true)
+        end
+    end
+
     @testset "package loading's world sees the demux methods" begin
         old = Base._require_world_age[]
         prev = install_demux!()

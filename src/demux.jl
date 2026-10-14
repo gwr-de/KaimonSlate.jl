@@ -52,6 +52,19 @@ function restore_streams!(prev)
     return nothing
 end
 
+# A redirect that ends (`redirect_stdio(stdout = io) do … end`, which restores the stream it found) can
+# be handed the demux back. The descriptor goes back to the stream the demux falls back to, then the
+# global goes back to the demux, so a redirect inside a worker leaves it as it was.
+function (f::Base.RedirectStdStream)(d::DemuxIO)
+    applicable(f, d.fallback) && f(d.fallback)
+    if f.unix_fd == 1
+        @eval Base stdout = $d
+    elseif f.unix_fd == 2
+        @eval Base stderr = $d
+    end
+    return d
+end
+
 # Run `f()` with stdout+stderr captured to fresh per-task buffers (routed via the installed DemuxIO),
 # returning `(value, stdout, stderr)`. Concurrency-safe: the buffers live in THIS task's storage, so
 # parallel evaluators never share them. Restores the prior capture keys on exit (nested-safe).
