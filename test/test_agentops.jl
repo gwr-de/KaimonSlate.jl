@@ -648,7 +648,7 @@ end
         # A slate_progress frame is RECORDED for sampling (latest-value-wins) rather than pushed
         # per-frame — that's what stops a 10Hz loop flooding the agent.
         zc = nb.report.cells[findfirst(c -> c.id == "zcell", nb.report.cells)]
-        lock(nb.lock) do; NS.ReportEngine.mark_running!(zc); NS._broadcast_progress(nb, zc); end
+        lock(nb.lock) do; NS.ReportEngine.begin_run!(zc); NS._broadcast_progress(nb, zc); end
         NS.ReportEngine._do_userprog(nb.report.id, "zcell", "bar1", 0.5, "halfway", false)
         rec = NS._live_latest(nb.id)
         @test rec[1] == 0.5 && rec[2] == "halfway"
@@ -681,7 +681,7 @@ end
         NS.agent_add_cell!(nb, "y = 2"; id = "ycell")
         NS._eval!(nb; wait_all = true)
         yc = nb.report.cells[findfirst(c -> c.id == "ycell", nb.report.cells)]
-        lock(nb.lock) do; NS.ReportEngine.mark_running!(yc); NS._broadcast_progress(nb, yc); end
+        lock(nb.lock) do; NS.ReportEngine.begin_run!(yc); NS._broadcast_progress(nb, yc); end
 
         @test NS._userprog_note(nb.id) == ""                       # nothing reported yet
         NS.ReportEngine._do_userprog(nb.report.id, "ycell", "bar", 0.45, "step 9/20", false)
@@ -732,7 +732,11 @@ end
         NS._eval!(nb; wait_all = true)
         wc = nb.report.cells[findfirst(c -> c.id == "wcell", nb.report.cells)]
         rid = nb.report.id
-        run!() = lock(nb.lock) do; NS.ReportEngine.mark_running!(wc); NS._broadcast_progress(nb, wc); end
+        run!() = lock(nb.lock) do
+            wc.run === nothing && NS.ReportEngine.begin_run!(wc); NS._broadcast_progress(nb, wc)
+        end
+        # A run ends when its record does; the stored state is what the finish wrote.
+        finish!() = (NS.ReportEngine.end_run!(wc, wc.run); NS.ReportEngine.mark_fresh!(wc))
         wjson() = (s = NS.state_json(nb); (s, s["cells"][findfirst(c -> c["id"] == "wcell", s["cells"])]))
 
         run!()
@@ -756,13 +760,13 @@ end
         @test wjson()[2]["runStartedAt"] == started
 
         # A run that ends without a finish broadcast (a reset) is dropped by the next state.
-        NS.ReportEngine.mark_fresh!(wc)
+        lock(nb.lock) do; finish!(); end
         _, c = wjson()
         @test !haskey(c, "runStartedAt") && !haskey(NS._CELL_LIVE[nb.id], "wcell")
 
         # The ordinary finish drops it too.
         run!()
-        lock(nb.lock) do; NS.ReportEngine.mark_fresh!(wc); NS._broadcast_progress(nb, wc); end
+        lock(nb.lock) do; finish!(); NS._broadcast_progress(nb, wc); end
         @test !haskey(NS._CELL_LIVE[nb.id], "wcell")
     finally
         NS.stop_hub(hub)
