@@ -1868,15 +1868,19 @@ function _make_router(h::Hub)
         b = _body(req)
         r = ReportEngine.region_get(strip(String(get(b, "name", ""))))
         r === nothing && return _json(Dict("ok" => false, "error" => "no such region"))
-        st = ReportEngine.preparing(r.name)
-        (st !== nothing && st["running"] === true) && return _json(Dict("ok" => true, "preparing" => st))
         n = get(b, "node", nothing)
         node = n isa Bool ? n : nothing
         project = strip(String(get(b, "project", "")))
         try; ReportEngine._reference_env(isempty(project) ? r.preload : project)
         catch e; return _json(Dict("ok" => false, "error" => sprint(showerror, e))); end
+        # An open notebook's prepare goes through it, which queues behind another environment's prepare.
         nb = node === false ? nothing : _open_notebook_at(h, project)
-        nb === nothing || (_prepare_for_notebook!(nb, r.name); return _json(Dict("ok" => true, "notebook" => nb.id)))
+        if nb !== nothing
+            ReportEngine.prepare_running(r.name; env = _nb_origin_env(nb)) || _prepare_for_notebook!(nb, r.name)
+            return _json(Dict("ok" => true, "notebook" => nb.id))
+        end
+        st = ReportEngine.preparing(r.name)
+        (st !== nothing && st["running"] === true) && return _json(Dict("ok" => true, "preparing" => st))
         Threads.@spawn try
             ReportEngine.prepare_region!(r.name; node = node, project = project)
         catch e
@@ -1889,8 +1893,8 @@ function _make_router(h::Hub)
     HTTP.register!(router, "POST", "/api/{id}/prepare-region", req -> _withnb(h, req, nb -> begin
         r = ReportEngine.region_get(strip(String(get(_body(req), "region", ""))))
         r === nothing && return _json(Dict("ok" => false, "error" => "no such region"))
-        st = ReportEngine.preparing(r.name)
-        (st !== nothing && st["running"] === true) || _prepare_for_notebook!(nb, r.name)
+        # Queued behind a prepare for another environment, rather than dropped (`_prepare_for_notebook!`).
+        ReportEngine.prepare_running(r.name; env = _nb_origin_env(nb)) || _prepare_for_notebook!(nb, r.name)
         _json(Dict("ok" => true))
     end))
     # A machine: what preparing it found, what has passed a test task there, and preparing it.

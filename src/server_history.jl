@@ -1399,8 +1399,8 @@ function _worker_entry(nb::LiveNotebook, side::AbstractString, k)
             code == "bringup" && (d["note"] = let last = ReportEngine.last_bringup_line()
                 isempty(last) ? "starting up…" : last
             end)
-            # Started by the region's prepare, which loads the packages in it before handing it over.
-            (code == "bringup" && !isempty(side) && ReportEngine.prepare_running(side)) && (d["face"] = "preparing")
+            # Started by the region's prepare for this notebook, which loads its packages before handing it over.
+            (code == "bringup" && !isempty(side) && _env_preparing(nb, side)) && (d["face"] = "preparing")
         elseif (busy = get(_KERNEL_BUSY_SINCE, k, nothing)) !== nothing
             d["noteCode"] = "busy_no_reply"
             d["busySince"] = round(Float64(busy); digits = 1)
@@ -1456,8 +1456,9 @@ function _workers_json(nb::LiveNotebook)
         # the sign-in the way a live kernel does, so the padlock is the obvious next step instead of
         # an indicator that says the scheduler is working when nothing is reaching it.
         signedout = sched && !isempty(host) && !ReportEngine.Sweep.connected(host)
-        # A prepare of the region starts the worker it will hand over; until then it is that, not a queue.
-        preparing = ReportEngine.prepare_running(side)
+        # A prepare of the region for this notebook starts the worker it will hand over; until then it is
+        # that, not a queue. Another notebook's prepare there is not this notebook's to show.
+        preparing = _env_preparing(nb, side)
         # Cells held until the region is prepared for this notebook: nothing starts until someone does.
         needsprep = !preparing && lock(nb.lock) do
             any(c -> c.state == BLOCKED && c.blocked == WAIT_NEEDS_PREPARE && _cell_region(c) == side, nb.report.cells)

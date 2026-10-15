@@ -1301,6 +1301,63 @@ function _open_notebook_at(h, path::AbstractString)
     return i === nothing ? nothing : nbs[i]
 end
 
+# Prepares asked for by a notebook while the region's prepare is for another environment: one prepare
+# runs per region, since its site, runtime, sysimage and node steps are the region's, so these wait their
+# turn rather than being dropped. Folded region name → (notebook, region, rebuild_sysimage), in the order asked.
+const _QUEUED_PREPARES = Dict{String,Vector{Tuple{Any,String,Bool}}}()
+const _QUEUED_PREPARES_LOCK = ReentrantLock()
+# When the last queued prepare was started, by region: it registers as running only once its task runs,
+# so a second drain in that gap would start another beside it.
+const _QUEUED_PREPARE_STARTED = Dict{String,Float64}()
+
+_queue_key(name) = ReportEngine._fold_region(String(name))
+
+function _prepare_queued(nb, name)
+    lock(_QUEUED_PREPARES_LOCK) do
+        any(x -> x[1] === nb, get(_QUEUED_PREPARES, _queue_key(name), Tuple{Any,String,Bool}[]))
+    end
+end
+
+"Whether region `name` is being prepared for `nb`'s environment, or will be once the prepare running there ends."
+_env_preparing(nb, name) = ReportEngine.prepare_running(name; env = _nb_origin_env(nb)) || _prepare_queued(nb, name)
+
+function _queue_prepare!(nb, name, rebuild_sysimage::Bool)
+    lock(_QUEUED_PREPARES_LOCK) do
+        q = get!(Vector{Tuple{Any,String,Bool}}, _QUEUED_PREPARES, _queue_key(name))
+        any(x -> x[1] === nb, q) || push!(q, (nb, String(name), rebuild_sysimage))
+    end
+    ReportEngine._rlog("prepare[$name]: $(basename(nb.path)) waits for the prepare running there to end")
+    return nothing
+end
+
+"""
+    _start_queued_prepares!()
+
+Start the next queued prepare of each region whose prepare has ended. Called as a prepare ends and
+from the supervisor, so a queue behind a prepare started elsewhere (the Regions manager, a tool) moves too.
+"""
+function _start_queued_prepares!()
+    starts = lock(_QUEUED_PREPARES_LOCK) do
+        out = Tuple{Any,String,Bool}[]
+        for (key, q) in _QUEUED_PREPARES
+            filter!(x -> !x[1].closed, q)
+            (isempty(q) || ReportEngine.prepare_running(key)) && continue
+            time() - get(_QUEUED_PREPARE_STARTED, key, 0.0) < 30 && continue
+            nb, name, rebuild = popfirst!(q)
+            _QUEUED_PREPARE_STARTED[key] = time()
+            push!(out, (nb, name, rebuild))
+        end
+        filter!(kv -> !isempty(kv.second), _QUEUED_PREPARES)
+        out
+    end
+    for (nb, name, rebuild) in starts
+        try; _prepare_for_notebook!(nb, name; rebuild_sysimage = rebuild); catch e
+            ReportEngine._rlog("prepare[$name]: could not start the queued prepare for $(basename(nb.path)) — $(first(sprint(showerror, e), 160))")
+        end
+    end
+    return nothing
+end
+
 """
     _prepare_for_notebook!(nb, name; rebuild_sysimage = false)
 
@@ -1312,6 +1369,13 @@ goes to that notebook instead of back to the scheduler.
 function _prepare_for_notebook!(nb::LiveNotebook, name::AbstractString; rebuild_sysimage::Bool = false)
     r = ReportEngine.region_get(name)
     r === nothing && return nothing
+    # The region is being prepared for another environment: this one starts when that one ends.
+    if ReportEngine.prepare_running(r.name) && !ReportEngine.prepare_running(r.name; env = _nb_origin_env(nb))
+        _queue_prepare!(nb, r.name, rebuild_sysimage)
+        _mark_region_preparing!(nb, r.name)
+        try; facts_changed!(); catch; end
+        return nothing
+    end
     # The worker prepare starts and loads the packages in is the one this notebook's cells use.
     worker = (start = (fresh::Bool = false) -> begin
                   # Replacing a running worker: drop the hub's kernel for it and the process, so the
@@ -1354,6 +1418,7 @@ function _prepare_for_notebook!(nb::LiveNotebook, name::AbstractString; rebuild_
         ReportEngine.prepare_failed_to_start!(r.name, e)
     finally
         try; facts_changed!(); catch; end
+        try; _start_queued_prepares!(); catch; end
     end
     return nothing
 end
@@ -2325,9 +2390,10 @@ function _region_kernel!(nb::LiveNotebook, name::String; preparing::Bool = false
         r === nothing && error("region '$name' is not defined — create it in the registry: " *
                                "region(\"$name\"; host=…, warm=…) or the home-page Regions manager")
         isempty(r.host) && error("region '$name' has no host — set one in the Regions manager")
-        # While the region is being prepared its cells wait for it: a prepare for this notebook starts
-        # the worker they will use, and a second one started beside it competes for the same node.
-        (!preparing && ReportEngine.prepare_running(r.name)) && throw(RegionWaiting(WAIT_PREPARING, r.host, r.name))
+        # While the region is being prepared for this notebook's environment its cells wait for it: that
+        # prepare starts the worker they will use. A prepare for another environment installs into that
+        # one's directory and leaves this notebook's environment and worker alone.
+        (!preparing && _env_preparing(nb, r.name)) && throw(RegionWaiting(WAIT_PREPARING, r.host, r.name))
         at = ReportEngine.region_where(r)
         k = get(_REGION_KERNELS, (nb.id, name), nothing)
         # A cached kernel's target names the node it runs on and, on a scheduler region, the job that
@@ -2755,7 +2821,8 @@ const _DEAD_WIRE_GRACE = something(tryparse(Float64, get(ENV, "KAIMONSLATE_DEADW
 # own time limits, so its silence is shown but its wire is kept.
 function _prepare_holds(k)
     t = try; k.target; catch; nothing; end
-    return t isa ReportEngine.RemoteTarget && !isempty(t.region) && ReportEngine.prepare_running(t.region)
+    return t isa ReportEngine.RemoteTarget && !isempty(t.region) &&
+           ReportEngine.prepare_running(t.region; env = t.origin_env)
 end
 
 function _dead_wire_grace(k)
@@ -3331,7 +3398,7 @@ function _prepared_regions_waiting(nb::LiveNotebook)
         for c in nb.report.cells
             c.state == BLOCKED || continue
             r = c.blocked_region
-            (isempty(r) || ReportEngine.prepare_running(r)) && continue
+            (isempty(r) || _env_preparing(nb, r)) && continue
             if c.blocked == WAIT_PREPARING
                 push!(done, r)
             elseif c.blocked == WAIT_NEEDS_PREPARE
@@ -3822,6 +3889,7 @@ function _supervise_runs!(h)   # NOTE: `Hub` is defined later (server_hub.jl, in
     part(ReportEngine.reap_pending_kills!, "pending-kill reap")   # hub-wide, not per-notebook — see gate_kernel.jl
     part(() -> _sweep_idle_regions!(h), "region sweep")            # hub-wide too: a region is not a notebook's to release
     part(() -> _sweep_stale_conn_state!(h), "conn-state sweep")    # drop the series of workers that are gone
+    part(_start_queued_prepares!, "queued prepares")                # a queue behind a prepare started elsewhere
     # Release the next wave of any started sweep, for every cluster this MACHINE knows — not just
     # the notebooks that happen to be open. A sweep's second wave used to wait on a sweep card
     # polling, so closing the tab left the rest of a grid unsubmitted until someone came back.

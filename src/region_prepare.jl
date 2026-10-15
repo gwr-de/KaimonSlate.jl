@@ -77,11 +77,19 @@ _trace_tail(name, n::Int) = lock(_REGION_TRACE_LOCK) do
     length(b) > n ? b[end-n+1:end] : copy(b)
 end
 
-"Whether a prepare of region `name` is running now."
-prepare_running(name) = lock(_PREPARING_LOCK) do
+"""
+    prepare_running(name; env = nothing) -> Bool
+
+Whether a prepare of region `name` is running now. With `env`, only one that prepares that
+environment (what `_reference_env` makes of a notebook or project): a prepare for another notebook
+installs into its own environment and leaves this one's alone.
+"""
+prepare_running(name; env::Union{Nothing,AbstractString} = nothing) = lock(_PREPARING_LOCK) do
     x = get(_PREPARING, _fold_region(name), nothing)
-    x !== nothing && x["running"] === true
+    x !== nothing && x["running"] === true && (env === nothing || _same_env(get(x, "project", ""), env))
 end
+
+_same_env(a, b) = rstrip(normpath(String(a)), '/') == rstrip(normpath(String(b)), '/')
 
 function preparing(name)
     s = lock(_PREPARING_LOCK) do

@@ -560,7 +560,8 @@ end
                     # While it is being prepared its cells wait; the prepare's own start goes ahead.
                     c = only(nb.report.cells)
                     lock(RE._PREPARING_LOCK) do
-                        RE._PREPARING[RE._fold_region("gpu")] = Dict{String,Any}("running" => true)
+                        RE._PREPARING[RE._fold_region("gpu")] = Dict{String,Any}("running" => true,
+                                                                               "project" => NS._nb_origin_env(nb))
                     end
                     try
                         @test why() == NS.WAIT_PREPARING
@@ -582,6 +583,28 @@ end
                         NS._forget_region_kernel!(nb, "gpu")
                     end
                     @test NS._prepared_regions_waiting(nb) == Set(["gpu"])     # done: they run
+                    # A prepare of the region for another notebook's environment holds nothing here: it
+                    # installs into its own directory. This notebook's own prepare queues behind it, and
+                    # its cells wait for that one.
+                    lock(RE._PREPARING_LOCK) do
+                        RE._PREPARING[RE._fold_region("gpu")] = Dict{String,Any}("running" => true,
+                                                                               "project" => mktempdir())
+                    end
+                    try
+                        @test why() == NS.WAIT_NEEDS_PREPARE                       # not held as preparing
+                        @test !NS._env_preparing(nb, "gpu")
+                        w = only(filter(w -> w["side"] == "gpu", NS._workers_json(nb)))
+                        @test w["face"] != "preparing"
+                        RE.mark_blocked!(c, NS.WAIT_NEEDS_PREPARE, "login", "gpu")
+                        NS._prepare_for_notebook!(nb, "gpu")
+                        @test NS._prepare_queued(nb, "gpu") && NS._env_preparing(nb, "gpu")
+                        @test c.blocked == NS.WAIT_PREPARING && why() == NS.WAIT_PREPARING
+                        @test isempty(NS._prepared_regions_waiting(nb))          # waiting for its turn
+                    finally
+                        lock(NS._QUEUED_PREPARES_LOCK) do; empty!(NS._QUEUED_PREPARES); end
+                        lock(RE._PREPARING_LOCK) do; delete!(RE._PREPARING, RE._fold_region("gpu")); end
+                        NS._forget_region_kernel!(nb, "gpu")
+                    end
                     # Told a prepare was needed, a cell waits for one to succeed, started from
                     # anywhere, rather than being re-run into the same answer every tick.
                     RE.mark_blocked!(c, NS.WAIT_NEEDS_PREPARE, "login", "gpu")

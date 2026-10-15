@@ -2681,8 +2681,6 @@ function create_tools(GateTool::Type)
             return "Region '$(r.name)': " * ReportEngine.readiness_text(r)
         end
         strip(action) == "start" || return "⛔ action must be start, status, history or report, not '$action'"
-        (st !== nothing && st["running"] === true) &&
-            return "'$(r.name)' is already being prepared — region_prepare(\"$(r.name)\", action=\"status\")"
         n = isempty(strip(node)) ? nothing : _dbg_flag(node)
         n === missing && return "⛔ node must be true or false, not '$node'"
         try; ReportEngine._reference_env(isempty(strip(project)) ? r.preload : project)
@@ -2693,10 +2691,18 @@ function create_tools(GateTool::Type)
         # worker, which starts on it, and its waiting cells run.
         nb = n === false ? nothing : NotebookServer._open_notebook_at(_HUB[], project)
         if nb !== nothing
+            env = NotebookServer._nb_origin_env(nb)
+            ReportEngine.prepare_running(r.name; env) &&
+                return "'$(r.name)' is already being prepared for $(basename(nb.path)) — region_prepare(\"$(r.name)\", action=\"status\")"
             NotebookServer._prepare_for_notebook!(nb, r.name; rebuild_sysimage = si == "rebuild")
+            NotebookServer._prepare_queued(nb, r.name) &&
+                return "'$(r.name)' is being prepared for another notebook; $(basename(nb.path))'s prepare starts when " *
+                       "that one ends, and its cells wait for it."
             return "Preparing '$(r.name)' for the open notebook $(basename(nb.path)): its node is kept for " *
                    "the notebook's worker. region_prepare(\"$(r.name)\", action=\"status\") to follow it."
         end
+        (st !== nothing && st["running"] === true) &&
+            return "'$(r.name)' is already being prepared — region_prepare(\"$(r.name)\", action=\"status\")"
         Threads.@spawn try
             ReportEngine.prepare_region!(r.name; node = n, project = project, rebuild_sysimage = si == "rebuild")
         catch e
