@@ -125,6 +125,38 @@ end
 end
 
 # Needs a server: set KAIMONSLATE_SSH_TEST_HOST to a host this machine signs in to by key.
+@testset "a server refusing channels with none of ours open ends the session" begin
+    # A server that counts sessions this side has already let go refuses every command from then on, while
+    # the forwards on the connection keep working. A minute of that, with no channel of ours open, ends the
+    # session so the next command connects afresh. No server is needed: the rule reads only what this side
+    # holds.
+    host = "refusal-test"
+    ep = T.Endpoint(host, host, 22, "u", String[], "")
+    fresh() = T.Session(ep, Cint(-1), C_NULL, Channel{Any}(1), nothing, T.Prompter(host), true, "", T.Fwd[])
+    clear!() = lock(() -> (delete!(T._IDLE_REFUSAL_SINCE, host); filter!(kv -> last(kv)[1] != host, T._OPEN_CMDS)), T._OPEN_CMDS_LOCK)
+    clear!()
+    s = fresh()
+    @test !T._refused_with_none_open!(s, "connect failed")            # the first refusal starts the clock
+    @test s.alive
+    lock(() -> (T._IDLE_REFUSAL_SINCE[host] -= T.IDLE_REFUSAL_S + 1), T._OPEN_CMDS_LOCK)
+    @test T._refused_with_none_open!(s, "connect failed")             # still refused a minute on: ended
+    @test !s.alive && occursin("refuses every channel", s.err)
+    # A command channel of ours still open means the server's count may be ours: the session stays.
+    clear!()
+    s2 = fresh()
+    T._note_open!(s2, Ptr{Cvoid}(UInt(0x1)), "sleep 600")
+    @test !T._refused_with_none_open!(s2, "connect failed")
+    lock(() -> (T._IDLE_REFUSAL_SINCE[host] = time() - T.IDLE_REFUSAL_S - 1), T._OPEN_CMDS_LOCK)
+    @test !T._refused_with_none_open!(s2, "connect failed")
+    @test s2.alive
+    # A channel opening in between resets the clock.
+    T._note_freed!(Ptr{Cvoid}(UInt(0x1)))
+    @test !T._refused_with_none_open!(s2, "connect failed")
+    T._note_open!(s2, Ptr{Cvoid}(UInt(0x2)), "true"); T._note_freed!(Ptr{Cvoid}(UInt(0x2)))
+    @test !haskey(T._IDLE_REFUSAL_SINCE, host)
+    clear!()
+end
+
 @testset "commands on one session run side by side" begin
     host = get(ENV, "KAIMONSLATE_SSH_TEST_HOST", "")
     if isempty(host)

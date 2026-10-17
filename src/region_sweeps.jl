@@ -53,6 +53,38 @@ _running_stage(s::_RegionSweeper) = "task worker running on $(s.host)"
 _stop_task_worker!(w::_TaskWorker) =
     (try; ReportEngine.shutdown!(w.kernel; kill_remote = true, wait = false); catch; end; nothing)
 
+# Where a task worker that stopped answering is stuck, written into its own log before it is stopped:
+# each thread's kernel wait state (`/proc/<pid>/task/*/wchan`, readable without attaching), and a native
+# stack of every thread from `eu-stack` or `gdb` where the node lets one attach. Best effort: a node
+# that cannot be reached, or forbids attaching, leaves what it could.
+function _record_stuck_worker(w::_TaskWorker)
+    k = w.kernel
+    t = k.target
+    (t isa ReportEngine.RemoteTarget && k.port != 0) || return nothing
+    log = "$(ReportEngine._REMOTE_WORKER)/worker-$(k.port).log"
+    script = """
+    for p in \$(pgrep -u "\$USER" -f '[w]orker-$(k.port)\\.jl'); do
+      {
+        echo "=== worker pid \$p, not answering the hub, at \$(date '+%F %T') ==="
+        for d in /proc/\$p/task/*; do
+          echo "thread \$(basename \$d) \$(cut -d' ' -f3 \$d/stat 2>/dev/null) \$(cat \$d/wchan 2>/dev/null) \$(cat \$d/comm 2>/dev/null)"
+        done
+        if command -v eu-stack >/dev/null 2>&1; then timeout 60 eu-stack -p \$p
+        elif command -v gdb >/dev/null 2>&1; then timeout 60 gdb -p \$p -batch -ex 'thread apply all bt'
+        else echo '(no eu-stack or gdb on this node)'; fi
+        echo "=== end of worker pid \$p ==="
+      } >> $(ReportEngine.Sweep.shq(log)) 2>&1
+    done
+    """
+    try
+        ReportEngine._run_on(t.ssh_host, script; timeout = 120.0)
+        ReportEngine._rlog("region: recorded where task worker $(k.label) was stuck, in $(t.ssh_host):$log")
+    catch e
+        ReportEngine._rlog("region: could not record where task worker $(k.label) was stuck — " * first(sprint(showerror, e), 120))
+    end
+    return nothing
+end
+
 function _stop_sweeper!(s::_RegionSweeper, why::AbstractString)
     s.worker === nothing && return nothing
     ReportEngine._rlog("region[$(s.region)]: stopping its task worker — $why")
@@ -188,6 +220,7 @@ function _check_worker!(s::_RegionSweeper, r, q, wanted::Set{String})
             return nothing
         end
         ReportEngine._rlog("region[$(r.name)]: task worker $(w.kernel.label) holds no live claim — stopping it")
+        _record_stuck_worker(w)
         _stop_task_worker!(w); s.worker = nothing
         return nothing
     end

@@ -297,8 +297,38 @@ _reap_dying!(s::Session) =
 const _OPEN_CMDS = Dict{Ptr{Cvoid},Tuple{String,String,Float64}}()
 const _OPEN_CMDS_LOCK = ReentrantLock()
 const _REFUSAL_REPORTED = Dict{String,Float64}()
-_note_open!(s::Session, ch, cmd) = lock(() -> (_OPEN_CMDS[ch] = (s.ep.alias, first(String(cmd), 120), time())), _OPEN_CMDS_LOCK)
+_note_open!(s::Session, ch, cmd) = lock(_OPEN_CMDS_LOCK) do
+    _OPEN_CMDS[ch] = (s.ep.alias, first(String(cmd), 120), time())
+    delete!(_IDLE_REFUSAL_SINCE, s.ep.alias)
+    nothing
+end
 _note_freed!(ch) = lock(() -> (delete!(_OPEN_CMDS, ch); nothing), _OPEN_CMDS_LOCK)
+
+# A server that refuses every channel while this side holds none of its command channels and is closing none is
+# counting sessions this side has already let go. The connection then refuses every command from that point on, while
+# the forwards riding it keep working, since a forward is not a session. Seen for `IDLE_REFUSAL_S` with no channel
+# opening in between, the session is ended as a lost connection is: the next command connects afresh, and the forwards
+# are made again over the new connection. When the first such refusal was seen, per host; under `_OPEN_CMDS_LOCK`.
+const _IDLE_REFUSAL_SINCE = Dict{String,Float64}()
+const IDLE_REFUSAL_S = 60.0
+
+function _refused_with_none_open!(s::Session, why::AbstractString)
+    s.bulk && return false
+    host = s.ep.alias
+    closing = lock(() -> length(s.dying), s.lk)
+    stale = lock(_OPEN_CMDS_LOCK) do
+        if closing > 0 || any(v -> first(v) == host, values(_OPEN_CMDS))
+            delete!(_IDLE_REFUSAL_SINCE, host)
+            return false
+        end
+        since = get!(_IDLE_REFUSAL_SINCE, host, time())
+        time() - since < IDLE_REFUSAL_S && return false
+        delete!(_IDLE_REFUSAL_SINCE, host)
+        true
+    end
+    stale && _channel_dead!(s, "$host refuses every channel though none of this side's are open ($why)")
+    return stale
+end
 
 # What the session holds when the server refuses a channel, at most once a minute per host
 function _report_refusal(s::Session, why::AbstractString)
@@ -738,6 +768,7 @@ function _open_started(s::Session, cmd::AbstractString; merge::Bool)
             err in _TRANSPORT_ERRS && (_channel_dead!(s, why); return (C_NULL, why))
             attempt < 3 && (sleep(0.3 * attempt); continue)
             _report_refusal(s, why)
+            _refused_with_none_open!(s, why)
             return (C_NULL, why)
         end
         # stderr arrives on the same stream as stdout, in the order it was written. Read separately,
