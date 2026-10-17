@@ -166,6 +166,25 @@ end
     clear!()
 end
 
+@testset "every channel open holds the session's open lock" begin
+    # libssh2 keeps a half-opened channel on the session, so two opens in flight at once mix their
+    # replies: a probe of a port nobody listens on, opened beside a command, handed the command its
+    # "connect failed" and left the session refusing every command after. Every function that opens a
+    # channel (a command's session channel, a forward, a probe) does it inside `lock(s.openlk)`.
+    src = read(joinpath(@__DIR__, "..", "src", "sshtransport.jl"), String)
+    calls(ex, name) = ex isa Expr && (any(a -> a isa QuoteNode && a.value === name, ex.args) || any(a -> calls(a, name), ex.args))
+    holds_openlk(ex) = ex isa Expr && ((ex.head === :call && ex.args[1] === :lock && any(a -> a == :(s.openlk), ex.args)) ||
+                                       any(holds_openlk, ex.args))
+    defs = Expr[]                                 # every definition, inside the module too
+    collect_defs(ex) = ex isa Expr && (ex.head in (:function, :(=)) ? push!(defs, ex) : foreach(collect_defs, ex.args))
+    collect_defs(Meta.parseall(src))
+    opens = [d for d in defs if calls(d, :libssh2_channel_open_ex) || calls(d, :libssh2_channel_direct_tcpip_ex)]
+    @test length(opens) >= 3                      # the command open, the forward open, the probe
+    for d in opens
+        @test holds_openlk(d)
+    end
+end
+
 # Needs a server: set KAIMONSLATE_SSH_TEST_HOST to a host this machine signs in to by key.
 @testset "commands on one session run side by side" begin
     host = get(ENV, "KAIMONSLATE_SSH_TEST_HOST", "")

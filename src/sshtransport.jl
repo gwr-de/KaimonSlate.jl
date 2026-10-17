@@ -899,11 +899,18 @@ end
 # Whether the far side accepts a connection to `host:port` now: a channel opened and closed at once.
 # A port nobody listens on fails the open straight away, so this answers in one round trip and tells
 # a booting worker from a ready one, which the local end of a forward cannot (it always accepts).
+# Under `openlk` like every other open: libssh2 keeps a half-opened channel on the session, and this
+# runs on a task of its own beside the commands, so a probe of a port nobody listens on interleaved
+# with a command's open hands that command the probe's "connect failed", and can leave the session's
+# open state stuck so that it refuses every command after.
 function _reach(s::Session, host::AbstractString, port::Integer)
-    ch = _again_ptr(s, () -> ccall((:libssh2_channel_direct_tcpip_ex, LIB), Ptr{Cvoid},
-                                   (Ptr{Cvoid}, Cstring, Cint, Cstring, Cint),
-                                   s.ptr, host, Cint(port), "127.0.0.1", Cint(22)); timeout = 5.0)
-    ch == C_NULL && return (false, s.openmsg)
+    ch, why = lock(s.openlk) do
+        c = _again_ptr(s, () -> ccall((:libssh2_channel_direct_tcpip_ex, LIB), Ptr{Cvoid},
+                                      (Ptr{Cvoid}, Cstring, Cint, Cstring, Cint),
+                                      s.ptr, host, Cint(port), "127.0.0.1", Cint(22)); timeout = 5.0)
+        (c, c == C_NULL ? s.openmsg : "")
+    end
+    ch == C_NULL && return (false, why)
     _again(s, () -> ccall((:libssh2_channel_close, LIB), Cint, (Ptr{Cvoid},), ch); timeout = 5.0)
     lock(() -> _free_channel!(s, ch), s.lk)
     return (true, "")
