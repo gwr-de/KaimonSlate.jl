@@ -489,19 +489,19 @@ _slurm_release_script(id) = "scancel " * shq(id) * " 2>&1"
 _pbs_release_script(id) = "qdel " * shq(id) * " 2>&1"
 
 """
-    release_allocation!(kind, host, name) -> Bool
+    release_allocation!(kind, host, name) -> String
 
 Give it back. Worth doing the moment the interactive work is done: an allocation bills for the time
 it is held, not the time it is used, and the commonest way to waste a cluster is to forget one.
+Returns the id of the job cancelled, or "" when nothing was held or the cancel failed.
 """
 function release_allocation!(kind::Symbol, host::AbstractString, name::AbstractString)
     a = find_allocation(kind, host, name)
-    settled(a) && return false          # nothing held, or nobody to tell
-    isempty(a.id) && return false
+    (settled(a) || isempty(a.id)) && return ""     # nothing held, or nobody to tell
     script = kind === :slurm ? _slurm_release_script(a.id) :
              kind === :pbs   ? _pbs_release_script(a.id) : _unsupported_scheduler(kind)
     ok, _ = run_there(host, script)
-    return ok
+    return ok ? String(a.id) : ""
 end
 
 """

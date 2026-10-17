@@ -782,11 +782,12 @@ struct RegionLauncher <: Launcher
     region::String
     root::String                 # the store as the host sees it
     parent::String               # the notebook environment the task workers start in
+    hub::String                  # the hub that serves what this launcher queues (`worker_owner_tag`)
     runner::Any                  # (host, script) -> (ok, output)
 end
 RegionLauncher(host::AbstractString; region::AbstractString, root::AbstractString,
-               parent::AbstractString = "", runner) =
-    RegionLauncher(String(host), String(region), String(root), String(parent), runner)
+               parent::AbstractString = "", hub::AbstractString = "", runner) =
+    RegionLauncher(String(host), String(region), String(root), String(parent), String(hub), runner)
 
 "A claim older than this is a task worker that is gone: its chunk is pending again."
 const CLAIM_STALE_S = 120
@@ -795,7 +796,7 @@ _queue_dir(root) = joinpath(String(root), "queue")
 function submit!(l::RegionLauncher, spec::JobSpec)
     isempty(spec.chunks) && return ""
     q = _queue_dir(l.root)
-    body = "region=$(l.region)\nparent=$(l.parent)\nchunks=$(join(spec.chunks, ' '))\n"
+    body = "region=$(l.region)\nparent=$(l.parent)\nhub=$(l.hub)\nchunks=$(join(spec.chunks, ' '))\n"
     um = isempty(spec.umask) ? ":" : "umask " * spec.umask
     ok, out = l.runner(l.host, "$um; mkdir -p $(_shq(q)) && rm -f " *
                        join((_shq(joinpath(q, c * ".done")) for c in spec.chunks), ' ') *
@@ -808,7 +809,8 @@ end
 """
     read_queue(runner, host, root) -> (; wants, claims, done)
 
-A region store's queue in one round trip. `wants`: submission name → `(; region, parent, chunks, age)`.
+A region store's queue in one round trip. `wants`: submission name → `(; region, parent, hub, chunks, age)`,
+`hub` being the hub that queued it and serves it.
 `claims`: chunk → `(; owner, age)` with `age` in seconds since the claim was last refreshed. `done`:
 chunks whose run returned. `stage`: what the hub's driver last said it is doing for the region.
 """
@@ -823,7 +825,7 @@ function read_queue(runner, host::AbstractString, root::AbstractString)
 end
 
 function parse_queue(txt::AbstractString)
-    wants = Dict{String,NamedTuple{(:region, :parent, :chunks, :age),Tuple{String,String,Vector{String},Int}}}()
+    wants = Dict{String,NamedTuple{(:region, :parent, :hub, :chunks, :age),Tuple{String,String,String,Vector{String},Int}}}()
     claims = Dict{String,NamedTuple{(:owner, :age),Tuple{String,Int}}}()
     done = Set{String}()
     stage = ""
@@ -836,7 +838,7 @@ function parse_queue(txt::AbstractString)
             for item in eachsplit(body, ';'; keepempty = false)
                 i = findfirst('=', item); i === nothing || (kv[item[1:prevind(item, i)]] = item[nextind(item, i):end])
             end
-            wants[f[1:end-5]] = (region = get(kv, "region", ""), parent = get(kv, "parent", ""),
+            wants[f[1:end-5]] = (region = get(kv, "region", ""), parent = get(kv, "parent", ""), hub = get(kv, "hub", ""),
                                  chunks = String.(split(get(kv, "chunks", ""))), age = age)
         elseif endswith(f, ".claim")
             claims[f[1:end-6]] = (owner = String(strip(replace(body, ';' => ' '))), age = age)

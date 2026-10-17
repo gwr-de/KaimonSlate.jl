@@ -19,6 +19,7 @@ const HUB_CLUSTERS = Dict{String,Any}[]
 const HUB_LOG = String[]
 clusters_all() = HUB_CLUSTERS
 _rlog(msg) = push!(HUB_LOG, String(msg))
+worker_owner_tag() = "slate-owner=test-hub"
 
 # A launcher that reports whatever the test tells it to, and records what was submitted.
 mutable struct FakeLauncher <: BL.Launcher
@@ -674,7 +675,7 @@ end
                 # Only this user's jobs are looked at, and a release cancels the job found, by its id.
                 tool("squeue", "echo \"\$@\" > $(bin)/asked; echo '42|RUNNING|nid1|0:41|N/A|None|32'")
                 tool("scancel", "echo \"\$@\" > $(bin)/cancelled")
-                @test Sweep.release_allocation!(:slurm, "", "hold")
+                @test Sweep.release_allocation!(:slurm, "", "hold") == "42"
                 asked = read(joinpath(bin, "asked"), String)
                 @test occursin("-u $(ENV["USER"])", asked) && occursin("-n hold", asked)
                 @test strip(read(joinpath(bin, "cancelled"), String)) == "42"
@@ -3716,13 +3717,16 @@ end
     @testset "a region's queue is the channel between the card and the task workers" begin
         mktempdir() do root
             sweep, chunks = mksweep(root; nchunk = 2, per = 2)
-            l = BL.RegionLauncher(""; region = "gpu", root, parent = "/env", runner = (h, sc) -> BL._local_run(sc))
+            l = BL.RegionLauncher(""; region = "gpu", root, parent = "/env", hub = "hub-a", runner = (h, sc) -> BL._local_run(sc))
             names = String[]
             spec = (name, cs) -> (push!(names, name); BL.JobSpec(name, cs; root, project = "", payload = ""))
             BS.reconcile!(root, sweep, l, spec; failure_policy = NOPROBE)
             q = BL.read_queue(l.runner, "", root)
             w = only(values(q.wants))
-            @test (w.region, w.parent, sort(w.chunks)) == ("gpu", "/env", sort(chunks))
+            @test (w.region, w.parent, w.hub, sort(w.chunks)) == ("gpu", "/env", "hub-a", sort(chunks))
+            # A region target queues under the hub that builds its launcher, which is the hub that serves it.
+            @test Sweep.launcher_for(Sweep.ClusterTarget("login"; kind = :region, region = "gpu", root)).hub ==
+                  worker_owner_tag()
             @test BL.poll(l, root, names) == Dict(only(names) => :pending)
             # What the hub's driver says it is doing rides the same read, for the card.
             write(joinpath(root, "queue", "stage"), "waiting for a node")

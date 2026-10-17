@@ -259,6 +259,14 @@ end
             @test RE.region_place!(plain) == ("workstation", nothing)
             @test !RE.region_release!(plain)              # nothing was ever held
 
+            # Two hubs that define one region share its store. Each serves only the wants it queued;
+            # one with no hub is nobody's here.
+            me = RE.worker_owner_tag()
+            q = RE.BatchLauncher.parse_queue("a.want\t5\tregion=gpu;parent=/env;hub=$me;chunks=c1;\n" *
+                                             "b.want\t5\tregion=gpu;parent=/env;hub=slate-owner=0;chunks=c2;\n" *
+                                             "c.want\t5\tregion=gpu;parent=/env;chunks=c3;\n")
+            @test collect(keys(KaimonSlate._own_wants((; name = "gpu"), q).wants)) == ["a"]
+
             # A scheduler region with no allocation yet reads as its login node and holds nothing —
             # the honest answer for a UI, and the reason `region_host` is separate from `region_place!`.
             # Prepared, so the tests below reach placement; preparing is tested on its own.

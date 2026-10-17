@@ -152,7 +152,8 @@ function _drive_region_sweep!(r, store::AbstractString)
     BL = ReportEngine.Sweep.BatchLauncher
     runner = (hh, sc) -> ReportEngine.Sweep.run_there(hh, sc)
     ReportEngine.Sweep.connected(r.host) || return nothing        # nobody signed in: nothing to read
-    q = BL.read_queue(runner, r.host, store)
+    all_q = BL.read_queue(runner, r.host, store)
+    q = _own_wants(r, all_q)
     lock(_SWEEPERS_LOCK) do
         isempty(q.wants) ? delete!(_SWEEP_QUEUED, r.name) : push!(_SWEEP_QUEUED, r.name)
     end
@@ -171,7 +172,8 @@ function _drive_region_sweep!(r, store::AbstractString)
         s.idle_since == 0 && (s.idle_since = time())
         time() - s.idle_since > _SWEEP_IDLE_STOP && _stop_sweeper!(s, "nothing queued")
     end
-    isempty(q.wants) && return _set_stage!(r, store, runner, "")
+    # The stage is the store's, so it is left to the hub whose work is queued there.
+    isempty(q.wants) && return isempty(all_q.wants) ? _set_stage!(r, store, runner, "") : nothing
     _region_used!(r.name)                       # queued work keeps the node, as a running cell does
     host, job = ReportEngine.region_where(r)
     if r.scheduler !== :none && isempty(job)
@@ -198,6 +200,22 @@ function _drive_region_sweep!(r, store::AbstractString)
     end
     return nothing
 end
+
+# The queue with only the wants this hub queued. Two hubs that define the same region share its store
+# on the cluster, and a hub serving the other's wants runs its chunks a second time, asks for nodes for
+# them, and gives those nodes back while the other hub's notebook is using them. A want with no hub is
+# foreign, as a worker manifest with no owner is (`_manifest_ours`). Each foreign want is logged once.
+function _own_wants(r, q)
+    me = ReportEngine.worker_owner_tag()
+    own = filter(p -> p.second.hub == me, q.wants)
+    for n in keys(q.wants)
+        haskey(own, n) && continue
+        lock(_SWEEPERS_LOCK) do; n in _FOREIGN_WANTS ? false : (push!(_FOREIGN_WANTS, n); true); end || continue
+        ReportEngine._rlog("region[$(r.name)]: leaving $n to the hub that queued it")
+    end
+    return (; q..., wants = own)
+end
+const _FOREIGN_WANTS = Set{String}()      # under `_SWEEPERS_LOCK`
 
 # What the worker is doing. One whose chunk is no longer wanted was cancelled with its want: it is
 # stopped, and the units it landed stay landed. A unit can hold every thread of the worker, or a long

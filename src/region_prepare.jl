@@ -522,7 +522,7 @@ function _prepare_on_node!(r::Region, step, facts, measured, ref; keep_node::Boo
                     else
                         note("job $(p0.job) has only $(Sweep.format_duration(left)) of walltime left; " *
                              "giving it back for a fresh node")
-                        region_release!(r); gave_back = time()
+                        region_release!(r; why = "too little walltime left for the prepare"); gave_back = time()
                         continue
                     end
                 end
@@ -594,7 +594,8 @@ function _prepare_on_node!(r::Region, step, facts, measured, ref; keep_node::Boo
             step(() -> ("ok", "$(region_host(r)) was held before the prepare"), "Leave the node as it was")
         else
             step("Give the node back") do
-                region_release!(r) ? ("ok", "") : ("warn", "nothing to release")
+                region_release!(r; why = "the prepare is done and nothing else needs the node") ? ("ok", "") :
+                                                                                       ("warn", "nothing to release")
             end
         end
     end

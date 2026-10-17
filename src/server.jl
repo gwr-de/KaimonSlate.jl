@@ -2332,7 +2332,7 @@ function _place_in_background!(name::AbstractString, nb::Union{LiveNotebook,Noth
             if _withdrawn_while_placing(name)
                 ReportEngine._rlog("region[$name]: the request was withdrawn while it was placed — releasing it")
                 # The withdrawal usually cancelled the job already, leaving this release nothing to do.
-                if !ReportEngine.region_release!(r)
+                if !ReportEngine.region_release!(r; why = "the request was withdrawn while it was placed")
                     left = ReportEngine.region_allocation(r)
                     (left === nothing || left.state !== :none) &&
                         ReportEngine._rlog("region[$name]: releasing the withdrawn request failed; " *
@@ -3738,7 +3738,7 @@ function _release_idle_regions!(nbs_of, busy)
                                "its $(ReportEngine.Sweep.format_duration(r.idle_release)) limit — " *
                                "releasing its node")
             try
-                ReportEngine.region_release!(r)
+                ReportEngine.region_release!(r; why = "idle past its limit")
                 lock(_REGION_USE_LOCK) do; delete!(_REGION_RELEASE_WARNED, r.name); end
                 # Nobody was here to see it — that is why it happened — so the notice is KEPT and pushed
                 # again when a page next connects, rather than broadcast once into an empty room.

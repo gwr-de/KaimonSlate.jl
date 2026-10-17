@@ -963,7 +963,7 @@ lists the job, the request stands: the stamp is undone and the task in flight ke
 function _release_region!(h, r)
     t = time()
     prev = _stamp_withdraw!(r.name, t)
-    ok = ReportEngine.region_release!(r)
+    ok = ReportEngine.region_release!(r; why = "released on request")
     left = ok ? nothing : ReportEngine.region_allocation(r)
     gone = ok || (left !== nothing && left.state === :none)
     gone || lock(_PLACING_LOCK) do

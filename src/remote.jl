@@ -5505,7 +5505,7 @@ function region_reap!(r::Union{Region,Nothing}, name)
         else
             # The allocation outlives the workers on it and bills the whole time, so this is the
             # step that must not be skipped — and it goes through the LOGIN node, still reachable.
-            try; region_release!(r); catch e
+            try; region_release!(r; why = "the region was deleted"); catch e
                 _rlog("region[$(r.name)]: release-on-delete failed ($(first(sprint(showerror, e), 120)))")
             end
         end
@@ -5881,11 +5881,11 @@ _granted_ts(prev, host, job, now_::Float64) =
 _alloc_walltime(r::Region) = isempty(r.walltime) ? "01:00:00" : r.walltime
 
 """
-    region_release!(r) -> Bool
+    region_release!(r; why = "") -> Bool
 
 Give the region's allocation back. An allocation bills for the time it is HELD, not the time it is
 used, so this runs whenever a region stops needing a node — draining to zero warm workers, or being
-deleted — and not only when someone remembers.
+deleted — and not only when someone remembers. The job cancelled is logged with `why`.
 """
 # Every worker of this region on the node it currently holds — attached ones included, unlike
 # `_region_warm_worker`, which is the adoption predicate and deliberately only sees idle ones.
@@ -5947,17 +5947,19 @@ function region_forget_placement!(r::Region)
     return true
 end
 
-function region_release!(r::Region)
+function region_release!(r::Region; why::AbstractString = "")
     kind = region_scheduler(r)
     kind === :none && return false
     _reap_region_workers!(r)                     # before the node goes — see above
     region_forget_placement!(r)
-    return try
+    id = try
         Sweep.release_allocation!(kind, r.host, region_alloc_name(r))
     catch e
         _rlog("region[$(r.name)]: releasing the allocation failed ($(first(sprint(showerror, e), 120)))")
-        false
+        ""
     end
+    isempty(id) || _rlog("region[$(r.name)]: cancelled job $id on $(r.host)" * (isempty(why) ? "" : " — $why"))
+    return !isempty(id)
 end
 
 "The region's cached placement, or `nothing` — the hub's own record of the node and when it ends."
@@ -6097,7 +6099,7 @@ function _region_reconcile_impl!(r::Region)
         _region_holds_node(r) ||
             return "region[$(r.name)]: holds no node — nothing to reconcile"
         if r.warm <= 0 && !_region_has_live_workers(r)
-            region_release!(r)
+            region_release!(r; why = "no worker of this hub is left on the node")
             return "region[$(r.name)]: nothing left to keep here — allocation released"
         end
         host, alloc = region_place!(r)

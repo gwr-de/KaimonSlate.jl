@@ -789,7 +789,7 @@ function launcher_for(t::ClusterTarget)
                                           runner = (h, sc) -> run_there(h, sc))
     t.kind === :region &&
         return BatchLauncher.RegionLauncher(t.host; region = t.region, root = job_root(t), parent = t.parent,
-                                            runner = (h, sc) -> run_there(h, sc))
+                                            hub = P.worker_owner_tag(), runner = (h, sc) -> run_there(h, sc))
     ctor = t.kind === :slurm ? BatchLauncher.SlurmLauncher :
            t.kind === :pbs   ? BatchLauncher.PbsLauncher :
            error("cluster: no launcher for scheduler `$(t.kind)`")
