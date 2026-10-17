@@ -3123,7 +3123,11 @@ function __slate_run_chunks(; root::AbstractString = "", chunks = String[], owne
     end
 end
 
+# Whether this worker is running a sweep's chunks now: work, for the spin-guard, though no cell is running.
+_running_chunks() = (cur = _CHUNKS[]; cur !== nothing && !istaskdone(cur.task))
+
 function __slate_chunk_status()
+    _LAST_HUB_REQ[] = time()   # the hub asking what a task worker is doing is its heartbeat, as `__slate_running` is
     cur = _CHUNKS[]
     cur === nothing && return Dict{String,Any}("state" => "idle")
     out = Dict{String,Any}("chunk" => cur.current[], "chunks" => cur.chunks)
@@ -3262,8 +3266,9 @@ function _telemetry_loop!(stats_path::String)
         # actually computing), and NO hub heartbeat for minutes (an attached kernel is pinged every few
         # seconds via __slate_running; silence ⇒ the hub has forgotten us). Warming/precompiling is exempt,
         # and a healthy idle worker sits near 0% cpu so it never trips. Require a sustained streak on top
-        # of the heartbeat gap so a GC burst can't fire it.
-        spin = (cpu > 70.0 && evals == 0 && (time() - _LAST_HUB_REQ[]) > 300 &&
+        # of the heartbeat gap so a GC burst can't fire it. A task worker running a sweep's chunks is
+        # working, not wedged, though no cell is: its chunks count as work.
+        spin = (cpu > 70.0 && evals == 0 && !_running_chunks() && (time() - _LAST_HUB_REQ[]) > 300 &&
                 !startswith(_WARM_STATUS[], "warming")) ? spin + 1 : 0
         if spin >= 15                                       # ~30s of hot-idle after ~5min of no hub contact ⇒ wedged orphan
             @error "slate worker: wedged orphan — a core pinned with no running eval and no hub heartbeat for minutes; exiting to free the host" cpu = cpu pid = getpid()
