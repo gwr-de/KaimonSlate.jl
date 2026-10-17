@@ -220,8 +220,10 @@ function _check_worker!(s::_RegionSweeper, r, q, wanted::Set{String})
             return nothing
         end
         ReportEngine._rlog("region[$(r.name)]: task worker $(w.kernel.label) holds no live claim — stopping it")
-        _record_stuck_worker(w)
-        _stop_task_worker!(w); s.worker = nothing
+        # Where it is stuck is read before it is stopped, which can take minutes on a node that lets a
+        # debugger attach: on a task of its own, so the other regions' sweeps go on meanwhile.
+        errormonitor(Threads.@spawn (_record_stuck_worker(w); _stop_task_worker!(w)))
+        s.worker = nothing
         return nothing
     end
     state = String(get(st, "state", "idle"))

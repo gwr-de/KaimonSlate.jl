@@ -292,41 +292,53 @@ _reap_dying!(s::Session) =
         !freed
     end
 
-# The command channels open now, with their host, command and start: the account given when a server refuses another
-# channel. A channel stays here until it is freed, which for a command whose far end has not finished is not yet.
-const _OPEN_CMDS = Dict{Ptr{Cvoid},Tuple{String,String,Float64}}()
+# The command channels open now, each with the session it belongs to, its command and its start: the account given when
+# a server refuses another channel. A channel stays here until it is freed, which for a command whose far end has not
+# finished is not yet; a session's channels are freed with it, so its entries go when it does (`_forget_session_cmds!`).
+const _OPEN_CMDS = Dict{Ptr{Cvoid},Tuple{Session,String,Float64}}()
 const _OPEN_CMDS_LOCK = ReentrantLock()
 const _REFUSAL_REPORTED = Dict{String,Float64}()
 _note_open!(s::Session, ch, cmd) = lock(_OPEN_CMDS_LOCK) do
-    _OPEN_CMDS[ch] = (s.ep.alias, first(String(cmd), 120), time())
-    delete!(_IDLE_REFUSAL_SINCE, s.ep.alias)
+    _OPEN_CMDS[ch] = (s, first(String(cmd), 120), time())
+    delete!(_IDLE_REFUSAL_SINCE, s)
     nothing
 end
 _note_freed!(ch) = lock(() -> (delete!(_OPEN_CMDS, ch); nothing), _OPEN_CMDS_LOCK)
 
-# A server that refuses every channel while this side holds none of its command channels and is closing none is
+# `s`'s command channels, oldest first, as (start, command).
+_session_cmds(s::Session) =
+    sort!([(t, cmd) for (o, cmd, t) in values(_OPEN_CMDS) if o === s]; by = first)   # under `_OPEN_CMDS_LOCK`
+
+# Called as libssh2 frees the session, which frees its channels with it.
+_forget_session_cmds!(s::Session) = lock(_OPEN_CMDS_LOCK) do
+    filter!(kv -> last(kv)[1] !== s, _OPEN_CMDS)
+    delete!(_IDLE_REFUSAL_SINCE, s)
+    nothing
+end
+
+# A server that refuses every channel while this session holds none of its command channels and is closing none is
 # counting sessions this side has already let go. The connection then refuses every command from that point on, while
 # the forwards riding it keep working, since a forward is not a session. Seen for `IDLE_REFUSAL_S` with no channel
 # opening in between, the session is ended as a lost connection is: the next command connects afresh, and the forwards
-# are made again over the new connection. When the first such refusal was seen, per host; under `_OPEN_CMDS_LOCK`.
-const _IDLE_REFUSAL_SINCE = Dict{String,Float64}()
+# are made again over the new connection. Each connection is counted on its own, so only this session's channels
+# count. When the first such refusal was seen, per session; under `_OPEN_CMDS_LOCK`.
+const _IDLE_REFUSAL_SINCE = IdDict{Session,Float64}()
 const IDLE_REFUSAL_S = 60.0
 
 function _refused_with_none_open!(s::Session, why::AbstractString)
     s.bulk && return false
-    host = s.ep.alias
     closing = lock(() -> length(s.dying), s.lk)
     stale = lock(_OPEN_CMDS_LOCK) do
-        if closing > 0 || any(v -> first(v) == host, values(_OPEN_CMDS))
-            delete!(_IDLE_REFUSAL_SINCE, host)
+        if closing > 0 || any(v -> v[1] === s, values(_OPEN_CMDS))
+            delete!(_IDLE_REFUSAL_SINCE, s)
             return false
         end
-        since = get!(_IDLE_REFUSAL_SINCE, host, time())
+        since = get!(_IDLE_REFUSAL_SINCE, s, time())
         time() - since < IDLE_REFUSAL_S && return false
-        delete!(_IDLE_REFUSAL_SINCE, host)
+        delete!(_IDLE_REFUSAL_SINCE, s)
         true
     end
-    stale && _channel_dead!(s, "$host refuses every channel though none of this side's are open ($why)")
+    stale && _channel_dead!(s, "$(s.ep.alias) refuses every channel though none of this session's are open ($why)")
     return stale
 end
 
@@ -337,7 +349,7 @@ function _report_refusal(s::Session, why::AbstractString)
     lock(_OPEN_CMDS_LOCK) do
         now - get(_REFUSAL_REPORTED, host, 0.0) < 60 && return nothing
         _REFUSAL_REPORTED[host] = now
-        mine = sort!([(t, cmd) for (_, (h, cmd, t)) in _OPEN_CMDS if h == host]; by = first)
+        mine = _session_cmds(s)
         @warn "ssh: $host refused a channel" why commands_running = s.busy[] forwards = s.ntun[] closing = length(s.dying) open_commands = length(mine) oldest = [string(round(Int, now - t), "s  ", cmd) for (t, cmd) in mine[1:min(end, 12)]]
     end
     nothing
@@ -1226,6 +1238,7 @@ end
 # fails on purpose.
 function _reconnect!(s::Session)
     s.ptr == C_NULL || ccall((:libssh2_session_free, LIB), Cint, (Ptr{Cvoid},), s.ptr)
+    _forget_session_cmds!(s)
     s.fd >= 0 && ccall(:close, Cint, (Cint,), s.fd)
     s.fd = _tcp_connect(s.ep.hostname, s.ep.port)
     s.ptr = ccall((:libssh2_session_init_ex, LIB), Ptr{Cvoid},
@@ -1248,6 +1261,7 @@ function _close!(s::Session)
         ccall((:libssh2_session_free, LIB), Cint, (Ptr{Cvoid},), s.ptr)
     end
     empty!(s.dying)                 # freed with the session
+    _forget_session_cmds!(s)
     s.fd >= 0 && ccall(:close, Cint, (Cint,), s.fd)
     s.ptr = C_NULL; s.fd = Cint(-1)
     return nothing
