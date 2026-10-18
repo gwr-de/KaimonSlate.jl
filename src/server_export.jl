@@ -2046,6 +2046,9 @@ end
 # into a sortable / filterable / client-paged table with a CSV download. All rows are already in the
 # DOM; numeric columns carry their raw value in `data-v` so sorting is numeric, not lexical. Emitted
 # ONCE into the page's `<script>` and run immediately (tables precede the script in the body).
+# The live page's image zoom (assets/js/imgzoom.js), carried as is: it brings its own styles.
+_imgzoom_js() = read(joinpath(@__DIR__, "assets", "js", "imgzoom.js"), String)
+
 const _EXPORT_TABLE_JS = raw"""(function(){
 function esc(s){s=String(s);return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}
 function enh(table){
@@ -3188,6 +3191,7 @@ function export_html(nb::LiveNotebook; include_source::Bool = true,
         # ride here at the end (they run against the finished DOM).
         print(io, "<script>")
         print(io, _EXPORT_TABLE_JS)   # hydrate every `.exp-table` → sortable/filterable/paged + CSV (no server)
+        print(io, _imgzoom_js())      # zoom/pan + full-window view for figure images, as on the live page
         # …then let a `@replay`-marked table follow its control, using the hook each enhancer just
         # registered. Nothing is emitted for a notebook with no replayed table.
         isempty(tablemarks) || print(io, "var _slateTableMarks=", JSON.json(tablemarks), ";",

@@ -655,25 +655,13 @@ function _scUpdateChrome() {
   const btn = document.getElementById('scratchbtn');
   if (btn) btn.dataset.count = _scUnread ? String(_scUnread) : '';   // NEW since last viewed, not the total
 }
-// Scratch output images render as thumbnails; click → a full-size lightbox (Esc / click to close).
-function _scZoom(src) {
-  let m = document.getElementById('scratchimgmodal');
-  if (!m) {
-    m = document.createElement('div'); m.id = 'scratchimgmodal'; m.className = 'scimgmodal';
-    m.innerHTML = '<img alt="scratch output"/>';
-    m.addEventListener('click', () => m.classList.remove('show'));
-    document.addEventListener('keydown', e => { if (e.key === 'Escape' && m.classList.contains('show')) m.classList.remove('show'); });
-    document.body.appendChild(m);
-  }
-  m.querySelector('img').src = src;
-  m.classList.add('show');
-}
+// Scratch output images render as thumbnails; click → the full-window image view (imgzoom.js).
 function _scWireImages(b) {
   b.querySelectorAll('.scout img').forEach(img => {
     if (img._scwired) return; img._scwired = true;
     img.classList.add('scthumb');
     img.title = 'click to enlarge';
-    img.addEventListener('click', () => _scZoom(img.currentSrc || img.src));
+    img.addEventListener('click', () => window.slateImageView(img.currentSrc || img.src, 'scratch output'));
   });
 }
 window.onScratchCell = function (cell) {

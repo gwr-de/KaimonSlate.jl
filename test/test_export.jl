@@ -758,6 +758,7 @@ end
     @test count("import(\"/ext-assets/GlobeSlate/lib.mjs\")", hstand) == 2  # the map resolves the call sites
     @test !occursin("/ext-assets/GlobeSlate/earth.png", hstand)
     @test count("src=\"data:image/png;base64,", hstand) == 2
+    @test occursin("window.slateImageView", hstand)                      # figures zoom as on the live page
     hsite = NS.export_html(_html_nb(); inline_assets = false)
     @test count("import(\"./ext-assets/GlobeSlate/lib.mjs\")", hsite) == 2
     @test count("src=\"./ext-assets/GlobeSlate/earth.png\"", hsite) == 2
