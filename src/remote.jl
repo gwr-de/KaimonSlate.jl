@@ -1185,7 +1185,8 @@ function _held_record_snippet(file::AbstractString, stamp::AbstractString)
     isempty(file) && return ""
     """
     try
-        import TOML, Artifacts
+        # Through Pkg, which the caller imports: an environment need not list TOML or Artifacts.
+        _toml_parse, _artifact_path = Pkg.TOML.parsefile, Pkg.Artifacts.artifact_path
         _f = raw"$file"
         _f = startswith(_f, "/") ? _f : joinpath(homedir(), startswith(_f, "~/") ? _f[3:end] : _f)
         _held = String[]
@@ -1198,9 +1199,9 @@ function _held_record_snippet(file::AbstractString, stamp::AbstractString)
             for _name in ("Artifacts.toml", "JuliaArtifacts.toml")
                 _toml = joinpath(_src, _name)
                 isfile(_toml) || continue
-                for (_, _e) in TOML.parsefile(_toml), _m in (_e isa AbstractVector ? _e : [_e])
+                for (_, _e) in _toml_parse(_toml), _m in (_e isa AbstractVector ? _e : [_e])
                     (_m isa AbstractDict && haskey(_m, "git-tree-sha1")) || continue
-                    _p = Artifacts.artifact_path(Base.SHA1(_m["git-tree-sha1"]))
+                    _p = _artifact_path(Base.SHA1(_m["git-tree-sha1"]))
                     isdir(_p) && push!(_held, _p)
                 end
             end
