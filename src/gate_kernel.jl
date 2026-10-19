@@ -883,6 +883,10 @@ worker_owner_tag() =
                                         get(ENV, "KAIMONSLATE_CONFIG_HOME", ""), '|',
                                         get(ENV, "KAIMONSLATE_PORT", ""))); base = 16)
 
+# The boot-script line that hands a worker, local or remote, the tag of the hub starting it: the
+# worker cannot compute it, since the tag hashes the hub's environment.
+_hub_owner_line() = "SlateWorker.HUB_OWNER[] = $(repr(worker_owner_tag()))"
+
 # Worker boot: put KaimonGate and the slate-owned infra env on LOAD_PATH, load the SlateWorker
 # package, and serve its tools over TCP. Pinned to the notebook's project.
 function _worker_script(port::Int, stream_port::Int, parent::AbstractString = "",
@@ -912,7 +916,7 @@ function _worker_script(port::Int, stream_port::Int, parent::AbstractString = ""
     try; @eval using Revise; catch e; @warn "slate: Revise unavailable in worker (hot-reload off)" exception=e; end
     SlateWorker.PARENT_PROJECT[] = $(repr(String(parent)))
     SlateWorker.NOTEBOOK_DIR[] = $(repr(String(nbdir)))
-    SlateWorker.HUB_OWNER[] = $(repr(worker_owner_tag()))
+    $(_hub_owner_line())
     SlateWorker.start(; host = "127.0.0.1", port = $port, stream_port = $stream_port)
     """
 end

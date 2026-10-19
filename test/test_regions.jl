@@ -56,13 +56,13 @@ end
     @testset "every worker boot hands the worker its hub's owner tag" begin
         # A sweep a worker queues on a region records the owning hub, and the worker has no other way
         # to know it: `worker_owner_tag` hashes the HUB's environment.
-        tag = RE.worker_owner_tag()
+        # (The local boot script uses the same line but needs Kaimon's gate env to build.)
+        line = RE._hub_owner_line()
+        ex = Meta.parse(line)
+        @test ex.head === :(=) && ex.args[2] == RE.worker_owner_tag()
         s = RE._remote_worker_script(RE.RemoteTarget("h"; transport = :tunnel), 9100, 9101, "/p", "PUB")
-        @test occursin("SlateWorker.HUB_OWNER[] = raw\"$tag\"", s)
+        @test occursin(line, s)
         @test findfirst("HUB_OWNER", s)[1] < findfirst("SlateWorker.start(", s)[1]
-        l = RE._worker_script(9100, 9101, "/p", "/nb")
-        @test occursin("SlateWorker.HUB_OWNER[] = $(repr(tag))", l)
-        @test findfirst("HUB_OWNER", l)[1] < findfirst("SlateWorker.start(", l)[1]
     end
 
     @testset "a tunnelled worker still allow-lists its client" begin
