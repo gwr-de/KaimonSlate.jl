@@ -2779,6 +2779,7 @@ function _remote_worker_script(t::RemoteTarget, port::Int, stream_port::Int, par
     _bt("Revise loaded")
     SlateWorker.PARENT_PROJECT[] = expanduser(raw"$parent")   # `~/.cache/…` → absolute, so @asset/@sfile/datadir don't emit un-expandable tilde paths
     SlateWorker.PAYLOAD_SHA[] = raw"$(_payload_sha())"
+    SlateWorker.HUB_OWNER[] = raw"$(worker_owner_tag())"
     SlateWorker.ENV_STAMP_FILE[] = let p = raw"$(_env_stamp_path(t))"; isabspath(p) ? p : joinpath(homedir(), p); end
     SlateWorker.BOOT_ENV_STAMP[] = SlateWorker._env_stamp_now()
     SlateWorker.start(; host="$bind", port=$port, stream_port=$stream_port,

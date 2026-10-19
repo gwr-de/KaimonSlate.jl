@@ -912,6 +912,7 @@ function _worker_script(port::Int, stream_port::Int, parent::AbstractString = ""
     try; @eval using Revise; catch e; @warn "slate: Revise unavailable in worker (hot-reload off)" exception=e; end
     SlateWorker.PARENT_PROJECT[] = $(repr(String(parent)))
     SlateWorker.NOTEBOOK_DIR[] = $(repr(String(nbdir)))
+    SlateWorker.HUB_OWNER[] = $(repr(worker_owner_tag()))
     SlateWorker.start(; host = "127.0.0.1", port = $port, stream_port = $stream_port)
     """
 end

@@ -29,6 +29,12 @@ const PARENT_PROJECT = Ref("")
 # case, where the asset base is the per-notebook env dir but the author's files sit by the notebook.
 const NOTEBOOK_DIR = Ref("")
 
+# The owner tag of the hub that started this worker (set by the boot script). A sweep this worker
+# queues on a region records it, so only that hub's driver serves the work — see region_sweeps.jl.
+const HUB_OWNER = Ref("")
+worker_owner_tag() = isempty(HUB_OWNER[]) ? error("slate: this worker was booted without its hub's owner tag") :
+                     HUB_OWNER[]
+
 # SHA of the worker payload this process BOOTED with (set from the boot script; "" for a local worker
 # that inherits the hub's version). The hub compares it against the current payload on reattach and
 # reprovisions a worker running stale code — see remote.jl `_payload_sha` / `attached!`.
