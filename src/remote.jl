@@ -1442,8 +1442,31 @@ is, its sources sent when they changed. `rebuild` (a prepare) also tests that th
 the environment and fetches what it lost. Returns what became of the environment (`_env_action`):
 `:build`, `:repair`, `:held` or `:keep`.
 """
-function provision_remote!(t::RemoteTarget, parent_project::AbstractString; precompile::Bool = true,
-                           seen = nothing, rebuild::Bool = false)
+function provision_remote!(t::RemoteTarget, parent_project::AbstractString; seen = nothing, kw...)
+    lk = _env_provision_lock(t)
+    if !trylock(lk)
+        _rlog("provision: waiting for another provision of $(t.project) on $(t.ssh_host)")
+        lock(lk)
+        seen = nothing           # what the host held before the wait is what the other provision changed
+    end
+    try
+        return _provision_remote!(t, parent_project; seen, kw...)
+    finally
+        unlock(lk)
+    end
+end
+
+# One provision of a remote environment at a time. Two that overlap write the same Project and
+# Manifest, and one's reset can delete the files the other is instantiating. Every node of a cluster
+# shares the home the environment is built in, so the key is the host holding the files, not the node.
+const _ENV_PROVISIONS = Dict{Tuple{String,String},ReentrantLock}()
+const _ENV_PROVISIONS_LOCK = ReentrantLock()
+_env_provision_lock(t::RemoteTarget) = lock(_ENV_PROVISIONS_LOCK) do
+    get!(ReentrantLock, _ENV_PROVISIONS, (_host_for_files(t.ssh_host), String(t.project)))
+end
+
+function _provision_remote!(t::RemoteTarget, parent_project::AbstractString; precompile::Bool = true,
+                            seen = nothing, rebuild::Bool = false)
     host = t.ssh_host
     _rlog("provision START host=$host transport=$(t.transport) project=$(t.project) parent=$parent_project")
     # Reachability precheck FIRST — a clear message beats a cryptic transfer failure ten steps in when the
@@ -1571,9 +1594,47 @@ function provision_remote!(t::RemoteTarget, parent_project::AbstractString; prec
     # A build writes it from its own script; an environment left as it was needs its own run only
     # when the path went missing.
     (!scripted && get(st, "rg", "") != "1") && _record_rg_path!(host, rel; setup = t.setup)
+    # The stamp records what was built, and the files under it can still be wrong: a build another one
+    # interrupted, a source that did not arrive. So the environment is asked to find each package the
+    # notebook's lists. One kept that cannot is built again, once; one just built that cannot fails.
+    gone = _env_missing(host, rel, _env_dep_names(envdir); setup = t.setup)
+    if !isempty(gone)
+        _run_on(host, "rm -f " * Sweep.shq_path(_env_stamp_path(t)))
+        built && error("provision: the environment built on $host cannot load " * join(gone, ", "))
+        _rlog("provision [3/3] the environment on $host cannot load $(join(gone, ", ")) — building it again")
+        return _provision_remote!(t, parent_project; precompile, rebuild)
+    end
     _rlog("provision DONE host=$host")
     # What became of the environment: `:build` when its files were written anew, else as `_env_action`.
     return built ? :build : action
+end
+
+# The packages an environment built from `envdir` must load: its Project's dependencies, and the
+# project itself when it is a package.
+function _env_dep_names(envdir::AbstractString)
+    f = joinpath(envdir, "Project.toml")
+    (isempty(envdir) || !isfile(f)) && return String[]
+    p = try; Sweep.TOML.parsefile(f); catch; return String[]; end
+    names = String.(collect(keys(get(p, "deps", Dict{String,Any}()))))
+    haskey(p, "name") && push!(names, String(p["name"]))
+    return sort!(unique!(names))
+end
+
+# Which of `names` the environment at `rel` on `host` cannot find. Empty when the host could not be
+# asked: the start fails on its own then, and a check that cannot run is not a failed check.
+function _env_missing(host::AbstractString, rel::AbstractString, names::Vector{String}; setup::AbstractString = "")
+    isempty(names) && return String[]
+    code = """
+    Base.set_active_project(joinpath(homedir(), raw"$rel"))
+    println("@@SLATE_ENV_MISSING ", join(filter(n -> Base.find_package(n) === nothing, $(repr(names))), ' '))
+    """
+    ok, out = _ssh_julia!(host, code, "environment check on $host"; setup)
+    m = match(r"@@SLATE_ENV_MISSING ?([^\n]*)", out)
+    if !ok || m === nothing
+        _rlog("provision: could not check the environment on $host: " * first(strip(out), 200))
+        return String[]
+    end
+    return String.(split(m.captures[1]))
 end
 
 # The end of a worker's own log, copied into the hub's before the worker is reaped.
@@ -2073,13 +2134,12 @@ function _send_dev_deps!(t::RemoteTarget, local_env::AbstractString; force::Bool
             push!(rewrites, (name, name == "SlateWorker" ? _remote_worker_pkg() : _remote_seb()))
             continue
         end
-        if !isdir(lpath)
-            _rlog("env: dev dep '$name' source missing locally ($lpath) — skipping (its path will dangle)")
-            continue
-        end
+        # Either failure leaves the environment pointing at a path the host does not have, so the
+        # provision stops here rather than building one that cannot load the package.
+        isdir(lpath) || error("env: the source of dev dep '$name' is missing here ($lpath)")
         rp = _devsrc_path(lpath)
         _send_tree!(host, lpath, rp; excludes = _DEVSRC_SEND_EXCLUDES, region = t.region, force) ||
-            (_rlog("env: could not send dev dep '$name' → $host"); continue)
+            error("env: could not send dev dep '$name' → $host")
         push!(rewrites, (name, rp))
         _rlog("env: dev dep '$name' → $host:$rp")
     end
