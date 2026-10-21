@@ -25,7 +25,17 @@ mutable struct _RegionSweeper
     job::String
     worker::Union{Nothing,_TaskWorker}
     idle_since::Float64             # when the queue last had nothing for this worker (0 = busy)
+    failures::Int                   # task workers in a row that failed to start or stopped on a chunk
+    next_start::Float64             # no task worker is started before this, after a failure
 end
+_RegionSweeper(region, parent, host, job) = _RegionSweeper(region, parent, host, job, nothing, 0.0, 0, 0.0)
+
+# A task worker that stops on a chunk, or that cannot be started, is replaced, not handed more: what
+# stopped it (a broken environment, a body that cannot load) stops the next chunk too. A fresh one is
+# started after a wait that doubles each time; after `_SWEEP_MAX_FAILURES` in a row the attempt is
+# given back to the sweep, whose own budget decides whether it is submitted again.
+const _SWEEP_MAX_FAILURES = 3
+_sweep_backoff(n::Integer) = min(600.0, 30.0 * 2.0^(n - 1))
 
 const _SWEEPERS = Dict{Tuple{String,String},_RegionSweeper}()   # (region, parent) → its worker
 const _SWEEPERS_LOCK = ReentrantLock()
@@ -159,7 +169,7 @@ function _drive_region_sweep!(r, store::AbstractString)
     end
     wanted = Set{String}(c for w in values(q.wants) for c in w.chunks)
     mine = lock(_SWEEPERS_LOCK) do; [s for s in values(_SWEEPERS) if s.region == r.name]; end
-    foreach(s -> _check_worker!(s, r, q, wanted), mine)
+    foreach(s -> _check_worker!(s, r, q, wanted, store, runner), mine)
     byparent = Dict{String,Vector{String}}()    # environment → its wants
     for (n, w) in q.wants
         push!(get!(Vector{String}, byparent, w.parent), n)
@@ -192,7 +202,7 @@ function _drive_region_sweep!(r, store::AbstractString)
     for (parent, names) in byparent
         s = lock(_SWEEPERS_LOCK) do
             get!(_SWEEPERS, (r.name, parent)) do
-                _RegionSweeper(r.name, parent, host, job, nothing, 0.0)
+                _RegionSweeper(r.name, parent, host, job)
             end
         end
         (s.host, s.job) == (host, job) || (_stop_sweeper!(s, "the region has a new node"); s.host = host; s.job = job)
@@ -221,7 +231,7 @@ const _FOREIGN_WANTS = Set{String}()      # under `_SWEEPERS_LOCK`
 # stopped, and the units it landed stay landed. A unit can hold every thread of the worker, or a long
 # collection can stop it, so a call it does not answer in time does not mean it is gone: the timer that
 # refreshes its chunk's claim does, once the claim has gone stale.
-function _check_worker!(s::_RegionSweeper, r, q, wanted::Set{String})
+function _check_worker!(s::_RegionSweeper, r, q, wanted::Set{String}, store, runner)
     w = s.worker
     w === nothing && return nothing
     st = try
@@ -252,9 +262,34 @@ function _check_worker!(s::_RegionSweeper, r, q, wanted::Set{String})
         _stop_task_worker!(w); s.worker = nothing
         return nothing
     end
-    state == "failed" && ReportEngine._rlog("region[$(r.name)]: $(w.kernel.label) stopped on chunk " *
-                                            "$(w.chunk): " * String(get(st, "error", "")))
+    if state == "failed"
+        err = String(get(st, "error", ""))
+        ReportEngine._rlog("region[$(r.name)]: $(w.kernel.label) stopped on chunk $(w.chunk): $err — replacing it")
+        _stop_task_worker!(w); s.worker = nothing
+        _sweeper_failed!(s, r, q, store, runner, "a chunk stopped on $(s.host): " * first(err, 200))
+    elseif state == "finished"
+        s.failures = 0
+    end
     return nothing
+end
+
+# One more failure in a row for `s`: wait before the next task worker, or, past the limit, give this
+# attempt back by removing the wants of its environment. The chunks they named that have not returned
+# are then missing to the sweep, which submits them again or reports them exhausted.
+function _sweeper_failed!(s::_RegionSweeper, r, q, store, runner, why::AbstractString)
+    BL = ReportEngine.Sweep.BatchLauncher
+    s.failures += 1
+    if s.failures < _SWEEP_MAX_FAILURES
+        wait_s = _sweep_backoff(s.failures)
+        s.next_start = time() + wait_s
+        return _set_stage!(r, store, runner, "$why; trying again in $(round(Int, wait_s))s")
+    end
+    names = [n for (n, w) in q.wants if w.parent == s.parent]
+    ReportEngine._rlog("region[$(r.name)]: $(s.failures) task workers in a row failed ($why); " *
+                       "ending the attempt for $(length(names)) submission(s)")
+    isempty(names) || runner(r.host, "rm -f " * join((BL._shq(joinpath(store, "queue", n * ".want")) for n in names), ' '))
+    s.failures = 0; s.next_start = 0.0
+    return _set_stage!(r, store, runner, "gave up on this attempt: $why")
 end
 
 function _feed_sweeper!(s::_RegionSweeper, r, store, q, names, runner)
@@ -272,12 +307,14 @@ function _feed_sweeper!(s::_RegionSweeper, r, store, q, names, runner)
     busy && _set_stage!(r, store, runner, _running_stage(s))
     (isempty(todo) || busy) && return nothing
     if s.worker === nothing
+        time() < s.next_start && return nothing
         _set_stage!(r, store, runner, "starting a task worker on $(s.host)")
         s.worker = try
             _task_worker(r, s.parent)
         catch e
-            ReportEngine._rlog("region[$(r.name)]: could not start a task worker — " * first(sprint(showerror, e), 200))
-            return nothing
+            err = first(sprint(showerror, e), 200)
+            ReportEngine._rlog("region[$(r.name)]: could not start a task worker — " * err)
+            return _sweeper_failed!(s, r, q, store, runner, "could not start a task worker on $(s.host): " * err)
         end
         _busy(s) && return _set_stage!(r, store, runner, _running_stage(s))   # reattached mid-list
     end

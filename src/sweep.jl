@@ -3978,6 +3978,9 @@ function handle_action(target::SweepTarget, run::AbstractString, params, keys,
         st = BatchSweep.fold(root).status      # status alone: no record is read to find a failure
         failed = [k for k in keys if get(st, k, "") == "error"]
         forget_results!(target, failed)
+        # And the chunks that used up their attempts without landing get them back.
+        p = BatchSweep.plan(root, run)
+        BatchSweep.forget_attempts!(root, [c for (c, s) in p.chunk_state if s === :exhausted])
     elseif action == "reset"
         # Kill anything live FIRST. `clear_attempts!` forgets the submission records, and with them
         # the job names needed to reach the scheduler — reversing these two would leave orphaned jobs
@@ -5052,7 +5055,13 @@ function action_list(p::BatchSweep.Plan, started::Bool = true; jobs::Bool = fals
     elseif st === :cancelled
         push!(acts, ("resume", "Resume"))
     end
-    p.shards_failed > 0 && push!(acts, ("retry", "Retry $(p.shards_failed) failed"))
+    # Units that never landed in their full budget of attempts are retried as failed ones are: the same
+    # button, given the attempts back. An exhausted sweep has nothing live and nothing left to submit,
+    # so every unit it is missing is one of those.
+    nlost = p.state === :exhausted ? p.shards_missing : 0
+    nretry = p.shards_failed + nlost
+    nretry > 0 && push!(acts, ("retry", nlost > 0 ? "Retry $(nretry) unit" * (nretry == 1 ? "" : "s") :
+                                                    "Retry $(p.shards_failed) failed"))
     # What the JOB said, as opposed to what a unit recorded. Offered exactly when a submission is on
     # record, because that is when an output file exists to read — and it is the ONLY account of a
     # failure that left no manifest, which is the state (`:exhausted`) where the card otherwise has

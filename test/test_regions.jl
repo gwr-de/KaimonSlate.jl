@@ -279,6 +279,34 @@ end
                                              "c.want\t5\tregion=gpu;parent=/env;chunks=c3;\n")
             @test collect(keys(KaimonSlate.NotebookServer._own_wants((; name = "gpu"), q).wants)) == ["a"]
 
+            # A task worker that stops on a chunk or cannot start is replaced after a growing wait; the
+            # third failure in a row gives the attempt back by removing its environment's wants.
+            let NS = KaimonSlate.NotebookServer, BL = RE.BatchLauncher
+                mktempdir() do store
+                    qd = joinpath(store, "queue"); mkpath(qd)
+                    write(joinpath(qd, "a.want"), "region=gpu\nparent=/env\nhub=$me\nchunks=c1\n")
+                    write(joinpath(qd, "b.want"), "region=gpu\nparent=/other\nhub=$me\nchunks=c2\n")
+                    runner = (h, sc) -> BL._local_run(sc)
+                    queue = BL.read_queue(runner, "", store)
+                    s = NS._RegionSweeper("gpu", "/env", "node", "1")
+                    r = (; name = "gpu", host = "")
+                    t0 = time()
+                    NS._sweeper_failed!(s, r, queue, store, runner, "boom")
+                    @test s.failures == 1 && s.next_start >= t0 + NS._sweep_backoff(1) - 1
+                    NS._sweeper_failed!(s, r, queue, store, runner, "boom")
+                    @test s.failures == 2 && NS._sweep_backoff(2) > NS._sweep_backoff(1) && isfile(joinpath(qd, "a.want"))
+                    NS._sweeper_failed!(s, r, queue, store, runner, "boom")
+                    @test s.failures == 0 && !isfile(joinpath(qd, "a.want")) && isfile(joinpath(qd, "b.want"))
+                    @test occursin("gave up on this attempt: boom", read(joinpath(qd, "stage"), String))
+                end
+            end
+
+            # What a provisioned environment must be able to load: its Project's deps, and itself.
+            mktempdir() do d
+                write(joinpath(d, "Project.toml"), "name = \"Self\"\n[deps]\nB = \"$(Base.UUID(1))\"\nA = \"$(Base.UUID(2))\"\n")
+                @test RE._env_dep_names(d) == ["A", "B", "Self"] && RE._env_dep_names("") == String[]
+            end
+
             # A scheduler region with no allocation yet reads as its login node and holds nothing —
             # the honest answer for a UI, and the reason `region_host` is separate from `region_place!`.
             # Prepared, so the tests below reach placement; preparing is tested on its own.

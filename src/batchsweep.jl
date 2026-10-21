@@ -939,20 +939,29 @@ function clear_attempts!(root::AbstractString, sweep::AbstractString)
         any(in(want), cs) || continue
         rm(index_path(root, name); force = true); n += 1
     end
+    return max(n, forget_attempts!(root, want))
+end
+
+"""
+    forget_attempts!(root, chunks) -> Int
+
+Drop the attempt counts of `chunks`, so each may be submitted its full budget again. The submission
+records stay, and with them the logs of the attempts already made. Returns how many were counted.
+"""
+function forget_attempts!(root::AbstractString, chunks)
+    want = Set{String}(String.(collect(chunks)))
     a = read_attempts(root)
     cleared = [c for c in keys(a) if c in want]
-    if !isempty(cleared)
-        for c in cleared; delete!(a, c); end
-        dir = jobs_dir(root); mkpath(dir); tmp = tempname(dir)
-        try
-            open(io -> TOML.print(io, Dict{String,Any}(k => v for (k, v) in a)), tmp, "w")
-            mv(tmp, attempts_path(root); force = true)
-        catch
-            try; rm(tmp; force = true); catch; end
-        end
-        n = max(n, length(cleared))
+    isempty(cleared) && return 0
+    for c in cleared; delete!(a, c); end
+    dir = jobs_dir(root); mkpath(dir); tmp = tempname(dir)
+    try
+        open(io -> TOML.print(io, Dict{String,Any}(k => v for (k, v) in a)), tmp, "w")
+        mv(tmp, attempts_path(root); force = true)
+    catch
+        try; rm(tmp; force = true); catch; end
     end
-    return n
+    return length(cleared)
 end
 
 # How old a claim is before its worker counts as gone (`BatchLauncher.CLAIM_STALE_S`, which this

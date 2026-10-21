@@ -299,6 +299,16 @@ end
             BS.reconcile!(root, sweep, l, specfn(root))
             @test length(l.submitted) == n          # and stays stopped
 
+            # Retry gives the units their attempts back and keeps the submissions, whose logs say why.
+            @test ("retry", "Retry 2 units") in Sweep.action_list(p)
+            nsubs = length(BS.known_submissions(root))
+            @test BS.forget_attempts!(root, chunks) == 1
+            @test BS.plan(root, sweep; launcher = l).state === :pending && length(BS.known_submissions(root)) == nsubs
+            for _ in 1:BS.MAX_ATTEMPTS
+                BS.reconcile!(root, sweep, l, specfn(root))
+                empty!(l.live)
+            end
+
             # After raising the walltime, clearing the history lets it go again.
             @test BS.clear_attempts!(root, sweep) >= 1
             p2 = BS.plan(root, sweep; launcher = l)
