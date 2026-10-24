@@ -571,7 +571,10 @@ function _render_chunks(chunks)
             n = something(tryparse(Int, String(copy(ch.data))), 0)
             n > 0 || continue
             grid > 0 && print(io, "</div>")
-            print(io, "<div class=\"disp gallery\" style=\"--gallery-cols:", _gallery_cols(n), "\">")
+            # the grid's layout inline as well as in the stylesheet, so a page holding an older stylesheet, or an
+            # export without it, still lays the figures out side by side
+            print(io, "<div class=\"disp gallery\" style=\"--gallery-cols:", _gallery_cols(n),
+                  ";display:grid;grid-template-columns:repeat(", _gallery_cols(n), ",minmax(0,1fr));gap:8px;align-items:start\">")
             grid = n
             continue
         end
