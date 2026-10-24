@@ -1036,6 +1036,9 @@ body.wrap-output .output pre { white-space:pre-wrap; word-break:break-word; }
 .slatetable .st-goto { width:3.6em; background:var(--bg3); color:var(--text); border:1px solid var(--accent);
   border-radius:5px; padding:1px 5px; font-size:.74rem; font-family:inherit; }
 .disp.img img { max-width:min(100%, var(--fig-max, 980px)); height:auto; border-radius:4px; display:block; margin-inline:auto; }
+/* a returned collection of figures: a grid, its columns set by the count (`_gallery_cols`) */
+.disp.gallery { display:grid; grid-template-columns:repeat(var(--gallery-cols, 2), minmax(0, 1fr)); gap:8px; align-items:start; }
+.disp.gallery .disp.img img { max-width:100%; }
 .disp.html table { border-collapse:collapse; } .disp.html td,.disp.html th { border:1px solid var(--border); padding:3px 8px; }
 /* DataFrames.jl HTML output (a bare `df` / `eachrow(df)[i]` return): the stock emit is a cramped
    full-grid with a bold row column and a shouting eltype header. Restyle into the notebook idiom —
