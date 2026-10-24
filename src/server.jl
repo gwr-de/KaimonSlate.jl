@@ -4959,8 +4959,9 @@ function _eval_one_run!(nb::LiveNotebook, cid::AbstractString, run::ReportEngine
             nb.version += 1
             return (true, true)
         end
+        # The wait keeps this cell's force: a locked cell asked to compute (its ▶, or `run_locked` reaching it
+        # from below) still computes once its upstream has run, rather than coming back only to restore.
         _settle!(c -> ReportEngine.mark_blocked!(c, u.blocked, u.blocked_host, u.blocked_region), nb, cid, run)
-        _take_force!(nb.id, cid)
         (true, false)
     end
     passed_on && (_ensure_runner!(nb); return :passed_on)

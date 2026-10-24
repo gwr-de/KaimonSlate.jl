@@ -501,6 +501,32 @@ end
     end
 end
 
+@testset "a forced locked cell waiting on its upstream computes once the upstream runs" begin
+    hub = NS.start_hub(; port = freeport())
+    RE_ = KaimonSlate.ReportEngine
+    try
+        nbp = tempname() * ".jl"
+        write(nbp, "#%% code id=a\nbase = 10\n#%% code id=b\nderived = base * 2\n#%% code id=c\nuse = derived + 1\n")
+        id = NS.open_notebook!(hub, nbp)
+        nb = hub.notebooks[id]
+        NS._eval!(nb; wait_all = true)
+        NS.set_cell_tags!(nb, "b", ["locked"])
+        cell(n, id) = n.report.cells[findfirst(c -> c.id == id, n.report.cells)]
+        NS.close_notebook!(hub, id)
+        nb2 = hub.notebooks[NS.open_notebook!(hub, nbp)]
+        timedwait(() -> cell(nb2, "c").state == RE_.BLOCKED, 10.0; pollint = 0.05)
+        # the upstream waits on something else (a queued node, say) when the run reaches the locked cell
+        RE_.mark_blocked!(cell(nb2, "a"), NS.WAIT_QUEUED)
+        NS.agent_run!(nb2, "c"; run_locked = true); NS._eval!(nb2; wait_all = true)
+        @test cell(nb2, "b").state == RE_.BLOCKED && "b" in get(NS._FORCE_RUN, nb2.id, Set{String}())
+        # the upstream runs: the locked cell computes, and its reader follows
+        NS._restale_blocked!(nb2); NS._eval!(nb2; wait_all = true)
+        @test (cell(nb2, "b").state, cell(nb2, "c").output.value_repr) == (RE_.FRESH, "21")
+    finally
+        NS.stop_hub(hub)
+    end
+end
+
 @testset "▶ force-run on an upstream cell does not restale a locked FRESH dependent" begin
     hub = NS.start_hub(; port = freeport())
     try
