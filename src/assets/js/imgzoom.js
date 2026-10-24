@@ -23,9 +23,10 @@
 .izframe.izdrag>img{cursor:grabbing}
 .izbtn{position:absolute;display:flex;align-items:center;justify-content:center;height:24px;min-width:24px;padding:0 6px;
   border:0;border-radius:5px;background:#000a;color:#fff;font:12px/1 system-ui,sans-serif;cursor:pointer;
-  opacity:0;transition:opacity .15s}
+  opacity:0;transition:opacity .2s}
 .izbtn:hover{background:#000d}
-.izframe:hover .izbtn,.izframe:focus-within .izbtn,.izframe.izzoomed .izbtn{opacity:1}
+/* the buttons fade in only while the pointer is over the figure (or a keyboard has focused one of them) */
+.izframe:hover .izbtn,.izbtn:focus-visible{opacity:1}
 .izexp{top:6px;right:6px}
 .izpct{bottom:6px;left:6px;cursor:default}
 .izframe:not(.izzoomed) .izpct{display:none}
