@@ -4827,7 +4827,7 @@ const _PASSED_ON = Set{Tuple{String,String}}()
 # run: a result is applied only if `run` is still that cell's run. The run is ended first, so `f` sees
 # a cell with nothing in flight and may restale it. An input that changed while the run was out
 # (`run.rerun`) leaves the cell STALE after `f`, keeping what it produced on screen until the next run
-# lands. Cells held on this one while it was stopped are let go once it has run again. Pushes the
+# lands. Cells held on this one, stopped or locked without a result, are let go once it has run. Pushes the
 # cell; returns `f`'s value, or `nothing` when the run was no longer the cell's. Takes `nb.lock`.
 function _settle!(f, nb::LiveNotebook, cid::AbstractString, run::ReportEngine.Run)
     lock(nb.lock) do
@@ -4837,7 +4837,7 @@ function _settle!(f, nb::LiveNotebook, cid::AbstractString, run::ReportEngine.Ru
         ReportEngine.end_run!(c, run) || return nothing
         v = f(c)
         run.rerun && c.state in (FRESH, ERRORED, BLOCKED) && ReportEngine.restale!(c)
-        c.state == STOPPED || _release_held_on!(nb, c.id)
+        c.state == STOPPED || _release_held_on!(nb, c.id, c.state)
         _broadcast_progress(nb, c)
         v
     end
@@ -4854,10 +4854,12 @@ function _drop_runs!(nb::LiveNotebook)
     return nothing
 end
 
-# Cells waiting on `cid` because it was stopped go back to stale, now that it has run again.
-function _release_held_on!(nb::LiveNotebook, cid::AbstractString)
+# Cells waiting on `cid` go back to stale once it has run: those held because it was stopped, and,
+# once it holds a result (computed or restored), those held because it was a locked cell without one.
+function _release_held_on!(nb::LiveNotebook, cid::AbstractString, state)
+    waits = state == BLOCKED ? (WAIT_UPSTREAM_STOPPED,) : (WAIT_UPSTREAM_STOPPED, WAIT_LOCKED)
     for c in nb.report.cells
-        (c.state == BLOCKED && c.blocked == WAIT_UPSTREAM_STOPPED && c.blocked_host == cid) || continue
+        (c.state == BLOCKED && c.blocked in waits && c.blocked_host == cid && c.id != cid) || continue
         ReportEngine.restale!(c) && _broadcast_progress(nb, c)
     end
     return nothing
