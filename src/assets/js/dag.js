@@ -787,7 +787,7 @@ async function _dagXferDashRefresh() {
 
   // Timeline — per-transfer instantaneous rate, coloured by route.
   const tc = _dagXferChart('dagxd-time');
-  if (tc) { tc.resize(); tc.setOption({ animation: false, grid: { left: 46, right: 12, top: 10, bottom: 26 },
+  if (tc) { tc.resize(); tc.setOption({ animation: false, grid: { left: 46, right: 40, top: 24, bottom: 26 },
     tooltip: Object.assign({ trigger: 'item', formatter: p => `${p.seriesName}<br><b>${(+p.data[1]).toFixed(2)} MB/s</b> · ${Math.round(-p.data[0])}s ago` }, tip),
     xAxis: { type: 'value', name: 's ago', nameTextStyle: { color: axisc }, max: 0, axisLabel: { color: axisc, formatter: v => Math.round(-v) + 's' }, splitLine: gridc },
     yAxis: { type: 'value', name: 'MB/s', nameTextStyle: { color: axisc }, axisLabel: { color: axisc }, splitLine: gridc },
@@ -810,7 +810,7 @@ async function _dagXferDashRefresh() {
   // Instantaneous-rate distribution (KDE).
   const kc = _dagXferChart('dagxd-kde');
   if (kc) { const hi = allRates.length ? Math.max(...allRates) * 1.1 : 1, dens = _dagKde(allRates, 0, hi, 64);
-    kc.resize(); kc.setOption({ animation: false, grid: { left: 40, right: 12, top: 10, bottom: 26 },
+    kc.resize(); kc.setOption({ animation: false, grid: { left: 40, right: 12, top: 10, bottom: 40 },
     tooltip: Object.assign({ trigger: 'axis', formatter: p => { const a = p && p[0]; const x = a ? (a.data ? a.data[0] : a.axisValue) : 0; return `≈ ${(+x).toFixed(2)} MB/s`; } }, tip),
     xAxis: { type: 'value', name: 'MB/s', nameLocation: 'middle', nameGap: 20, min: 0, max: +hi.toFixed(1), nameTextStyle: { color: axisc }, axisLabel: { color: axisc, formatter: v => (+v).toFixed(1) }, splitLine: { show: false } },
     yAxis: { type: 'value', axisLabel: { show: false }, splitLine: { lineStyle: { color: P.border, opacity: 0.25 } } },
