@@ -564,3 +564,8 @@ end
         @test _sep(hub_memo()) == _sep(joinpath(abspath("/tmp/b"), "cache", "memo"))  # then the HOME shortcut, NOT XDG
     end
 end
+
+@testset "transfer labels: a region's worker by its region, the hub's own as local" begin
+    @test RE._xfer_label((; target = RE.RemoteTarget("h"; region = "gpu"))) == "gpu"
+    @test RE._xfer_label((; target = RE.LocalTarget())) == "local"
+end

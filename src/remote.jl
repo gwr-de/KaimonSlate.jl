@@ -4194,6 +4194,8 @@ end
 const _XFER_VIEWS = Dict{Int,XferView}()
 const _XFER_VIEW_LOCK = ReentrantLock()
 const _XFER_VIEW_SEQ  = Threads.Atomic{Int}(0)
+# A kernel as the transfers view and dashboard name it: its region, or "local" for the hub's own worker
+_xfer_label(k) = k.target isa RemoteTarget ? String(k.target.region) : "local"
 _xfer_view_prune!() = lock(_XFER_VIEW_LOCK) do
     for (k, v) in collect(_XFER_VIEWS)
         (v.finished > 0 && time() - v.finished > 60) && delete!(_XFER_VIEWS, k)
@@ -5025,7 +5027,6 @@ function transfer_binding!(src_k, dst_k, name::AbstractString; zc::Bool = false,
 
     moved = 0
     used = :relay
-    fellback = false                                        # a peer attempt was tried and failed → we're rescuing via relay
     if mode === :direct || mode === :auto
         route = _resolve_peer_route(src_k, dst_k)           # probe B→A: :direct / :ssh (bridge) / :relay
         phase("route")
@@ -5042,7 +5043,6 @@ function transfer_binding!(src_k, dst_k, name::AbstractString; zc::Bool = false,
                 mode === :direct && rethrow()               # strict: surface the failure
                 # Real-time DOWNGRADE: the cached path broke (topology likely changed under us) — forget this
                 # pair's verdict so the next transfer re-probes, and relay right now.
-                fellback = true
                 _peer_route_forget_pair!(String(src_k.target.ssh_host), String(dst_k.target.ssh_host))
                 _rlog("region transfer '$name': $(route.kind) failed, forgetting route + falling back to relay — " *
                       first(sprint(showerror, e), 160))
@@ -5054,25 +5054,46 @@ function transfer_binding!(src_k, dst_k, name::AbstractString; zc::Bool = false,
     end
 
     if used === :relay                                      # neither direct nor ssh took it
-        relay_t0 = time()
-        root = joinpath(_slate_cache_dir(), "memo")
-        if src_k.target isa RemoteTarget                   # remote source → land the blob locally
-            ep = _data_endpoint!(src_k.target, src_k)
-            moved += pull_blob!(ep.ip, ep.port, h; server_key = ep.server_key, on_progress = on_progress)
-        end
-        if dst_k.target isa RemoteTarget                   # remote destination → ship it there
-            ep = _data_endpoint!(dst_k.target, dst_k)
-            moved += push_blob!(ep.ip, ep.port, h; server_key = ep.server_key,
-                                on_plan = nothing, meta = meta, on_progress = on_progress)
-        end
-        # When this relay RESCUED a failed peer attempt, post a ✓ relay row: otherwise the only trace left in
-        # the transfers view is the ❌ direct/ssh try, which reads as a dead transfer though the value arrived.
-        # (A pure-relay move — never a peer attempt — stays unlisted, as before: it's the hub-mediated floor.)
-        if fellback && (src_k.target isa RemoteTarget || dst_k.target isa RemoteTarget)
+        wire = src_k.target isa RemoteTarget || dst_k.target isa RemoteTarget
+        # A move that crosses a wire is listed in the transfers view and kept as a dashboard trace like a
+        # peer pull, region↔local included: its progress over both legs (pull to the hub, push on) as one series.
+        vid = Threads.atomic_add!(_XFER_VIEW_SEQ, 1)
+        relay_t0 = time(); trT = Float64[]; trB = Int[]; legs = 0; err = ""
+        src_l, dst_l = _xfer_label(src_k), _xfer_label(dst_k)
+        if wire
+            _xfer_view_prune!()
             lock(_XFER_VIEW_LOCK) do
-                vid = Threads.atomic_add!(_XFER_VIEW_SEQ, 1)
-                _XFER_VIEWS[vid] = XferView(String(dst_k.target.region), String(src_k.target.region),
-                                            String(name), "relay", moved, moved, relay_t0, time(), "")
+                _XFER_VIEWS[vid] = XferView(dst_l, src_l, String(name), "relay", 0, Int(meta.bytes), relay_t0, 0.0, "")
+            end
+        end
+        upd(f) = lock(_XFER_VIEW_LOCK) do; v = get(_XFER_VIEWS, vid, nothing); v === nothing || f(v); end
+        prog = (off, total) -> begin
+            push!(trT, time()); push!(trB, legs + off)
+            upd(v -> (v.done = legs + off))
+            on_progress === nothing || on_progress(off, total)
+        end
+        try
+            if src_k.target isa RemoteTarget               # remote source → land the blob locally
+                ep = _data_endpoint!(src_k.target, src_k)
+                moved += pull_blob!(ep.ip, ep.port, h; server_key = ep.server_key, on_progress = prog)
+                legs = moved
+            end
+            if dst_k.target isa RemoteTarget               # remote destination → ship it there
+                ep = _data_endpoint!(dst_k.target, dst_k)
+                moved += push_blob!(ep.ip, ep.port, h; server_key = ep.server_key,
+                                    on_plan = nothing, meta = meta, on_progress = prog)
+            end
+        catch e
+            err = first(sprint(showerror, e), 200)
+            rethrow()
+        finally
+            if wire && (moved > 0 || !isempty(err))
+                upd(v -> (v.done = moved; v.finished = time(); v.err = err))
+                pushfirst!(trT, relay_t0); pushfirst!(trB, 0)
+                _xfer_trace_push!((; src = src_l, dst = dst_l, name = String(name), via = "relay"),
+                                  relay_t0, moved, trT, trB, err)
+            else                                            # deduplicated: nothing crossed, nothing to list
+                lock(_XFER_VIEW_LOCK) do; delete!(_XFER_VIEWS, vid); end
             end
         end
     end
