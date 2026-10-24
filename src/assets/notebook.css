@@ -726,6 +726,8 @@ body.app .appfail .appfailjump:hover { color:var(--text); border-color:var(--acc
 .cregion.unwell .cregst, .cregion.degraded .cregst { opacity:.9; }
 .cregion.unwell .cregst::before, .cregion.degraded .cregst::before { content:'· '; opacity:.55; }
 .cregion.blocked .cregst, .cregion.blocked .blockwait { pointer-events:none; }
+.cregion.blocked .cregst .cregjump { pointer-events:auto; cursor:pointer; text-decoration:underline dotted; text-underline-offset:2px; }
+.cregion.blocked .cregst .cregjump:hover { text-decoration-style:solid; }
 .cregion.blocked .cregst { opacity:.9; }
 .cregion.blocked .cregst::before { content:'· '; opacity:.55; }
 .cregion.blocked .blockwait { opacity:.7; font-variant-numeric:tabular-nums; }

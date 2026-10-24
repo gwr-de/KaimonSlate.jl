@@ -378,20 +378,22 @@ function blockedText(c) {
 function cellRegionChip(c) {
   const set = _cellRegionSet();
   const blocked = !!(c && c.state === 'blocked' && c.blocked);
-  // A locked cell with nothing to restore, or a cell reading one: not a wait on a machine, so no
-  // place and no clock, just which cell's ▶ ends it.
-  if (blocked && c.blocked === 'locked') {
-    const own = !c.blockedHost || c.blockedHost === c.id;
-    const tip = own ? 'Locked, with no stored result to restore. Its own ▶ computes it.'
+  // A locked cell with nothing to restore, or a cell reading one or one that was stopped: not a wait on
+  // a machine, so no clock, but still WHERE it runs, and the cell it waits on as a link to that cell.
+  if (blocked && (c.blocked === 'locked' || c.blocked === 'upstream_stopped')) {
+    const own = c.blocked === 'locked' && (!c.blockedHost || c.blockedHost === c.id);
+    const tip = c.blocked === 'upstream_stopped' ? 'Reads ' + c.blockedHost + ', which was stopped. Running it again runs this one.'
+              : own ? 'Locked, with no stored result to restore. Its own ▶ computes it.'
                     : 'Reads ' + c.blockedHost + ', a locked cell not computed yet. Its ▶ computes it.';
-    return `<span class="cregion blocked" data-bkey="${_esc(_blockedKey(c))}" title="${_esc(tip)}">🔒` +
-      ` <span class="cregst">${own ? '▶ to compute' : 'waits on ' + _esc(c.blockedHost)}</span></span>`;
-  }
-  // A cell reading one that was stopped: it waits for that cell to run again, not on a machine.
-  if (blocked && c.blocked === 'upstream_stopped') {
-    const tip = 'Reads ' + c.blockedHost + ', which was stopped. Running it again runs this one.';
-    return `<span class="cregion blocked" data-bkey="${_esc(_blockedKey(c))}" title="${_esc(tip)}">■` +
-      ` <span class="cregst">waits on ${_esc(c.blockedHost)}</span></span>`;
+    const loc = _cellRunLoc(c);
+    const place = loc ? `${loc.local ? '💻' : _regIcon(loc.name)} ${_esc(loc.name || 'local')} ` : '';
+    const wait = own ? '▶ to compute'
+      : `waits on <a class="cregjump" title="go to ${_esc(c.blockedHost)}"` +
+        ` onmousedown="event.stopPropagation(); window.selectCell && window.selectCell('${_esc(c.blockedHost)}', true)">` +
+        `${_esc(c.blockedHost)}</a>`;
+    return `<span class="cregion blocked" data-bkey="${_esc(_blockedKey(c))}" data-reg="${_esc((loc && loc.name) || '')}"` +
+      ` title="${_esc(tip)}" onmousedown="window.openRegionPanel('${c.id}', event)">` +
+      `${c.blocked === 'locked' ? '🔒' : '■'} ${place}<span class="cregst">${wait}</span></span>`;
   }
   if (!blocked && set.size < 2 && set.has('local')) return '';
   const loc = _cellRunLoc(c);
