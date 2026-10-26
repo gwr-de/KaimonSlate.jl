@@ -710,3 +710,24 @@ end
         end
     end
 end
+
+# A save replaces the notebook file whole. A reader that came between a plain `write`'s truncation and
+# its end parsed an empty or cut-short notebook, took it for an outside edit, and emptied the live one.
+@testset "a save never shows a reader a partial notebook" begin
+    RE = KaimonSlate.ReportEngine
+    dir = mktempdir()
+    real = joinpath(dir, "real.jl"); write(real, "#%% code id=a\na = 1\n")
+    chmod(real, 0o640)
+    link = joinpath(dir, "nb.jl"); symlink(real, link)
+    nb = NS.LiveNotebook("savewhole", link, RE.parse_report("#%% code id=a\na = 1\n#%% code id=b\nb = 2\n"),
+        RE.InProcessKernel(), 1, String[], String[], ReentrantLock(), Channel{String}[],
+        ReentrantLock(), "", false, Dict{String,String}())
+    before = stat(real).inode
+    NS._persist!(nb; source = "agent")
+    # A new file moved into place, not the old one rewritten: a reader never sees it emptied.
+    @test stat(real).inode != before
+    @test [c.id for c in RE.parse_report(read(link, String)).cells] == ["a", "b"]
+    @test islink(link) && filemode(real) & 0o777 == 0o640
+    @test readdir(dir) == ["nb.jl", "real.jl"]                       # nothing left beside it
+    @test !NS.sync_from_file!(nb)                                     # its own write is not an edit
+end

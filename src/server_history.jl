@@ -125,6 +125,25 @@ end
 _is_server_write(report_id, h::UInt64) =
     lock(_SWRITES_LOCK) do; h in get(_SERVER_WRITES, String(report_id), UInt64[]); end
 
+# Write a notebook's text to `path` whole: into a file beside it, then moved over it, so a reader (the
+# watcher, a `/state` poll, both of which `sync_from_file!`) sees the old text or the new one. A read
+# between a plain `write`'s truncation and its last byte parses as a notebook with fewer cells, or
+# none, matches no recorded server write, and replaces the live notebook. A symlink is written
+# through, since a rename would replace the link, and the file keeps its mode.
+function _write_notebook(path::AbstractString, s::AbstractString)
+    target = ispath(path) ? realpath(path) : String(path)
+    tmp = joinpath(dirname(target), "." * basename(target) * ".saving-" * string(rand(UInt64); base = 36))
+    try
+        write(tmp, s)
+        ispath(target) && chmod(tmp, filemode(target) & 0o7777)
+        mv(tmp, target; force = true)
+    catch
+        rm(tmp; force = true)
+        rethrow()
+    end
+    return nothing
+end
+
 # Persist the notebook to its `.jl` AND record a durable checkpoint. The single
 # write+capture chokepoint for in-app mutations (replaces bare `write(...)`).
 function _persist!(nb::LiveNotebook; source::AbstractString = "browser", label::AbstractString = "")
@@ -150,7 +169,7 @@ function _persist!(nb::LiveNotebook; source::AbstractString = "browser", label::
         @warn "KaimonSlate: could not preserve bundle footer on save" exception = (e, catch_backtrace())
     end
     _note_server_write!(nb.report.id, canon)     # register BEFORE writing: a watcher tick fired by
-    write(nb.path, s)                             # this write must recognize it as OURS, not external
+    _write_notebook(nb.path, s)                   # this write must recognize it as OURS, not external
     nb.version += 1                               # every in-app commit advances the version (CAS basis)
     _history!(nb; source = source, label = label)
     return nb
