@@ -422,7 +422,7 @@ TextArea(default::AbstractString = ""; rows::Int = 3, label = nothing) =
 # The page sends back only the TEXT of an option value. That text names the value only when the
 # widget is PLAIN: every value is a string, symbol, Bool, char, date or finite number, and no two
 # values have the same text. Any other option list makes a KEYED widget. Option `i` then holds the
-# key `"#opt:" * string(hash(v); base = 62)` in place of its value, and `values` holds the values
+# key `"#opt:i"` in place of its value, and `values` holds the values
 # (`nothing` for a plain widget). `wrap` gives the cell the value of a key. The values stay in the
 # worker (`_wire_params`), because the hub cannot read a type that the notebook defines.
 function _norm_options(options)
@@ -437,11 +437,10 @@ function _norm_options(options)
         push!(vals, specs[end]["value"])
     end
     all(_plain_option, vals) && allunique(map(_browser_text, vals)) && return specs, labeled, nothing
-    seen = Set{String}()
-    for s in specs
-        k = "#opt:" * string(hash(s["value"]); base = 62)
-        while k in seen; k *= "'"; end             # an equal value, or a hash collision
-        push!(seen, k); s["value"] = k
+    # A key names the option's position, which a new worker gives the same option: a key made from
+    # the value would change with it for a struct or a function the notebook defines.
+    for (i, s) in enumerate(specs)
+        s["value"] = "#opt:$i"
     end
     return specs, labeled, vals
 end
@@ -902,11 +901,11 @@ function _coerce_option(w::Widget, v)
     return haskey(w.params, "values") && v isa AbstractString && startswith(v, "#opt:") ? w.default : v
 end
 # The registry value in the new widget `nw` for the old registry value `ov` of `ow`, else `nothing`
-# when the new list does not have the option. A key that is still in the list keeps its option.
-# Else the old option value finds its place in the new list, also between a plain and a keyed widget.
+# when the new list does not have the option. The old option value finds its place in the new list,
+# also between a plain and a keyed widget. Never by the key: a key is a position, and the option at
+# that position may now be another one.
 function _carry_option(ow::Widget, ov, nw::Widget)
     keep = _opt_values(get(nw.params, "options", ()))
-    ov in keep && return ov
     k = _key_of(nw.params, _unkey(ow, ov))
     return k in keep ? k : nothing
 end

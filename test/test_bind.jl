@@ -193,6 +193,11 @@ end
         m2 = RE.MultiSelect([(5, 6) => "C", (1, 2) => "A"])
         sel = RE.wrap_value(m2, RE.reconcile_bind(m, [key(1), key(2)], m2))
         @test collect(keys(sel)) == [(1, 2)] && sel[(1, 2)] == "A" && RE.indices(sel) == [2]
+        # A key is the option's position, so a new worker building the same list gives the same keys.
+        @test [o["value"] for o in m.params["options"]] == ["#opt:1", "#opt:2", "#opt:3"]
+        # A pick follows its value when the options move, not the position it had.
+        s0 = RE.Select([(1, 2), (3, 4)]); s1 = RE.Select([(3, 4), (1, 2)])
+        @test RE.wrap_value(s1, RE.reconcile_bind(s0, RE.coerce_bind(s0, (3, 4)), s1)) == (3, 4)
     end
 
     # The bind record that leaves the worker has the keys and the labels, and no option values: the

@@ -139,13 +139,13 @@ cell always reads the option value.
 
 The page sends back only the text of an option. When every option value is a string, symbol, `Bool`,
 character, date or finite number, and no two options have the same text, the page gets the option
-values as they are. Any other option list gives each option a key such as `"#opt:Ebgc8oA1gwU"`, made
-from the hash of the option value, and the option values stay in the worker.
+values as they are. Any other option list gives each option a key, `"#opt:1"`, `"#opt:2"` and so on
+by its position, and the option values stay in the worker.
 
 Outside the cell, such a control holds the key: `window.slateBindValue`, the `set_bind` agent tool and
 the hub report it. `set_bind` from a cell, an agent or an extension accepts an option value or its
-key, and a JSON array names a tuple option. A struct or a function that the notebook defines gets
-another key in a new worker, so after a worker restart its control goes back to the default.
+key, and a JSON array names a tuple option. A key names a position, so a pick survives a worker
+restart. When the options change while the notebook runs, the pick follows its option value.
 
 ### Labelled options
 
