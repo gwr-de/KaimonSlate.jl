@@ -1330,6 +1330,7 @@ function updateChrome(state) {
     hb.style.display = 'none'; document.body.classList.remove('hyd-preview'); window.clearPrepare && window.clearPrepare();
   }
   updateStaleBadge(state);
+  window.checkSrcBanner && window.checkSrcBanner(state);   // the source-reload banner closes once its cells ran
   // Agent chat needs Kaimon's agent service — a standalone hub (slate --own / serve_notebook)
   // doesn't have it. Disable the button up front instead of letting the first turn error out.
   const ab = document.getElementById('agentbtn');

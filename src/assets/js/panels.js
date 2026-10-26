@@ -272,7 +272,28 @@ async function histReplay() {
 // Persistent, top-left. The change detector is best-effort (~file-granular), so rather than
 // silently trust it we keep this up until the user acts: run our guess (the stale cells), or
 // re-run the whole notebook (safe). Parse errors show a red, button-less variant.
-function hideSrcBanner() { const b = document.getElementById('srcbanner'); b.style.display = 'none'; b.innerHTML = ''; }
+function hideSrcBanner() { const b = document.getElementById('srcbanner'); b.style.display = 'none'; b.innerHTML = ''; _srcWatch = null; }
+// The banner asks for a run, so a run answers it, whoever makes it: once the cells it marked stale
+// have all run (an agent running them, ⇧⏎ on each), it closes. With no cells named, it closes after
+// the first run that starts while it is up. `ids` is the stale set when it appeared.
+let _srcWatch = null;   // { ids: Set, began: bool } while the reload banner is up
+function _watchSrcBanner(n) {
+  const cells = (typeof nbState !== 'undefined' && nbState && nbState.cells) || [];
+  const ids = n > 0 ? cells.filter(c => c.state === 'stale' || c.state === 'edited').map(c => c.id) : [];
+  _srcWatch = { ids: new Set(ids), began: false };
+}
+window.checkSrcBanner = function (state) {
+  const w = _srcWatch;
+  if (!w) return;
+  const running = typeof window._runActive === 'function' && window._runActive();
+  if (w.ids.size) {
+    const pending = ((state && state.cells) || []).some(c => w.ids.has(c.id) && (c.state === 'stale' || c.state === 'edited'));
+    if (!pending && !running) hideSrcBanner();
+  } else {
+    if (running) w.began = true;
+    else if (w.began) hideSrcBanner();
+  }
+};
 function showSrcReload(n) {
   const b = document.getElementById('srcbanner'); b.className = 'srcbanner';
   // n>0: we mapped the edit to cells (Run affected, or Re-run all to be safe). n===0: a source def
@@ -542,6 +563,7 @@ function connectLive() {
       const n = parseInt(e.data.slice(10), 10) || 0;
       updateStates(await api('GET', '/api/state'));   // reflect our guessed stale marks
       showSrcReload(n);
+      _watchSrcBanner(n);
       return;
     }
     if (e.data.startsWith('srcerror:')) {    // a /src save didn't parse — Revise couldn't apply it
