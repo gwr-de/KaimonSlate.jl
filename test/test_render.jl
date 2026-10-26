@@ -40,10 +40,10 @@ include(joinpath(HERE, "..", "src", "render.jl")); using .ReportRender
         disp = r.cells[1].output.display
         @test disp[1].mime == "application/vnd.kaimonslate.gallery" && String(copy(disp[1].data)) == "3"
         @test [c.data[end] for c in disp if c.mime == "image/png"] == UInt8[1, 2, 3]
-        html = ReportRender._render_chunks(disp)
-        @test occursin("disp gallery", html) && occursin("--gallery-cols:3", html) && count("disp img", html) == 3
+        ghtml = ReportRender._render_chunks(disp)
+        @test occursin("disp gallery", ghtml) && occursin("--gallery-cols:3", ghtml) && count("disp img", ghtml) == 3
         # the grid closes after its images
-        @test endswith(html, "</div></div>")
+        @test endswith(ghtml, "</div></div>")
         # a collection with anything but figures is not a gallery
         @test !any(c -> c.mime == "application/vnd.kaimonslate.gallery", r.cells[2].output.display)
     end
