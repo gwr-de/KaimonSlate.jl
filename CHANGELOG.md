@@ -12,38 +12,57 @@ were written when they went out. They are marked.
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-10-26
+
+### Added
+
+- Image outputs zoom and pan. A click makes a figure active, as with a chart; the wheel then zooms
+  around the cursor at the strength of the "Chart scroll-zoom" setting, a drag pans, and a
+  double-click switches between the fitted figure and a close look. The ⤢ button opens the figure in
+  a full-window view with its own zoom controls, which the scratch panel's thumbnails open too.
+  Static HTML exports carry the same zoom.
+- A cell that returns a vector or tuple of figures shows them in a grid of two to four columns, by
+  how many there are. Snapshots and exports keep each figure as before.
+
 ### Changed
 
-- An option widget gives each option a key (`"#opt:…"`) unless every option value is a string,
-  symbol, `Bool`, character, date or finite number, with no two of the same text. The option values
-  of such a widget stay in the worker. `window.slateBindValue`, `slate_bind_value`, the `set_bind`
-  agent tool and the hub report the key. `set_bind` accepts the key or the option value, and a JSON
-  array names a tuple option.
+- An option widget whose option values are not all plain (a string, symbol, `Bool`, character, date
+  or finite number, with no two of the same text) gives each option a key by its position,
+  `"#opt:1"`, `"#opt:2"` and so on, and keeps the option values in the worker. A pick survives a
+  worker restart. `window.slateBindValue`, `slate_bind_value`, the `set_bind` agent tool and the hub
+  report the key; `set_bind` accepts the key or the option value, and a JSON array names a tuple
+  option. (#71, @disberd)
 - The value mirror, the controls palette and the PDF parameter strip show the label of a key. The
-  palette escapes the value text.
+  palette escapes the value text. (#71, @disberd)
 
 ### Fixed
 
-- A cell with `@replay` marks no longer compiles Slate's replay code again each time it runs. Each
-  mark cost about 120 ms on every run, so a slider move on a figure with 8 marks took 660–860 ms.
-  It now takes about 58 ms.
-- A cell with `@replay` marks no longer compiles each marked expression again when it runs. The
-  live run now evaluates the expression in place and does not call the closure that the export
-  sweeps. In a figure with 8 marks, this removes about 23 ms of compiling from each slider move.
+- A cell with `@replay` marks no longer compiles Slate's replay code or its marked expressions again
+  on each run, so moving a control costs about what the cell's own work does. (#70, @disberd)
 - A cell that runs again with fewer `@replay` marks no longer leaves the old marks registered. The
-  export swept them and shipped their data, although no output on the page read it.
+  export swept them and shipped their data, although no output on the page read it. (#66, @disberd)
 - A cell that uses `bind_observable(:name)` offers that control in its header control picker. The
-  cell still does not run again when the control changes.
+  cell still does not run again when the control changes. (#68, @disberd)
 - `window.slateSetBind` coalesces calls per control again. A second definition replaced the
   coalescing one, so each call sent its own request, and a fast drag built a backlog that moved the
-  figure after the reader let go.
+  figure after the reader let go. (#69, @disberd)
 - `Select`, `Radio`, `MultiSelect` and `MultiCheckBox` bind the picked option value when it is a
   tuple, a vector, a `NamedTuple`, a `Dict`, `nothing`, a function or a struct of the notebook. Such
   a pick reached the cell as text (`"dog,2"`), and a multiple choice lost its picks. A struct or a
   function option made the `@bind` cell fail on a gate worker, and froze every `@replay` control of
-  the export.
+  the export. (#71, @disberd)
 - Two options with the same text in the page, such as `Any[1, "1"]`, or with one value and two
-  labels, bind the picked option.
+  labels, bind the picked option. (#71, @disberd)
+- A page that closes leaves the hub's list of page connections. Each closed page stayed registered,
+  and later updates to its notebook kept queueing for it. (#73, @haakon-e)
+- `serve_notebook` prints its ready banner to the terminal it started from. A cell still running at
+  that moment captured the banner, or ended the server when it closed its output during the write.
+  (#75, @haakon-e)
+- A page that loads while a cell runs shows that cell's progress bars and elapsed time.
+- A chart drawn by the SVG renderer keeps its font. The font stack is quoted with single quotes,
+  which survive the double-quoted style attribute the renderer writes.
+- Precompile output printed while a worker loads a package goes through the worker's own output
+  methods, which package loading could not see before.
 
 ## [1.11.1] - 2026-10-08
 
