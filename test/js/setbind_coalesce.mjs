@@ -1,6 +1,6 @@
 // `slateSetBind` (core.js) sends a control's value to the server. While one POST is in flight it
-// holds only the last value of a burst, so a fast drag does not build a backlog. When the held
-// value and the new value are both plain objects, the new keys merge into the held object.
+// holds only the last value of a burst, so a fast drag does not build a backlog. A held value is
+// replaced, objects included, as the server replaces a control's value.
 //
 // The real function is extracted and evaluated, with stand-ins for `api`, `_bindOwner` and the
 // ack handler.
@@ -56,7 +56,7 @@ const finish = async (ack) => { const p = posts.shift(); p.res(ack); await flush
   eq(posts.length, 0, 'nothing more after the burst');
 }
 
-// ── plain objects merge while held ────────────────────────────────────────────────────────────────
+// ── a held object is replaced, as an idle call's object is sent as it is ─────────────────────────
 {
   posts = [];
   setBind('o', { a: 0 });
@@ -64,7 +64,7 @@ const finish = async (ack) => { const p = posts.shift(); p.res(ack); await flush
   setBind('o', { b: 2 });
   setBind('o', { c: 3 });
   await finish({});
-  eq(posts.map(p => p.body.value), [{ a: 1, b: 2, c: 3 }], 'held objects merge, newer keys win');
+  eq(posts.map(p => p.body.value), [{ c: 3 }], 'the last object wins');
   await finish({});
 }
 
@@ -75,7 +75,7 @@ const finish = async (ack) => { const p = posts.shift(); p.res(ack); await flush
   setBind('r', [1, 2]);
   setBind('r', [3, 4]);
   await finish({});
-  eq(posts.map(p => p.body.value), [[3, 4]], 'arrays replace, not merge');
+  eq(posts.map(p => p.body.value), [[3, 4]], 'the last array wins');
   await finish({});
 
   setBind('r', 'busy');
