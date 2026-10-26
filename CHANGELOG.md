@@ -14,6 +14,14 @@ were written when they went out. They are marked.
 
 ### Fixed
 
+- A cell with `@replay` marks no longer compiles Slate's replay code again each time it runs. Each
+  mark cost about 120 ms on every run, so a slider move on a figure with 8 marks took 660–860 ms.
+  It now takes about 58 ms.
+- A cell with `@replay` marks no longer compiles each marked expression again when it runs. The
+  live run now evaluates the expression in place and does not call the closure that the export
+  sweeps. In a figure with 8 marks, this removes about 23 ms of compiling from each slider move.
+- A cell that runs again with fewer `@replay` marks no longer leaves the old marks registered. The
+  export swept them and shipped their data, although no output on the page read it.
 - A cell that uses `bind_observable(:name)` offers that control in its header control picker. The
   cell still does not run again when the control changes.
 

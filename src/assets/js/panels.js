@@ -519,9 +519,9 @@ function connectLive() {
     if (e.data.startsWith('refresh:')) { try { patchCells(JSON.parse(e.data.slice(8)).cells); } catch (_) {} return; }   // targeted: only the changed cells, inline
     if (e.data.startsWith('runbatch:')) { const _rb = e.data.slice(9).split(':'); window.onRunBatch && window.onRunBatch(parseInt(_rb[0], 10) || 0, _rb[1] === '1'); return; }   // N cells about to run (+ whether it STARTS a run) → stable k/N
     if (e.data.startsWith('cellpre:')) { try { const r = JSON.parse(e.data.slice(8)); window.onCellPre && window.onCellPre(r.index, r.cell); } catch (_) {} return; }   // agent add/edit: show the (stale) cell BEFORE its eval finishes
-    if (e.data.startsWith('cellrun:')) { window.onCellRun && window.onCellRun(e.data.slice(8)); return; }   // a cell started running (live status)
+    if (e.data.startsWith('cellrun:')) { try { const r = JSON.parse(e.data.slice(8)); window.onCellRun && window.onCellRun(r); } catch (_) {} return; }   // {id,rev} — a cell started running (live status)
     if (e.data.startsWith('celldone:')) { try { const c = JSON.parse(e.data.slice(9)); patchCells([c]); window.onCellDone && window.onCellDone(c); } catch (_) {} return; }   // a cell finished — patch + status
-    if (e.data.startsWith('cellprog:')) { try { const p = JSON.parse(e.data.slice(9)); window.onCellProgress && window.onCellProgress(p); } catch (_) {} return; }   // {frac,msg,id,done} — one bar per id
+    if (e.data.startsWith('cellprog:')) { try { const p = JSON.parse(e.data.slice(9)); window.onCellProgress && window.onCellProgress(p); } catch (_) {} return; }   // {cid,frac,msg,id,done} — one bar per (cell, id)
     if (e.data.startsWith('cellout:')) { try { const p = JSON.parse(e.data.slice(8)); window.onCellOutput && window.onCellOutput(p); } catch (_) {} return; }   // {cid,out,err} — a RUNNING cell's output so far (cooked text)
     if (e.data.startsWith('cellstream:')) { try { const p = JSON.parse(e.data.slice(11)); window.onCellStream && window.onCellStream(p.channel, p.data); } catch (_) {} return; }   // slate_emit(channel,data) → a cell's custom JS renderer
     if (e.data.startsWith('inspect:')) { try { const r = JSON.parse(e.data.slice(8)); window._slateInspect && window._slateInspect(r.reqid, r.cell); } catch (_) {} return; }   // slate.inspect: capture this cell for the agent
@@ -631,25 +631,13 @@ function _scUpdateChrome() {
   const btn = document.getElementById('scratchbtn');
   if (btn) btn.dataset.count = _scUnread ? String(_scUnread) : '';   // NEW since last viewed, not the total
 }
-// Scratch output images render as thumbnails; click → a full-size lightbox (Esc / click to close).
-function _scZoom(src) {
-  let m = document.getElementById('scratchimgmodal');
-  if (!m) {
-    m = document.createElement('div'); m.id = 'scratchimgmodal'; m.className = 'scimgmodal';
-    m.innerHTML = '<img alt="scratch output"/>';
-    m.addEventListener('click', () => m.classList.remove('show'));
-    document.addEventListener('keydown', e => { if (e.key === 'Escape' && m.classList.contains('show')) m.classList.remove('show'); });
-    document.body.appendChild(m);
-  }
-  m.querySelector('img').src = src;
-  m.classList.add('show');
-}
+// Scratch output images render as thumbnails; click → the full-window image view (imgzoom.js).
 function _scWireImages(b) {
   b.querySelectorAll('.scout img').forEach(img => {
     if (img._scwired) return; img._scwired = true;
     img.classList.add('scthumb');
     img.title = 'click to enlarge';
-    img.addEventListener('click', () => _scZoom(img.currentSrc || img.src));
+    img.addEventListener('click', () => window.slateImageView(img.currentSrc || img.src, 'scratch output'));
   });
 }
 window.onScratchCell = function (cell) {
