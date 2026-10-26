@@ -142,7 +142,7 @@ holds a connection to it for that alone while it has a session to the host.
 
 ![The Remote activity strip: workers grouped by region (db · db-box, gpu · gpu-box), each row with a CPU meter, RSS, and status — one attached and running ▶ train, one warm and ✓ ready · CUDA](./assets/remote-activity.png)
 
-![A worker-detail popup opened from the strip: the worker's host, region, notebook, transport, ports and stat chips (CPU, RSS, memo store, host CPU/load/memory), plus CPU% and RSS history sparklines](./assets/worker-detail.png)
+![The telemetry view opened from a row of the strip: the worker's host, region, notebook, state, transport and ports, its restart and reap actions, and charts of its CPU and memory over time](./assets/worker-detail.png)
 
 **Inside the notebook:**
 
