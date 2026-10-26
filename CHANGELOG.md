@@ -20,6 +20,8 @@ were written when they went out. They are marked.
 - A cell with `@replay` marks no longer compiles each marked expression again when it runs. The
   live run now evaluates the expression in place and does not call the closure that the export
   sweeps. In a figure with 8 marks, this removes about 23 ms of compiling from each slider move.
+- A cell that runs again with fewer `@replay` marks no longer leaves the old marks registered. The
+  export swept them and shipped their data, although no output on the page read it.
 
 ## [1.11.1] - 2026-10-08
 
