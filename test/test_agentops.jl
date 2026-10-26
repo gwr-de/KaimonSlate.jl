@@ -861,7 +861,8 @@ end
                        "sweep_tile_panel.mjs", "agent_toolrow.mjs",
                        "specialist_ask_routing.mjs", "echarts_dark_labels.mjs",
                        "teardown_output.mjs", "carry_mounted.mjs", "duration_fmt.mjs",
-                       "swap_hold.mjs", "pkg_log_tail.mjs", "run_resume.mjs")
+                       "swap_hold.mjs", "pkg_log_tail.mjs", "run_resume.mjs",
+                       "setbind_coalesce.mjs")
             io = IOBuffer()
             ok = success(pipeline(`$node $(joinpath(@__DIR__, "js", script))`; stdout = io, stderr = io))
             ok || print(String(take!(io)))

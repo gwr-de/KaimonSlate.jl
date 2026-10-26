@@ -14,15 +14,28 @@ const _showVal = v => Array.isArray(v) ? v.join(', ') : v;
 const _valKey = v => Array.isArray(v) ? JSON.stringify([...v].map(String).sort()) : String(v);
 // Normalize a widget option: a bare value becomes {value, label:String(value)}; an object passes through.
 const _normOpt = o => (o && typeof o === 'object') ? o : { value: o, label: String(o) };
+// A keyed option widget (`_norm_options` in widgets.jl) holds `#opt:` keys in place of option values
+// that the page cannot send back as text. The page shows the label of each key.
+const _isKey = x => typeof x === 'string' && x.startsWith('#opt:');
+const _hasKey = v => _isKey(v) || (Array.isArray(v) && v.some(_isKey));
+// The labels of a value that holds keys (joined with ", " for a list); any other value is unchanged.
+function _keyText(p, v) {
+  if (!_hasKey(v)) return v;
+  const opts = (p && p.options) || [];
+  const lab = x => { const o = opts.find(o => o && o.value === x); return o ? o.label : String(x); };
+  return Array.isArray(v) ? v.map(lab).join(', ') : lab(v);
+}
 // The text shown in a widget's value mirror (`.wval`). A toggle with on/off labels shows the
-// active state's word; a button shows its click count; everything else shows the raw value. Reads
-// the on/off text from the input's data- attributes so the local + server-sync paths agree.
-function _ctrlValLabel(el, v) {
+// active state's word; a button shows its click count; a key shows its option label; everything
+// else shows the raw value. Reads the on/off text from the input's data- attributes so the local +
+// server-sync paths agree. `p` is the widget's params, when the caller has them.
+function _ctrlValLabel(el, v, p) {
   const w = el.dataset.widget;
   if (w === 'button') return '×' + v;
   if (w === 'toggle' && (el.dataset.on != null || el.dataset.off != null))
     return v ? (el.dataset.on != null ? el.dataset.on : 'on') : (el.dataset.off != null ? el.dataset.off : 'off');
-  return _showVal(v);
+  if (!p && _hasKey(v)) p = (_bindSpec(el.dataset.bind, el.dataset.name) || {}).params;
+  return _showVal(_keyText(p, v));
 }
 
 // ── Custom widget registry (extension point) ─────────────────────────────────
@@ -176,7 +189,7 @@ function controlMarkup(bindId, b) {
   // stringified VALUE in each option's `value` attr; the LABEL is what's shown (rich for radio).
   const opts = (p.options || []).map(o => _normOpt(o));
   const _selV = String(b.value);
-  let ctrl = '', wval = `<span class="wval">${_esc(_showVal(b.value))}</span>`;
+  let ctrl = '', wval = `<span class="wval">${_esc(_showVal(_keyText(p, b.value)))}</span>`;
   if (w === 'slider')
     ctrl = `<input type="range" min="${p.min}" max="${p.max}" step="${p.step}" value="${b.value}" ${a}/>`;
   else if (w === 'number')
@@ -1227,18 +1240,6 @@ function _pickToData(frac, lim, scale) {
 const _pickOwner = name => ((nbState && nbState.cells) || [])
   .find(c => (c.binds || []).some(b => b.name === name));
 
-// `slateSetBind(name, value)` — drive one of the notebook's own controls from front-end JS, by the
-// bound VARIABLE name. The JS counterpart of `set_bind(:name, v)` in cell code, and the same path a
-// dragged slider takes (coerce → restale readers → sync the widget → persist), so a value set from
-// a web cell's canvas is indistinguishable from one the reader dialled in. Resolving the declaring
-// cell here is the point: a custom visualisation shouldn't have to know which cell happens to
-// declare the control it drives. Returns a promise; resolves false if no such control exists.
-window.slateSetBind = function (name, value) {
-  const owner = _pickOwner(name);
-  if (!owner) return Promise.resolve(false);
-  return api('POST', '/api/bind/' + owner.id, { name, value }).then(applyAck).then(() => true);
-};
-
 function mountPicks(c, cell) {
   const picks = c.picks || [];
   if (!picks.length) return;
@@ -1994,7 +1995,7 @@ function paletteChips() {
   cells.forEach(h => (h.controls || []).flat().forEach(s => { (hosts[s.name] ||= []).push(h.id); }));
   const chips = [];
   cells.forEach(c => (c.binds || []).forEach(b =>
-    chips.push({ name: b.name, widget: b.widget, value: b.value, def: c.id, hosts: hosts[b.name] || [] })));
+    chips.push({ name: b.name, widget: b.widget, value: _keyText(b.params, b.value), def: c.id, hosts: hosts[b.name] || [] })));
   return chips;
 }
 function togglePalette() { document.getElementById('palette').classList.toggle('open'); }
@@ -2012,7 +2013,7 @@ function renderPalette() {
       ` title="${window.slateEscHtml(c.name + ' = ' + vt)}&#10;drag into a cell to surface it · click to jump to ‘${c.def}’${c.hosts.length ? ' · surfaced in ' + c.hosts.map(h => '‘' + h + '’').join(', ') : ''}">` +
       `<span class="cname">${c.name}</span><span class="ctype">${c.widget}</span>` +
       `<span class="cright">${host ? `<span class="chost">${host}</span>` : ''}` +
-      `<span class="pval" data-pname="${c.name}">${c.value}</span></span></div>`;
+      `<span class="pval" data-pname="${c.name}">${_esc(String(c.value))}</span></span></div>`;
   }).join('');
 }
 
@@ -2102,7 +2103,7 @@ function syncControlValues(state) {
     else if (window.slateWidgets && window.slateWidgets[w] && window.slateWidgets[w].sync) window.slateWidgets[w].sync(el, v, p);
     else el.value = String(v);
     const wrap = el.closest('.widget, .control'); const m = wrap && wrap.querySelector('.wval');
-    if (m) m.textContent = _ctrlValLabel(el, v);
+    if (m) m.textContent = _ctrlValLabel(el, v, p);
   });
 }
 
