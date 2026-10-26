@@ -12,6 +12,23 @@ were written when they went out. They are marked.
 
 ## [Unreleased]
 
+## [1.12.1] - 2026-10-26
+
+### Fixed
+
+- An agent's edit no longer empties the notebook in the browser. A save rewrote the file in place,
+  and the file watcher or a state poll that read it part way through took the cut-short file for an
+  outside edit and replaced the notebook with it. The file on disk stayed whole, which is why
+  reopening brought the cells back. A save now writes a file beside the notebook and moves it into
+  place. (#35, reported by @yl4070)
+- An edit made outside Slate by a writer that saves in place, such as an editor or an agent writing
+  the file directly, is read once the writer has finished, not part way through.
+- The "Project source changed" banner closes once the cells it marked stale have run, whoever runs
+  them, so an agent running them clears it.
+- A web cell laid out differently from the editor's own layout, such as `""", css"""` on one line, no
+  longer reads as edited, so an agent's change to it no longer raises the conflict prompt. Running or
+  saving an untouched web cell keeps its layout.
+
 ## [1.12.0] - 2026-10-26
 
 ### Added
