@@ -2660,7 +2660,7 @@ const _WS_CONNS = Dict{String,Vector{_WSConn}}()   # nb id → live page sockets
 const _WS_LOCK = ReentrantLock()
 _ws_register!(nb::LiveNotebook, c::_WSConn) = lock(_WS_LOCK) do; push!(get!(_WS_CONNS, nb.id, _WSConn[]), c); end
 _ws_unregister!(nb::LiveNotebook, c::_WSConn) = lock(_WS_LOCK) do
-    v = get(_WS_CONNS, nb.id, nothing); v === nothing || filter!(!==(c), v)
+    v = get(_WS_CONNS, nb.id, nothing); v === nothing || filter!(d -> d !== c, v)
 end
 
 # Enqueue one frame to a connection, NON-blocking. Full queue ⇒ drop + count; the next successful
