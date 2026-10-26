@@ -14,6 +14,14 @@ Two things to know about the published GitHub releases for this package:
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-10-12
+
+### Added
+
+`encode_binary_frame!(buf, channel, x)` encodes a `SlateBinary` into a buffer the caller provides,
+resized to the frame's length. A buffer reused across a stream of large frames is allocated once
+instead of once per frame. `encode_binary_frame` produces the same bytes into a new buffer.
+
 ## [0.11.1] - 2026-10-07
 
 ### Added

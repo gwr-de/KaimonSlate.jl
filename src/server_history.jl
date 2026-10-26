@@ -1365,6 +1365,30 @@ function _static_cells(nb::LiveNotebook)
     return [cell_json(c, bindref, hostednames) for c in nb.report.cells]
 end
 
+# A running cell's payload carries what a page needs to pick the run up part-way: when it started
+# (hub clock — the page measures it against `now`, so the two clocks never meet) and the bars it
+# shows. Without them a page loaded mid-run had no start time and dropped every later progress frame.
+#
+# While hydrating, the cells are the stored preview, whose states describe the last save rather than
+# this run; the running ones are marked running here. The preview is shared across requests, so the
+# array and each touched cell are copied rather than written to.
+function _annotate_running!(nb::LiveNotebook, meta::AbstractDict)
+    meta["now"] = time()
+    live = _live_snapshot!(nb)
+    (isempty(live) || !haskey(meta, "cells")) && return meta
+    cells = meta["cells"] = Any[c for c in meta["cells"]]
+    for (i, c) in pairs(cells)
+        c isa AbstractDict || continue
+        l = get(live, String(get(c, "id", "")), nothing)
+        l === nothing && continue
+        d = cells[i] = Dict{String,Any}(c)
+        d["state"] = "running"
+        d["runStartedAt"] = l.started
+        d["progress"] = [Dict{String,Any}("id" => b[1], "frac" => b[2], "msg" => b[3]) for b in l.bars]
+    end
+    return meta
+end
+
 function state_json(nb::LiveNotebook)
     meta = Dict{String,Any}(
         "id" => nb.id, "title" => nb.report.title, "path" => abspath(nb.path),
@@ -1455,7 +1479,7 @@ function state_json(nb::LiveNotebook)
         meta["hydratingKind"] = get(nb.report.meta, "hydratingKind",
                                     haskey(nb.report.meta, "preview") ? "env" : "run")
         haskey(nb.report.meta, "hydratingHost") && (meta["hydratingHost"] = nb.report.meta["hydratingHost"])
-        return meta
+        return _annotate_running!(nb, meta)
     end
     bindref, hostednames = _bind_index(nb.report)
     md = Set{String}(get(nb.report.meta, "multidef", String[]))   # names defined in 2+ cells → per-cell flag
@@ -1491,7 +1515,7 @@ function state_json(nb::LiveNotebook)
     # it loads. Pushing the whole effective map lets the browser extend its import map with whatever is
     # missing, so a specifier works in the session that installed it (see view.js `applyPackageImports`).
     let im = _effective_imports(nb); isempty(im) || (meta["moduleImports"] = im); end
-    return meta
+    return _annotate_running!(nb, meta)
 end
 
 # A web cell's source in the exact form `_web_skin` emits, so the browser's pane reassembly matches it

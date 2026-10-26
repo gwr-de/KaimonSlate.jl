@@ -675,4 +675,14 @@ SlateExtensionsBase.to_palette_command(c::TaggedCmd) = auto_palette_command(c)
         @test occursin("z()", ejs)                           # run body passes through unescaped
     end
 
+    @testset "encode_binary_frame! writes the same frame into a reused buffer" begin
+        a = rand(Float32, 64, 32)
+        sb = SlateBinary(a; i = 3)
+        buf = zeros(UInt8, 10)
+        @test encode_binary_frame!(buf, "ch", sb) === buf
+        @test buf == encode_binary_frame("ch", sb)
+        big = fill(0xff, 2 * length(buf))
+        encode_binary_frame!(big, "ch", sb)                  # a larger buffer shrinks to the frame
+        @test big == buf
+    end
 end

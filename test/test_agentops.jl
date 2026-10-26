@@ -544,21 +544,22 @@ end
 
         # A slate_progress frame is RECORDED for sampling (latest-value-wins) rather than pushed
         # per-frame — that's what stops a 10Hz loop flooding the agent.
-        NS.ReportEngine._do_userprog(nb.report.id, 0.5, "halfway", "bar1", false)
-        rec = lock(NS._USERPROG_LOCK) do; NS._LAST_USERPROG[nb.id]; end
+        zc = nb.report.cells[findfirst(c -> c.id == "zcell", nb.report.cells)]
+        lock(nb.lock) do; NS.ReportEngine.mark_running!(zc); NS._broadcast_progress(nb, zc); end
+        NS.ReportEngine._do_userprog(nb.report.id, "zcell", "bar1", 0.5, "halfway", false)
+        rec = NS._live_latest(nb.id)
         @test rec[1] == 0.5 && rec[2] == "halfway"
-        # A burst collapses: the stash holds only the most recent reading.
+        # A burst collapses: the record holds only the most recent reading.
         for i in 1:20
-            NS.ReportEngine._do_userprog(nb.report.id, i / 20, "step $i", "bar1", false)
+            NS.ReportEngine._do_userprog(nb.report.id, "zcell", "bar1", i / 20, "step $i", false)
         end
-        rec2 = lock(NS._USERPROG_LOCK) do; NS._LAST_USERPROG[nb.id]; end
-        @test rec2[2] == "step 20"
+        @test NS._live_latest(nb.id)[2] == "step 20"
         @test NS._note_run_progress(nb, "zcell", time() - 5) === nothing
 
-        # Closing must drop the reading: notebook ids are reused on reopen, so a leftover would
+        # Closing must drop the record: notebook ids are reused on reopen, so a leftover would
         # be reported against the next notebook's first run as if it described it.
         NS._unwire_callbacks!(nb)
-        @test !haskey(lock(NS._USERPROG_LOCK) do; NS._LAST_USERPROG; end, nb.id)
+        @test NS._live_latest(nb.id) === nothing
     finally
         NS.stop_hub(hub)
     end
@@ -574,19 +575,23 @@ end
         nbp = tempname() * ".jl"
         write(nbp, "#%% md id=intro\n# T\n")
         nb = hub.notebooks[NS.open_notebook!(hub, nbp)]
+        NS.agent_add_cell!(nb, "y = 2"; id = "ycell")
+        NS._eval!(nb; wait_all = true)
+        yc = nb.report.cells[findfirst(c -> c.id == "ycell", nb.report.cells)]
+        lock(nb.lock) do; NS.ReportEngine.mark_running!(yc); NS._broadcast_progress(nb, yc); end
 
         @test NS._userprog_note(nb.id) == ""                       # nothing reported yet
-        NS.ReportEngine._do_userprog(nb.report.id, 0.45, "step 9/20", "bar", false)
+        NS.ReportEngine._do_userprog(nb.report.id, "ycell", "bar", 0.45, "step 9/20", false)
         note = NS._userprog_note(nb.id)
         @test occursin("45%", note) && occursin("step 9/20", note)
 
         # A FINISHED bar must not be reported as live state — it would read as current progress
         # for whatever runs next.
-        NS.ReportEngine._do_userprog(nb.report.id, 1.0, "all done", "bar", true)
+        NS.ReportEngine._do_userprog(nb.report.id, "ycell", "bar", 1.0, "all done", true)
         @test NS._userprog_note(nb.id) == ""
 
         # And it reaches the actual poll response for a running job.
-        NS.ReportEngine._do_userprog(nb.report.id, 0.7, "phase two", "bar", false)
+        NS.ReportEngine._do_userprog(nb.report.id, "ycell", "bar", 0.7, "phase two", false)
         r = NS._run_bg(nb, "probe"; grace = 0) do
             sleep(5); "done"
         end
@@ -606,6 +611,56 @@ end
 
         # Unknown job ids stay a clean message, not an error.
         @test occursin("No such scratch job", NS.scratch_check("nope"))
+    finally
+        NS.stop_hub(hub)
+    end
+end
+
+# A page that loads mid-run learns of the run only from /api/state: the event stream reports runs
+# that start while it listens. So the state carries each running cell's start and current bars.
+@testset "state carries a running cell's start and progress" begin
+    NS.SlateHistory._ROOT[] = mktempdir()
+    hub = NS.start_hub(; port = 8865)
+    try
+        nbp = tempname() * ".jl"
+        write(nbp, "#%% md id=intro\n# T\n")
+        nb = hub.notebooks[NS.open_notebook!(hub, nbp)]
+        NS.agent_add_cell!(nb, "w = 3"; id = "wcell")
+        NS._eval!(nb; wait_all = true)
+        wc = nb.report.cells[findfirst(c -> c.id == "wcell", nb.report.cells)]
+        rid = nb.report.id
+        run!() = lock(nb.lock) do; NS.ReportEngine.mark_running!(wc); NS._broadcast_progress(nb, wc); end
+        wjson() = (s = NS.state_json(nb); (s, s["cells"][findfirst(c -> c["id"] == "wcell", s["cells"])]))
+
+        run!()
+        s, c = wjson()
+        @test c["state"] == "running" && c["runStartedAt"] <= s["now"] && isempty(c["progress"])
+        started = c["runStartedAt"]
+
+        # Bars keep the order they appeared in; an update replaces in place, `done` removes.
+        NS.ReportEngine._do_userprog(rid, "wcell", "outer", 0.3, "epoch 3", false)
+        NS.ReportEngine._do_userprog(rid, "wcell", "inner", 0.6, "batch", false)
+        NS.ReportEngine._do_userprog(rid, "wcell", "outer", 0.4, "epoch 4", false)
+        NS.ReportEngine._do_userprog(rid, "wcell", "inner", 1.0, "batch", true)
+        # Progress naming a cell that isn't running has no run to attach to.
+        NS.ReportEngine._do_userprog(rid, "intro", "x", 0.5, "stray", false)
+        _, c = wjson()
+        @test [(b["id"], b["frac"], b["msg"]) for b in c["progress"]] == [("outer", 0.4, "epoch 4")]
+        @test !haskey(NS._CELL_LIVE[nb.id], "intro")
+
+        # A second start announcement (a region cell's) keeps the original start.
+        sleep(0.01); run!()
+        @test wjson()[2]["runStartedAt"] == started
+
+        # A run that ends without a finish broadcast (a reset) is dropped by the next state.
+        NS.ReportEngine.mark_fresh!(wc)
+        _, c = wjson()
+        @test !haskey(c, "runStartedAt") && !haskey(NS._CELL_LIVE[nb.id], "wcell")
+
+        # The ordinary finish drops it too.
+        run!()
+        lock(nb.lock) do; NS.ReportEngine.mark_fresh!(wc); NS._broadcast_progress(nb, wc); end
+        @test !haskey(NS._CELL_LIVE[nb.id], "wcell")
     finally
         NS.stop_hub(hub)
     end
@@ -646,7 +701,7 @@ end
                        "keymap_key_owner.mjs", "keep_focus.mjs", "ansi_html.mjs",
                        "settings_section_links.mjs", "echarts_dark_labels.mjs",
                        "teardown_output.mjs", "carry_mounted.mjs", "duration_fmt.mjs",
-                       "swap_hold.mjs", "pkg_log_tail.mjs")
+                       "swap_hold.mjs", "pkg_log_tail.mjs", "run_resume.mjs")
             io = IOBuffer()
             ok = success(pipeline(`$node $(joinpath(@__DIR__, "js", script))`; stdout = io, stderr = io))
             ok || print(String(take!(io)))

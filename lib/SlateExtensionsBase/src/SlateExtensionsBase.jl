@@ -83,7 +83,7 @@ export slate_render, component, html_fragment, SlateComponentMIME, SlateHtmlMIME
 # Markdown fenced blocks claimed by an extension (```mermaid → that package's value)
 export register_fence_renderer!, fence_renderer, fence_languages, render_fence
 # Binary numeric streaming
-export SlateBinary, encode_binary_frame
+export SlateBinary, encode_binary_frame, encode_binary_frame!
 export HookLogger
 
 end # module
