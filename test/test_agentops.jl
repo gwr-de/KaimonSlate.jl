@@ -862,11 +862,64 @@ end
                        "specialist_ask_routing.mjs", "echarts_dark_labels.mjs",
                        "teardown_output.mjs", "carry_mounted.mjs", "duration_fmt.mjs",
                        "swap_hold.mjs", "pkg_log_tail.mjs", "run_resume.mjs",
-                       "setbind_coalesce.mjs")
+                       "setbind_coalesce.mjs", "src_banner_close.mjs")
             io = IOBuffer()
             ok = success(pipeline(`$node $(joinpath(@__DIR__, "js", script))`; stdout = io, stderr = io))
             ok || print(String(take!(io)))
             @test ok
         end
+    end
+end
+
+# A save replaces the notebook file whole. A reader that came between a plain `write`'s truncation and
+# its end parsed an empty or cut-short notebook, took it for an outside edit, and emptied the live one.
+@testset "a save never shows a reader a partial notebook" begin
+    RE = KaimonSlate.ReportEngine
+    dir = mktempdir()
+    real = joinpath(dir, "real.jl"); write(real, "#%% code id=a\na = 1\n")
+    chmod(real, 0o640)
+    link = joinpath(dir, "nb.jl"); symlink(real, link)
+    nb = NS.LiveNotebook("savewhole", link, RE.parse_report("#%% code id=a\na = 1\n#%% code id=b\nb = 2\n"),
+        RE.InProcessKernel(), 1, String[], String[], ReentrantLock(), Channel{String}[],
+        ReentrantLock(), "", false, Dict{String,String}())
+    before = stat(real).inode
+    NS._persist!(nb; source = "agent")
+    # A new file moved into place, not the old one rewritten: a reader never sees it emptied.
+    @test stat(real).inode != before
+    @test [c.id for c in RE.parse_report(read(link, String)).cells] == ["a", "b"]
+    @test islink(link) && filemode(real) & 0o777 == 0o640
+    @test readdir(dir) == ["nb.jl", "real.jl"]                       # nothing left beside it
+    @test !NS.sync_from_file!(nb)                                     # its own write is not an edit
+
+    # A file written moments ago is not read yet, since an in-place save may still be under way.
+    f = joinpath(dir, "fresh.jl"); write(f, "#%% code id=a\na = 1\n")
+    @test NS._read_settled(f) === nothing
+    sleep(NS._SETTLE_S + 0.05)
+    @test NS._read_settled(f) == "#%% code id=a\na = 1\n"
+
+    # Saves in a tight loop against readers that parse the file, as the watcher and a state poll do.
+    # A read lands inside a write only on another thread.
+    if Threads.nthreads() >= 2
+        ncells = 30
+        text(i) = join(("#%% code id=c$k\nx$k = $i\n" for k in 1:ncells), "\n")
+        function torn_reads(save!, reader; seconds = 0.5, gap = 0.0)
+            p = joinpath(mktempdir(), "nb.jl"); write(p, text(0)); RE.parse_report(text(0))
+            done = Threads.Atomic{Bool}(false); torn = Threads.Atomic{Int}(0); n = Threads.Atomic{Int}(0)
+            ts = [Threads.@spawn while !done[]
+                      t = try; reader(p); catch; nothing; end
+                      t === nothing && (yield(); continue)
+                      Threads.atomic_add!(n, 1)
+                      length(RE.parse_report(t).cells) < ncells && Threads.atomic_add!(torn, 1)
+                  end for _ in 1:2]
+            while n[] < 1; yield(); end
+            t0 = time(); i = 0
+            while time() - t0 < seconds
+                save!(p, text(i += 1)); gap > 0 && sleep(gap)
+            end
+            done[] = true; foreach(wait, ts)
+            return torn[]
+        end
+        @test torn_reads(NS._write_notebook, p -> read(p, String)) == 0     # the hub's own saves
+        @test torn_reads(write, NS._read_settled; seconds = 1.0, gap = 0.05) == 0   # an editor saving in place
     end
 end

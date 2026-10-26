@@ -223,9 +223,18 @@ function WebEditor({ cell }) {
       css:  panes.css  ? panes.css.state.doc.toString()  : '',
       js:   panes.js   ? panes.js.state.doc.toString()   : '',
     });
+    // What the panes were last loaded from: the server's source and its sections. A pane that differs
+    // from its section is an edit; while none does, the editor's text is that source as written.
+    // `assemble` writes one layout, and a source laid out another way (`""", css"""` on one line, say)
+    // compared after a round trip through it read as an edit nobody made.
+    const base = { src: cell.source || '', secs: { html: secs.html || '', css: secs.css || '', js: secs.js || '' } };
+    const changed = () => readerOwnsIt &&
+      _WEB_LANGS.some(([l]) => (panes[l] ? panes[l].state.doc.toString() : '') !== base.secs[l]);
+    const text = () => changed() ? assemble() : base.src;
+    const rebase = src => { base.src = src || ''; base.secs = window._webSections(base.src); };
     const onAnyDoc = () => {
       if (!primed) return;
-      if (!srcEq(assemble(), window.srcMap[cell.id] || '')) { window.setState(cell.id, 'edited'); window._backupSoon && window._backupSoon(); }
+      if (changed()) { window.setState(cell.id, 'edited'); window._backupSoon && window._backupSoon(); }
       else clearEdited(cell.id);
     };
     const setPrimary = () => {                            // a real view for edited-state/measure
@@ -288,7 +297,7 @@ function WebEditor({ cell }) {
     if (!activeLangs.length) activeLangs.push('js');
     if (readerOwnsIt) for (const [l] of _WEB_LANGS) if (activeLangs.includes(l)) addPane(l, secs[l] || '');
 
-    (window.webEditors || (window.webEditors = {}))[cell.id] = { panes, assemble, addPane };
+    (window.webEditors || (window.webEditors = {}))[cell.id] = { panes, assemble, addPane, text, rebase };
     setTimeout(() => { primed = true; }, 0);
     return () => {
       if (window.editors[cell.id] && Object.values(panes).includes(window.editors[cell.id])) delete window.editors[cell.id];

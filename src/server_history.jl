@@ -125,6 +125,25 @@ end
 _is_server_write(report_id, h::UInt64) =
     lock(_SWRITES_LOCK) do; h in get(_SERVER_WRITES, String(report_id), UInt64[]); end
 
+# Write a notebook's text to `path` whole: into a file beside it, then moved over it, so a reader (the
+# watcher, a `/state` poll, both of which `sync_from_file!`) sees the old text or the new one. A read
+# between a plain `write`'s truncation and its last byte parses as a notebook with fewer cells, or
+# none, matches no recorded server write, and replaces the live notebook. A symlink is written
+# through, since a rename would replace the link, and the file keeps its mode.
+function _write_notebook(path::AbstractString, s::AbstractString)
+    target = ispath(path) ? realpath(path) : String(path)
+    tmp = joinpath(dirname(target), "." * basename(target) * ".saving-" * string(rand(UInt64); base = 36))
+    try
+        write(tmp, s)
+        ispath(target) && chmod(tmp, filemode(target) & 0o7777)
+        mv(tmp, target; force = true)
+    catch
+        rm(tmp; force = true)
+        rethrow()
+    end
+    return nothing
+end
+
 # Persist the notebook to its `.jl` AND record a durable checkpoint. The single
 # write+capture chokepoint for in-app mutations (replaces bare `write(...)`).
 function _persist!(nb::LiveNotebook; source::AbstractString = "browser", label::AbstractString = "")
@@ -156,7 +175,7 @@ function _persist!(nb::LiveNotebook; source::AbstractString = "browser", label::
         @warn "KaimonSlate: could not preserve bundle footer on save" exception = (e, catch_backtrace())
     end
     _note_server_write!(nb.report.id, canon)     # register BEFORE writing: a watcher tick fired by
-    write(nb.path, s)                             # this write must recognize it as OURS, not external
+    _write_notebook(nb.path, s)                   # this write must recognize it as OURS, not external
     nb.version += 1                               # every in-app commit advances the version (CAS basis)
     _history!(nb; source = source, label = label)
     return nb
@@ -357,12 +376,28 @@ function restore_history!(nb::LiveNotebook, hash::AbstractString)
     return true
 end
 
+# The notebook's text as a writer left it, or `nothing` while one may be part way through: the file
+# was written moments ago, or its size or mtime moved during the read. An editor that saves in place
+# truncates the file first, and a read in that window parses as a notebook with fewer cells, or none.
+# The hub's own saves are whole (`_write_notebook`); this covers every other writer. An mtime ahead
+# of the clock, as a network filesystem can report, counts as settled.
+const _SETTLE_S = 0.15
+function _read_settled(path::AbstractString)
+    s1 = stat(path)
+    0 <= time() - s1.mtime < _SETTLE_S && return nothing
+    txt = read(path, String)
+    s2 = stat(path)
+    (s2.mtime == s1.mtime && s2.size == s1.size == sizeof(txt)) || return nothing
+    return txt
+end
+
 # Pull in external edits (VS Code, the agent, …). Re-reads the file; if it differs
 # (canonically) from our state, reconciles → runs stale → bumps version. Returns
 # true if changed. The server's own writes match canonically, so they don't loop.
 function sync_from_file!(nb::LiveNotebook)
     isfile(nb.path) || return false
-    disk = read(nb.path, String)
+    disk = _read_settled(nb.path)
+    disk === nothing && return false     # a writer is part way through; the next tick reads it whole
     norm = try
         serialize_report(parse_report(disk; id = nb.report.id))
     catch
