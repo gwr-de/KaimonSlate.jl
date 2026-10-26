@@ -210,6 +210,26 @@ function _fix_at_refs(bytes::Vector{UInt8})
     return Vector{UInt8}(replace(s, _ATREF_RE => _atref_span))
 end
 
+# A returned collection of figures — every element's richest form an image — is captured as a GALLERY: a
+# marker chunk carrying the count, then each figure's own chunks (its image, and its PDF for export). The
+# renderer lays the images following the marker out as a grid; anything that reads image chunks one by one
+# (snapshots, export) still finds them. Bounded so a long vector of images is not rendered wholesale.
+const _GALLERY_MIME = "application/vnd.kaimonslate.gallery"
+const _GALLERY_MAX = 64
+function _richest_mime(x)
+    for m in _RICH_MIMES
+        Base.invokelatest(showable, m, x) && return m
+    end
+    return ""
+end
+function _capture_gallery!(chunks::Vector{Tuple{String,Vector{UInt8}}}, value)
+    (value isa AbstractVector || value isa Tuple) && 2 <= length(value) <= _GALLERY_MAX || return false
+    all(x -> startswith(_richest_mime(x), "image/"), value) || return false
+    push!(chunks, (_GALLERY_MIME, Vector{UInt8}(string(length(value)))))
+    foreach(x -> _capture_rich!(chunks, x), value)
+    return true
+end
+
 # When we just captured a raster figure (image/*), also try to render it to PDF — a
 # vector form for publication export. We attempt `show(io, MIME"application/pdf", x)`
 # *directly* (not gated on `showable`): CairoMakie gates `showable` on its active output
@@ -862,6 +882,8 @@ function run_capture(mod::Module, source::AbstractString, filename::AbstractStri
     cid = replace(filename, r"^cell:" => "")
     task_local_storage(:slate_cell, cid)
     _ns_defined(mod, :__slate_cleanups) && _run_cell_cleanups!(_ns_read(mod, :__slate_cleanups), cid)
+    # Clear this cell's `@replay` marks, so that this run registers the full set again (see `_do_replay`).
+    _ns_defined(mod, :__slate_replay_forget) && _ns_read(mod, :__slate_replay_forget)(cid)
 
     # Cell-effects sink (see `_slate_effect`): declarations a cell / a package it calls makes during eval,
     # attributed to the executing statement. Seeded here, harvested + cleared after the eval — like the
@@ -976,7 +998,9 @@ function run_capture(mod::Module, source::AbstractString, filename::AbstractStri
                !(try Base.invokelatest(showable, MIME"text/latex"(), value) catch; false end)
                 value = try; Base.invokelatest(slate_matrix, value); catch; value; end
             end
-            if value isa EChart
+            if (try Base.invokelatest(_capture_gallery!, chunks, value) catch; false end)
+                # a collection of figures, laid out together
+            elseif value isa EChart
                 push!(echarts, value.option)
             elseif value isa Animation
                 push!(animations, (manifest = value.manifest, frames = value.frames, lut = value.lut))

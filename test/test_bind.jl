@@ -861,6 +861,61 @@ end
         @test sort(collect(keys(Base.invokelatest(getproperty, r.mod, :__slate_replay_sweeps)))) == ids
     end
 
+    # The registry outlives every run, so a mark that the new source of a cell no longer has must go
+    # when the cell runs again. If it stays, the export sweeps it and ships data that no output reads.
+    @testset "a re-run drops the @replay marks its new source no longer has" begin
+        r = parse_report("""
+        #%% code id=ctl
+        @bind k Slider(1:4)
+        @bind j Slider(1:3)
+        #%% code id=two
+        (@replay(k, [k]), @replay(k, [2k]), @replay(k, [3k]), @replay(k, [4k]))
+        #%% code id=other
+        @replay(k, [k])
+        """)
+        build_dependencies!(r)
+        eval_stale!(r)
+        ids() = sort(collect(keys(Base.invokelatest(getproperty, r.mod, :__slate_replay_sweeps))))
+        @test ids() == ["other:k", "two:k", "two:k#1", "two:k#2", "two:k#3"]
+
+        rerun!(src) = (c = findcell(r, "two"); c.source = src; c.state = STALE;
+                       build_dependencies!(r); eval_stale!(r))
+        # Fewer marks on the same control: the suffixed ones past the new count go.
+        rerun!("(@replay(k, [k]), @replay(k, [2k]))")
+        @test ids() == ["other:k", "two:k", "two:k#1"]
+
+        # A composed chain sweep on the same cell belongs to the export's pass, not to the cell's run.
+        chain = Base.invokelatest(getproperty, r.mod, :__slate_replay_chain)
+        Base.invokelatest(chain, [(; id = "two#0", name = :k, f = k -> [k], cell = "two")])
+        # A mark on a different control only: every mark on `k` goes, and the other cell keeps its own.
+        rerun!("@replay(j, [j])")
+        @test ids() == ["other:k", "two#0", "two:j"]
+    end
+
+    # Each run of a cell lowers it again, so each `@replay` makes a closure of a NEW type. Anything that
+    # compiles for that type compiles again on every run, which made a slider move cost far more than
+    # the cell's work: `_do_replay` specialized on it (about 120 ms per mark), and the live call of the
+    # closure compiled its body (about 5 ms per mark). One specialization must serve every run, and the
+    # live run must take the value from the cell without calling the closure.
+    @testset "re-running a @replay cell compiles nothing new" begin
+        r = parse_report("""
+        #%% code id=ctl
+        @bind k Slider(1:4; default = 3)
+        #%% code id=use
+        v = @replay(k, [k, 2k])
+        """)
+        build_dependencies!(r)
+        eval_stale!(r)
+        for _ in 1:2
+            findcell(r, "use").state = STALE; eval_stale!(r)
+        end
+        @test count(_ -> true, Base.specializations(only(methods(RE._do_replay)))) == 1
+        @test collect(Base.invokelatest(getproperty, r.mod, :v)) == [3, 6]
+        f = Base.invokelatest(getproperty, r.mod, :__slate_replay_sweeps)["use:k"].f
+        @test isempty(Base.specializations(only(methods(f))))
+        @test Base.invokelatest(f, 2) == [2, 4]          # the export still sweeps the closure
+    end
+
     # `@replay` sweeps the value a CELL sees, not the wire value the registry holds. For a slider or a
     # select those are the same thing; for a TableSelect the wire value is a row index and the cell
     # value is the row, so sweeping unwrapped would hand `sel.b` an integer and fail on field access.

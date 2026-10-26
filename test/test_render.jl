@@ -27,6 +27,27 @@ include(joinpath(HERE, "..", "src", "render.jl")); using .ReportRender
     eval_report!(r)
     html = render_html(r)
 
+    @testset "a returned collection of figures is captured and laid out as a gallery" begin
+        r = parse_report("""
+        #%% code id=g
+        struct G; k::Int; end
+        Base.show(io::IO, ::MIME"image/png", g::G) = write(io, UInt8[0x89, 0x50, 0x4e, 0x47, g.k])
+        [G(1), G(2), G(3)]
+        #%% code id=m
+        (G(1), "not a figure")
+        """)
+        eval_report!(r)
+        disp = r.cells[1].output.display
+        @test disp[1].mime == "application/vnd.kaimonslate.gallery" && String(copy(disp[1].data)) == "3"
+        @test [c.data[end] for c in disp if c.mime == "image/png"] == UInt8[1, 2, 3]
+        ghtml = ReportRender._render_chunks(disp)
+        @test occursin("disp gallery", ghtml) && occursin("--gallery-cols:3", ghtml) && count("disp img", ghtml) == 3
+        # the grid closes after its images
+        @test endswith(ghtml, "</div></div>")
+        # a collection with anything but figures is not a gallery
+        @test !any(c -> c.mime == "application/vnd.kaimonslate.gallery", r.cells[2].output.display)
+    end
+
     @testset "page shell + title" begin
         @test occursin("<!DOCTYPE html>", html)
         @test occursin("<title>T</title>", html)
