@@ -359,12 +359,28 @@ function restore_history!(nb::LiveNotebook, hash::AbstractString)
     return true
 end
 
+# The notebook's text as a writer left it, or `nothing` while one may be part way through: the file
+# was written moments ago, or its size or mtime moved during the read. An editor that saves in place
+# truncates the file first, and a read in that window parses as a notebook with fewer cells, or none.
+# The hub's own saves are whole (`_write_notebook`); this covers every other writer. An mtime ahead
+# of the clock, as a network filesystem can report, counts as settled.
+const _SETTLE_S = 0.15
+function _read_settled(path::AbstractString)
+    s1 = stat(path)
+    0 <= time() - s1.mtime < _SETTLE_S && return nothing
+    txt = read(path, String)
+    s2 = stat(path)
+    (s2.mtime == s1.mtime && s2.size == s1.size == sizeof(txt)) || return nothing
+    return txt
+end
+
 # Pull in external edits (VS Code, the agent, …). Re-reads the file; if it differs
 # (canonically) from our state, reconciles → runs stale → bumps version. Returns
 # true if changed. The server's own writes match canonically, so they don't loop.
 function sync_from_file!(nb::LiveNotebook)
     isfile(nb.path) || return false
-    disk = read(nb.path, String)
+    disk = _read_settled(nb.path)
+    disk === nothing && return false     # a writer is part way through; the next tick reads it whole
     norm = try
         serialize_report(parse_report(disk; id = nb.report.id))
     catch

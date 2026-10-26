@@ -730,4 +730,36 @@ end
     @test islink(link) && filemode(real) & 0o777 == 0o640
     @test readdir(dir) == ["nb.jl", "real.jl"]                       # nothing left beside it
     @test !NS.sync_from_file!(nb)                                     # its own write is not an edit
+
+    # A file written moments ago is not read yet, since an in-place save may still be under way.
+    f = joinpath(dir, "fresh.jl"); write(f, "#%% code id=a\na = 1\n")
+    @test NS._read_settled(f) === nothing
+    sleep(NS._SETTLE_S + 0.05)
+    @test NS._read_settled(f) == "#%% code id=a\na = 1\n"
+
+    # Saves in a tight loop against readers that parse the file, as the watcher and a state poll do.
+    # A read lands inside a write only on another thread.
+    if Threads.nthreads() >= 2
+        ncells = 30
+        text(i) = join(("#%% code id=c$k\nx$k = $i\n" for k in 1:ncells), "\n")
+        function torn_reads(save!, reader; seconds = 0.5, gap = 0.0)
+            p = joinpath(mktempdir(), "nb.jl"); write(p, text(0)); RE.parse_report(text(0))
+            done = Threads.Atomic{Bool}(false); torn = Threads.Atomic{Int}(0); n = Threads.Atomic{Int}(0)
+            ts = [Threads.@spawn while !done[]
+                      t = try; reader(p); catch; nothing; end
+                      t === nothing && (yield(); continue)
+                      Threads.atomic_add!(n, 1)
+                      length(RE.parse_report(t).cells) < ncells && Threads.atomic_add!(torn, 1)
+                  end for _ in 1:2]
+            while n[] < 1; yield(); end
+            t0 = time(); i = 0
+            while time() - t0 < seconds
+                save!(p, text(i += 1)); gap > 0 && sleep(gap)
+            end
+            done[] = true; foreach(wait, ts)
+            return torn[]
+        end
+        @test torn_reads(NS._write_notebook, p -> read(p, String)) == 0     # the hub's own saves
+        @test torn_reads(write, NS._read_settled; seconds = 1.0, gap = 0.05) == 0   # an editor saving in place
+    end
 end
