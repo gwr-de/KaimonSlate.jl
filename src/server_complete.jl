@@ -155,6 +155,7 @@ function restart_kernel!(nb::LiveNotebook)
     try; ReportEngine.shutdown!(nb.kernel; kill_remote = true); catch; end
     _teardown_region!(nb; kill = true)       # region kernels restart fresh too (+ sync state reset)
     with_report(nb) do report                # lock only for the report reset/mutate (no round-trip)
+        _live_clear!(nb)                     # the reset ends every run without a finish broadcast
         ReportEngine.reset!(nb.kernel, report)
         build_dependencies!(report)
         report.meta["hydrating"] = true
@@ -660,7 +661,7 @@ function _sync_datadir_to!(nb::LiveNotebook, dst_k; cell_id::AbstractString = ""
     # multi-minute stall with no indication of what's happening. Off (cell_id empty) ⇒ no reporting.
     pid = "datadir-" * String(cell_id)
     prog(frac, msg, done) = isempty(cell_id) ? nothing :
-        (try; ReportEngine._do_userprog(nb.report.id, Float64(frac), msg, pid, done); catch; end; nothing)
+        (try; ReportEngine._do_userprog(nb.report.id, cell_id, pid, Float64(frac), msg, done); catch; end; nothing)
     files = Any[]; fbytes = Int[]
     for (dir, _, names) in walkdir(ddir), name in names
         p = joinpath(dir, name)
@@ -2659,7 +2660,7 @@ const _WS_CONNS = Dict{String,Vector{_WSConn}}()   # nb id → live page sockets
 const _WS_LOCK = ReentrantLock()
 _ws_register!(nb::LiveNotebook, c::_WSConn) = lock(_WS_LOCK) do; push!(get!(_WS_CONNS, nb.id, _WSConn[]), c); end
 _ws_unregister!(nb::LiveNotebook, c::_WSConn) = lock(_WS_LOCK) do
-    v = get(_WS_CONNS, nb.id, nothing); v === nothing || filter!(!==(c), v)
+    v = get(_WS_CONNS, nb.id, nothing); v === nothing || filter!(d -> d !== c, v)
 end
 
 # Enqueue one frame to a connection, NON-blocking. Full queue ⇒ drop + count; the next successful

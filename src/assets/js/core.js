@@ -712,7 +712,9 @@ function _slateEchartsThemeFrom(V, fam) {
   // NOT a valid canvas font-family, so the whole assignment is rejected and EVERY fontSize silently
   // reverts to the canvas default (color still applies — it's set via fillStyle, not the font string).
   // Resolve to a real stack so per-chart fontSize overrides actually take effect.
-  const family = fam || 'system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
+  // Quote family names with single quotes: the SVG renderer writes the stack into a double-quoted
+  // style="…" attribute without escaping, and computed styles serialise names with double quotes.
+  const family = (fam || "system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif").replace(/"/g, "'");
   return {
     color: cycle, backgroundColor: 'transparent',
     textStyle: { color: text, fontFamily: family, fontSize: 14 },

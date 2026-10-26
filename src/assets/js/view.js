@@ -1005,8 +1005,12 @@ function cancelSource(id) {
 // store. renderAll/updateStates now just publish the state + refresh the chrome; the component
 // diffs cells by id (so editors survive structural ops) and does per-cell output processing in
 // effects. The old full-wipe rebuild and the in-place patch collapse into one publish.
-function renderAll(state)    { _publishState(state); window.loadScratch && window.loadScratch(state && state.scratch); }
-function updateStates(state) { _publishState(state); window.loadScratch && window.loadScratch(state && state.scratch); }
+function renderAll(state)    { _publishState(state); _afterFullState(state); }
+function updateStates(state) { _publishState(state); _afterFullState(state); }
+function _afterFullState(state) {
+  window.loadScratch && window.loadScratch(state && state.scratch);
+  window.onRunState && state && window.onRunState(state);   // a page loaded mid-run picks the run up here
+}
 // Targeted live refresh (SSE `refresh:` / `celldone:`): merge ONLY the changed cells into the state
 // and publish, with no full-state GET.
 //
@@ -1079,7 +1083,7 @@ function markBlank(el, c) {
   el.classList.toggle('cell-blank', blank);
 }
 window.slateMarkBlank = markBlank;
-function resetCellRevs() { for (const k in _cellRev) delete _cellRev[k]; }
+function resetCellRevs() { for (const k in _cellRev) delete _cellRev[k]; window.slateRunForgetRevs && window.slateRunForgetRevs(); }
 window.slateRevIsNew = revIsNew;
 window.slateRevMark = revMark;
 window.slateResetCellRevs = resetCellRevs;
@@ -1550,8 +1554,11 @@ function _swapOutput(out, html, live, after) {
   const seq = (out.__slateSwapSeq = (out.__slateSwapSeq || 0) + 1);
   const commit = () => {
     if (out.__slateSwapSeq !== seq) return;
-    const applyUpdates = _carryMounted(out, stage);
+    // Measure the height before `_carryMounted` runs. It moves each kept figure out of `out` and
+    // into the stage, so a later measure gets the height without the figure. A hold at that height
+    // lets the page get shorter until the figure is back, and scroll anchoring then moves the view.
     out.style.minHeight = out.offsetHeight + 'px';
+    const applyUpdates = _carryMounted(out, stage);
     out.__slateHoldSeq = seq;   // the hold belongs to the swap that committed last
     out.replaceChildren(...Array.from(stage.childNodes));
     runScripts(out);   // a <script> from parsed HTML is inert — re-create so figures boot
