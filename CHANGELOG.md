@@ -34,6 +34,9 @@ were written when they went out. They are marked.
   export swept them and shipped their data, although no output on the page read it.
 - A cell that uses `bind_observable(:name)` offers that control in its header control picker. The
   cell still does not run again when the control changes.
+- `window.slateSetBind` coalesces calls per control again. A second definition replaced the
+  coalescing one, so each call sent its own request, and a fast drag built a backlog that moved the
+  figure after the reader let go.
 - `Select`, `Radio`, `MultiSelect` and `MultiCheckBox` bind the picked option value when it is a
   tuple, a vector, a `NamedTuple`, a `Dict`, `nothing`, a function or a struct of the notebook. Such
   a pick reached the cell as text (`"dog,2"`), and a multiple choice lost its picks. A struct or a
