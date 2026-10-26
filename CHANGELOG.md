@@ -22,6 +22,8 @@ were written when they went out. They are marked.
   sweeps. In a figure with 8 marks, this removes about 23 ms of compiling from each slider move.
 - A cell that runs again with fewer `@replay` marks no longer leaves the old marks registered. The
   export swept them and shipped their data, although no output on the page read it.
+- A cell that uses `bind_observable(:name)` offers that control in its header control picker. The
+  cell still does not run again when the control changes.
 
 ## [1.11.1] - 2026-10-08
 
