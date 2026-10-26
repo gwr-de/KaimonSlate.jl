@@ -6136,6 +6136,8 @@ the banner shows the path; only errors still print.
 function serve_notebook(path::AbstractString; host = "127.0.0.1", port = 8765, quiet::Bool = true,
                         inactive::Bool = false, app::Bool = false, workbook::Bool = false,
                         appdefaults::AbstractDict = Dict{String,Any}())
+    # A running cell redirects the process stdout into a capture that it closes when the cell ends.
+    out = stdout
     # Swap the logger BEFORE anything spawns so worker-spawn infos land in the file.
     logdir = ReportEngine._slate_logdir()
     logpath = isempty(logdir) ? "" : joinpath(logdir, "hub-$port.log")
@@ -6176,7 +6178,7 @@ function serve_notebook(path::AbstractString; host = "127.0.0.1", port = 8765, q
         nb1 === nothing ? "" : strip(report_frontmatter(nb1.report).title)
     catch; ""; end
     _print_ready_banner(url; logpath = logio === nothing ? "" : logpath, keys = showkeys,
-                        inactive = inactive, app = app, apptitle = apptitle)
+                        inactive = inactive, app = app, apptitle = apptitle, io = out)
     _open_in_browser(url)                    # best-effort auto-open (a no-op under KAIMONSLATE_NO_OPEN, which run.jl sets so its b/p keys drive opening instead)
     # Block until stopped — and make Ctrl-C actually stop it. Signals are a dead end
     # here (verified against a live hub): once the threaded HTTP listener runs, a
