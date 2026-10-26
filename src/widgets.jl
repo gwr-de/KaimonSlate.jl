@@ -422,7 +422,7 @@ TextArea(default::AbstractString = ""; rows::Int = 3, label = nothing) =
 # The page sends back only the TEXT of an option value. That text names the value only when the
 # widget is PLAIN: every value is a string, symbol, Bool, char, date or finite number, and no two
 # values have the same text. Any other option list makes a KEYED widget. Option `i` then holds the
-# key `"#opt:i"` in place of its value, and `values` holds the values
+# key `"#opt:i"` in place of its value and a `digest` of it, and `values` holds the values
 # (`nothing` for a plain widget). `wrap` gives the cell the value of a key. The values stay in the
 # worker (`_wire_params`), because the hub cannot read a type that the notebook defines.
 function _norm_options(options)
@@ -440,10 +440,15 @@ function _norm_options(options)
     # A key names the option's position, which a new worker gives the same option: a key made from
     # the value would change with it for a struct or a function the notebook defines.
     for (i, s) in enumerate(specs)
+        s["digest"] = _option_digest(s["value"])
         s["value"] = "#opt:$i"
     end
     return specs, labeled, vals
 end
+# What a keyed option's value is, for the hub's memo key, which reads the digest in place of the key
+# (`_memo_bind_value`): the content fingerprint the hub gives every value, else the hash, which may
+# change with the worker and then costs a recompute.
+_option_digest(v) = try; slate_fingerprint(v); catch; "h" * string(hash(v); base = 62); end
 # A plain option value: JSON writes it as a string or a number (see `_norm_options`).
 _plain_option(v) = v isa Union{AbstractString,Symbol,Bool,Char,Dates.TimeType} ||
                    (v isa Union{Integer,AbstractFloat} && isfinite(v))

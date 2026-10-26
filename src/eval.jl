@@ -1059,6 +1059,17 @@ _state_digest(v) = try; slate_fingerprint(v); catch; "?"; end
 # re-digests and one that hasn't is a dict lookup — the identity check is exactly the question being
 # asked, and cheap for the scalars controls carry.
 const _BIND_DIGEST_CACHE = Dict{Tuple{String,String},Tuple{Any,String}}()
+
+# The value a control's memo digest is made from. A keyed option widget holds a key, which names the
+# option's position and not its value, so the key stands in as the digest of the option it picks
+# (`_norm_options`): another list with another value at that position gives another memo key.
+function _memo_bind_value(b)
+    opts = get(b.params, "options", nothing)
+    (opts isa AbstractVector && any(o -> o isa AbstractDict && haskey(o, "digest"), opts)) || return b.value
+    dig(k) = (i = findfirst(o -> o isa AbstractDict && get(o, "value", nothing) == k, opts);
+              i === nothing ? k : String(opts[i]["digest"]))
+    return b.value isa AbstractVector ? map(dig, b.value) : dig(b.value)
+end
 function _bind_digest(rid::AbstractString, name::AbstractString, v)
     k = (String(rid), String(name))
     hit = lock(_STATE_DIGESTS_LOCK) do; get(_BIND_DIGEST_CACHE, k, nothing); end
@@ -1121,7 +1132,7 @@ function _memo_key(report::Report, cell::Cell)
     sdig = state_digests(report.id)
     svals = Tuple{String,String}[]
     for c in report.cells, b in c.binds
-        b.name in readnames && push!(svals, (string(b.name), _bind_digest(report.id, string(b.name), b.value)))
+        b.name in readnames && push!(svals, (string(b.name), _bind_digest(report.id, string(b.name), _memo_bind_value(b))))
     end
     if sdig !== nothing
         for n in readnames

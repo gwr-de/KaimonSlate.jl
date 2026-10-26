@@ -215,8 +215,8 @@ end
         @test findcell(r, "ctl").binds[1].value == spec.params["options"][2]["value"]
     end
 
-    # The memo key of a reader digests the bind value. A key is the hash of the option value, so a
-    # new option list that puts another value at the same position gives another memo key.
+    # The memo key of a reader digests the bind value. A key names a position, so the memo key takes
+    # the digest of the option value it picks: another value at the same position gives another key.
     @testset "keyed options: the memo key follows the option value" begin
         r = parse_report("#%% code id=ctl\n@bind pick Select(opts)\n#%% code id=use\nsum(length, pick)")
         build_dependencies!(r)
