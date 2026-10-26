@@ -1324,7 +1324,7 @@ end
                 @test "gpu" in last(NS._regions_in_use(hub))
 
                 # ▶ on the reader asks for the node: the force passes to the cell that needs it, and the
-                # reader runs again after it, waiting on what that run left. Its marker is then used up.
+                # reader runs again after it, waiting on what that run left. It keeps its marker while it waits.
                 lock(nb.lock) do; push!(get!(Set{String}, NS._FORCE_RUN, "waits"), "b"); end
                 lock(NS._RUNNER_LOCK) do; NS._RUNNERS["waits"] = true; end   # no runner spawned here
                 runb() = (RE.restale!(b); NS._eval_one!(nb, b))   # the runner takes up only stale cells
@@ -1335,7 +1335,7 @@ end
                     RE.mark_blocked!(a, NS.WAIT_QUEUED, "login", "gpu")           # as `a`'s run leaves it
                     runb()
                     @test b.state == RE.BLOCKED && b.blocked == NS.WAIT_QUEUED
-                    @test get(NS._FORCE_RUN, "waits", Set{String}()) == Set(["a"])
+                    @test get(NS._FORCE_RUN, "waits", Set{String}()) == Set(["a", "b"])
                     # Passed on once per run: an upstream that still waits after its run is not run again.
                     RE.mark_blocked!(a, NS.WAIT_NEEDS_PREPARE, "login", "gpu")
                     delete!(NS._FORCE_RUN, "waits"); push!(get!(Set{String}, NS._FORCE_RUN, "waits"), "b")
@@ -1349,12 +1349,12 @@ end
                     runb()
                     @test a.state == RE.STALE && get(NS._FORCE_RUN, "waits", Set{String}()) == Set(["a", "b"])
                     RE.mark_blocked!(a, NS.WAIT_NEEDS_PREPARE, "login", "gpu"); runb()
-                    # A queue wait is not helped by running anything; the marker is used up all the same.
+                    # A queue wait is not helped by running anything, so the force stays with the reader.
                     delete!(NS._FORCE_RUN, "waits")
                     RE.mark_blocked!(a, NS.WAIT_QUEUED, "login", "gpu")
                     push!(get!(Set{String}, NS._FORCE_RUN, "waits"), "b")
                     runb()
-                    @test a.state == RE.BLOCKED && !haskey(NS._FORCE_RUN, "waits")
+                    @test a.state == RE.BLOCKED && get(NS._FORCE_RUN, "waits", Set{String}()) == Set(["b"])
                     # A forced cell that errors before it reaches a kernel has had its run.
                     rep2 = RE.parse_report("#%% code id=e region=nosuchregion\n1\n")
                     nb2 = NS.LiveNotebook("errs", joinpath(mktempdir(), "errs.jl"), rep2, RE.InProcessKernel(), 1,

@@ -379,6 +379,21 @@ async function mockCatalog(page) {
 // Install every region/remote route interceptor on a page BEFORE navigating.
 async function mockRegions(page) {
   const J = (o) => ({ contentType: 'application/json', body: JSON.stringify(o) })
+  // The page reads the region registry and its workers from the hub's facts (model.js), one full frame on
+  // /api/facts and the same frame on the /api/facts/events stream, keyed `region/<name>`,
+  // `parked/<host>/<label>/<port>` and `worker/<nb>/<side>`. A full frame replaces every fact, so the
+  // mocked regions join the hub's own frame, which keeps the notebook's workers for the top-bar pill.
+  // The activity monitor probes the hosts those regions name.
+  const facts = async (r) => {
+    const hub = await r.fetch({ url: BASE + '/api/facts' }).then((x) => x.json()).catch(() => ({}))
+    const set = { ...(hub.set || {}) }
+    for (const g of REG_REGISTRY.regions) set['region/' + g.name] = { ...g, scheduler: 'none' }
+    for (const p of REG_REGISTRY.parked) set[`parked/${p.host}/${p.label}/${p.port}`] = p
+    return { t: 'facts', full: true, rev: hub.rev || 1, now: Date.now() / 1000, set }
+  }
+  await page.route('**/api/facts', async (r) => r.fulfill(J(await facts(r))))
+  await page.route('**/api/facts/events', async (r) =>
+    r.fulfill({ contentType: 'text/event-stream', body: 'data: ' + JSON.stringify(await facts(r)) + '\n\n' }))
   await page.route('**/api/regions', (r) => r.request().method() === 'GET' ? r.fulfill(J(REG_REGISTRY)) : r.continue())
   await page.route('**/api/remote-workers*', (r) => {
     const host = new URL(r.request().url()).searchParams.get('host') || ''
@@ -614,13 +629,12 @@ async function regionShots(browser) {
     await sleep(1800)                                        // let the activity monitor poll /api/regions
     await elShot(page, '#actmon', 'remote-activity.png')
 
-    // worker-detail popup — click a worker row (opens the CPU/RSS history popup)
+    // worker telemetry view — click a worker row (opens its telemetry view, actions above the charts)
     try {
       await page.locator('#actmon .actrow').first().click({ timeout: 3000 })
-      await page.waitForSelector('.wdhead', { timeout: 5000 })
-      await sleep(700)                                        // let the sparklines lay out
-      await page.evaluate(() => { const e = document.querySelector('.wdhead'); if (e && e.parentElement) e.parentElement.id = '__wdpop' })
-      await elShot(page, '#__wdpop', 'worker-detail.png')
+      await page.waitForSelector('.tm-card .tm-chart', { timeout: 8000 })
+      await sleep(900)                                        // let the charts lay out
+      await elShot(page, '.tm-card', 'worker-detail.png')
       await page.keyboard.press('Escape')
     } catch (e) { log('! worker-detail skipped:', e.message.split('\n')[0]) }
 
