@@ -4477,7 +4477,10 @@ function _forget_notebook_state!(nb::LiveNotebook)
     ReportEngine.forget_state_writes!(id)
     lock(_LBL_LOCK) do; delete!(_UNDO_LBL, id); delete!(_REDO_LBL, id); end
     lock(_CELL_STATS_LOCK) do; delete!(_CELL_STATS, id); end
-    lock(_WD_LOCK) do; delete!(_NB_HEALTH, id); delete!(_LAST_RUNNING, id); end
+    lock(_WD_LOCK) do
+        delete!(_NB_HEALTH, id); delete!(_LAST_RUNNING, id)
+        filter!(kv -> kv[1][1] != id, _UNHELD_RUNS)
+    end
     lock(_REGION_LOCK) do; filter!(kv -> kv[1][1] != id, _SETUP_FAILED); end
     delete!(_AGENT_TURN, id)
     return nothing

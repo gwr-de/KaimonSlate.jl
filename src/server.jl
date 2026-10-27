@@ -3060,20 +3060,56 @@ end
 # Ping every connected kernel: refresh the heartbeat, track failures, heal dead remote wires, and
 # stash the running cell ids, with which kernels answered, for the orphan reconciler. Runs every sweep (idle or busy) so a
 # wire that dies while nothing is running is still healed before the next cell is dispatched onto it.
-# One heartbeat: `(ok, the run and cell ids it is evaluating, the error)`.
+# One heartbeat: `(ok, the run and cell ids it is evaluating, the error, (run id, cell id) pairs)`.
 function _liveness_ping(k)
     t1 = time_ns()
     r = try
         ReportEngine._tool(k, "__slate_running", Dict{String,Any}(); timeout = _LIVENESS_PING_TIMEOUT)
     catch e
-        return (false, String[], e)
+        return (false, String[], e, Tuple{String,String}[])
     end
     _note_clock!(k, r, t1, time_ns())   # the heartbeat is already a round trip; measure it
     field(f) = r isa NamedTuple ? get(r, f, nothing) :
                r isa AbstractDict ? get(r, String(f), get(r, f, nothing)) : nothing
     run = field(:running)
-    run === nothing && return (false, String[], nothing)
-    return (true, String[String.(run); String.(collect(something(field(:runs), ())))], nothing)
+    run === nothing && return (false, String[], nothing, Tuple{String,String}[])
+    rids = String.(collect(something(field(:runs), ())))
+    # The worker lists both in the same order; an eval outside a run is registered under its file name.
+    pairs = length(rids) == length(run) ? collect(zip(rids, String.(run))) : Tuple{String,String}[]
+    return (true, String[String.(run); rids], nothing, pairs)
+end
+
+# A run the worker is still evaluating that no cell of this notebook holds any more: its wire dropped
+# and the hub let the cell go, or the cell was dispatched again, so its result would be thrown away and
+# it may be running the cell twice. Stopped once seen on two sweeps in a row, which leaves a run that is
+# starting or settling at that moment alone. Only this hub's runs (`_new_run_id`'s prefix) and only
+# cells of this notebook: a region worker can be shared with another hub.
+const _UNHELD_RUNS = Dict{Tuple{String,String},Int}()   # (nb id, run id) → sweeps seen unheld
+function _runs_to_stop!(nb::LiveNotebook, pairs)
+    prefix = "r" * ReportEngine._RUN_PREFIX[] * "-"
+    cells = nb.report.cells
+    held = Set{String}(c.run.id for c in cells if c.run !== nothing)
+    ids = Set{String}(c.id for c in cells)
+    unheld = [rid for (rid, cid) in pairs if startswith(rid, prefix) && cid in ids && !(rid in held)]
+    stop = lock(_WD_LOCK) do
+        for key in collect(keys(_UNHELD_RUNS))
+            key[1] == nb.id && !(key[2] in unheld) && delete!(_UNHELD_RUNS, key)
+        end
+        [rid for rid in unheld if (_UNHELD_RUNS[(nb.id, rid)] = get(_UNHELD_RUNS, (nb.id, rid), 0) + 1) >= 2]
+    end
+    return stop
+end
+function _stop_unheld_runs!(nb::LiveNotebook, k, pairs)
+    stop = _runs_to_stop!(nb, pairs)
+    isempty(stop) && return nothing
+    ReportEngine._rlog("liveness: stopping $(length(stop)) run(s) on $(nb.id)/$(_kernel_side_label(nb, k)) " *
+                       "that no cell holds: $(join(stop, ", "))")
+    Threads.@spawn try
+        ReportEngine._tool(k, "__slate_cancel_cells", Dict{String,Any}("ids" => stop); timeout = 30.0)
+    catch e
+        ReportEngine._rlog("liveness: stopping unheld runs failed: " * first(sprint(showerror, e), 160))
+    end
+    return nothing
 end
 
 # `replies` are the answers `_ping_workers` collected for the whole pass; a worker without one is
@@ -3098,9 +3134,10 @@ function _liveness_sweep!(nb::LiveNotebook; replies = nothing)
         push!(pings, pre === nothing ? (k, k.conn, Threads.@spawn _liveness_ping(k)) : (k, pre...))
     end
     for (k, conn0, t) in pings
-        ok, got, err = t isa Task ? fetch(t) : t
+        ok, got, err, pairs = t isa Task ? fetch(t) : t
         if ok
             union!(ids, got)
+            _stop_unheld_runs!(nb, k, pairs)
             push!(answered, _kernel_side_label(nb, k))
         end
         if ok && haskey(_KERNEL_BUSY_SINCE, k)

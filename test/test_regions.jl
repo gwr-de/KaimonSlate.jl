@@ -2907,3 +2907,18 @@ end
     @test t0 != t1 && t1 != t2
     @test NS._transfer_token(nb, reader, w, :level, "", Dict("other" => "d9")) == t0   # another name's identity
 end
+
+@testset "a worker run no cell holds is stopped, after two sweeps" begin
+    r = RE.parse_report("#%% code id=a\nx = 1\n#%% code id=b\ny = 2\n")
+    RE.build_dependencies!(r)
+    nb = NS.LiveNotebook("unheld", tempname() * ".jl", r, RE.InProcessKernel(), 0, String[], String[],
+                         ReentrantLock(), Channel{String}[], ReentrantLock(), "", false, Dict{String,String}())
+    held = RE._new_run_id(); stray = RE._new_run_id()
+    r.byid["a"].run = RE.Run(held, r.byid["a"].src_hash, "", :dispatched, false, 0.0, time(), 0.0, nothing, 0, 0)
+    pairs = [(held, "a"), (stray, "b"), ("rOTHERHUB-1", "b"), ("x#prime", "x#prime")]
+    @test isempty(NS._runs_to_stop!(nb, pairs))                     # first sight: could be settling
+    @test NS._runs_to_stop!(nb, pairs) == [stray]                   # still unheld: stopped
+    # A run that is held again (or gone) is forgotten, so it starts counting from zero.
+    @test isempty(NS._runs_to_stop!(nb, [(held, "a")]))
+    @test isempty(NS._runs_to_stop!(nb, [(stray, "b")]))
+end
