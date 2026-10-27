@@ -4120,8 +4120,9 @@ function export_app(nb::LiveNotebook, dir::AbstractString; appdefaults::Abstract
     # A workbook saves the student's answers over the notebook it ships, so the exercises as the
     # author wrote them have to survive somewhere else — this copy is what the Reset button reads
     # (`_workbook_stub_path`). Dotfile-named so it doesn't read as a second notebook to open.
-    workbook && write(joinpath(d, "." * bname * ".original"),
-                      export_standalone(nb; history = false, include = String[]))
+    # Reset reads only cell sources from it, so it is the plain notebook text, without the bundle,
+    # memo results or preview the shipped copy carries.
+    workbook && write(joinpath(d, "." * bname * ".original"), serialize_report(nb.report))
     write(joinpath(d, _SITE_RUNJL), _run_script(""; agent = agent, bundle_name = bname,
                                                 app = true, workbook = workbook,
                                                 appdefaults = appdefaults, port = Int(port),
@@ -5359,7 +5360,7 @@ const _TEX_MACRO = Dict(
     "neq"=>"≠","approx"=>"≈","sim"=>"∼","simeq"=>"≃","equiv"=>"≡","propto"=>"∝","infty"=>"∞","partial"=>"∂",
     "nabla"=>"∇","int"=>"∫","sum"=>"∑","prod"=>"∏","sqrt"=>"√","angle"=>"∠","rightarrow"=>"→","to"=>"→",
     "leftarrow"=>"←","Rightarrow"=>"⇒","mapsto"=>"↦","langle"=>"⟨","rangle"=>"⟩","ldots"=>"…","cdots"=>"⋯",
-    "in"=>"∈","notin"=>"∉","forall"=>"∀","exists"=>"∃","hbar"=>"ℏ","ell"=>"ℓ","circ"=>"∘","cap"=>"∩",
+    "in"=>"∈","notin"=>"∉","div"=>"÷","dots"=>"…","subset"=>"⊂","forall"=>"∀","exists"=>"∃","hbar"=>"ℏ","ell"=>"ℓ","circ"=>"∘","cap"=>"∩",
     "cup"=>"∪",  # function names keep their letters (drop only the backslash); unknown macros are dropped
     "cos"=>"cos","sin"=>"sin","tan"=>"tan","sec"=>"sec","csc"=>"csc","cot"=>"cot","sinh"=>"sinh",
     "cosh"=>"cosh","tanh"=>"tanh","log"=>"log","ln"=>"ln","exp"=>"exp","lim"=>"lim","min"=>"min",
@@ -5368,7 +5369,7 @@ const _TEX_SUP = Dict{Char,Char}(zip("0123456789+-=()ni", "⁰¹²³⁴⁵⁶⁷
 const _TEX_SUB = Dict{Char,Char}(zip("0123456789+-=()", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎"))
 # `^{…}`/`^x` (or `_…`) → Unicode only when EVERY char maps, else the bare body (e.g. `x^{2θ}` → `x2θ`).
 _tex_script(m, sub) = (b = replace(m, r"^[\^_]\{?" => "", "}" => "");
-                       (!isempty(b) && all(c -> haskey(sub, c), b)) ? String([sub[c] for c in b]) : b)
+                       isempty(b) ? b : something(_tex_mapscript(b, sub), b))   # export_typst.jl
 function _demath(s::AbstractString)
     t = String(s)
     ('$' in t || occursin("\\(", t) || occursin("\\[", t)) || return t   # no inline maths → untouched

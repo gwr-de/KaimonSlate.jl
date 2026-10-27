@@ -1199,21 +1199,8 @@ _tex_accent_sub(m::AbstractString) =
     (mm = match(r"\\([`'^\"~=.cvuHkrbd])\s*\{?\s*([A-Za-z])\}?", m);
      mm === nothing ? m : Base.Unicode.normalize(string(mm.captures[2], _TEX_ACCENT[mm.captures[1][1]]), :NFC))
 
-# Common LaTeX math commands → their Unicode glyph (decoded only INSIDE `$…$`, so an operator like
-# `\cdot` isn't confused with the `\c` cedilla accent, and Greek/ops in titles render). Word commands,
-# matched with a trailing non-letter boundary; longer names win by that boundary (`\cdots` vs `\cdot`).
-const _TEX_CMD = ["cdots" => "⋯", "cdot" => "·", "times" => "×", "div" => "÷", "pm" => "±", "mp" => "∓",
-    "leq" => "≤", "geq" => "≥", "neq" => "≠", "approx" => "≈", "equiv" => "≡", "sim" => "∼", "propto" => "∝",
-    "infty" => "∞", "ldots" => "…", "dots" => "…", "rightarrow" => "→", "leftarrow" => "←", "to" => "→",
-    "partial" => "∂", "nabla" => "∇", "sum" => "∑", "prod" => "∏", "int" => "∫", "sqrt" => "√", "in" => "∈",
-    "subset" => "⊂", "cup" => "∪", "cap" => "∩", "varepsilon" => "ε", "epsilon" => "ε", "varphi" => "φ",
-    "alpha" => "α", "beta" => "β", "gamma" => "γ", "delta" => "δ", "zeta" => "ζ", "eta" => "η", "theta" => "θ",
-    "iota" => "ι", "kappa" => "κ", "lambda" => "λ", "mu" => "μ", "nu" => "ν", "xi" => "ξ", "rho" => "ρ",
-    "sigma" => "σ", "tau" => "τ", "phi" => "φ", "chi" => "χ", "psi" => "ψ", "omega" => "ω", "pi" => "π",
-    "Gamma" => "Γ", "Delta" => "Δ", "Theta" => "Θ", "Lambda" => "Λ", "Xi" => "Ξ", "Pi" => "Π", "Sigma" => "Σ",
-    "Phi" => "Φ", "Psi" => "Ψ", "Omega" => "Ω"]
-const _TEX_SUP = Dict('0'=>'⁰','1'=>'¹','2'=>'²','3'=>'³','4'=>'⁴','5'=>'⁵','6'=>'⁶','7'=>'⁷','8'=>'⁸','9'=>'⁹','+'=>'⁺','-'=>'⁻','='=>'⁼','('=>'⁽',')'=>'⁾','n'=>'ⁿ','i'=>'ⁱ')
-const _TEX_SUB = Dict('0'=>'₀','1'=>'₁','2'=>'₂','3'=>'₃','4'=>'₄','5'=>'₅','6'=>'₆','7'=>'₇','8'=>'₈','9'=>'₉','+'=>'₊','-'=>'₋','='=>'₌','('=>'₍',')'=>'₎')
+# Math commands, super/subscripts: `_TEX_MACRO`, `_TEX_SUP`, `_TEX_SUB` (server_export.jl), shared with `_demath`.
+
 # Map every char of `s` through `tbl` (super/subscript), or `nothing` if any char has no mapping.
 function _tex_mapscript(s, tbl)
     io = IOBuffer()
@@ -1226,9 +1213,9 @@ _tex_script_sub(m::AbstractString, tbl) =
 # Decode a `$…$` math span (the `$` are dropped): operators/Greek, then super/subscripts.
 function _tex_math_sub(m::AbstractString)
     inner = String(SubString(m, nextind(m, firstindex(m)), prevind(m, lastindex(m))))
-    for (cmd, ch) in _TEX_CMD
-        inner = replace(inner, Regex("\\\\" * cmd * "(?![A-Za-z])") => ch)
-    end
+    # Decoded only INSIDE `$…$`, so an operator like `\cdot` isn't read as the `\c` cedilla accent. A whole
+    # word is matched, so `\cdots` is not `\cdot` + `s`; an unknown command stays as written.
+    inner = replace(inner, r"\\[A-Za-z]+" => m -> get(_TEX_MACRO, String(m)[2:end], m))
     inner = replace(inner, r"\^\{[^{}]+\}" => x -> _tex_script_sub(x, _TEX_SUP))
     inner = replace(inner, r"\^[A-Za-z0-9+\-]" => x -> _tex_script_sub(x, _TEX_SUP))
     inner = replace(inner, r"_\{[^{}]+\}" => x -> _tex_script_sub(x, _TEX_SUB))

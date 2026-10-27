@@ -904,6 +904,89 @@ function run_capture(mod::Module, source::AbstractString, filename::AbstractStri
     tracesink = _ns_defined(mod, :__slate_trace_sink) ? _ns_read(mod, :__slate_trace_sink) : nothing
     tracesink === nothing || (tracesink[] = nothing)
 
+    # The return value renders INSIDE this eval's capture and execution context (`render_value!`, called
+    # at the end of the eval below): a `show` that prints, logs or calls `display` lands in the cell's
+    # own streams, and teardown it registers with `slate_on_cleanup` belongs to this cell.
+    # A cell whose last code line ends in `;` is "quiet": its RETURN value is not displayed (as in the
+    # REPL / Jupyter); stdout and explicit `display(…)` calls still show.
+    quiet = _is_quiet_cell(source)
+    echarts = Any[]
+    tables = Any[]
+    animations = Any[]
+    assets = Any[]
+    value_repr = ""
+    overflow = NamedTuple[]                       # full results saved to disk for "open full output"
+    function render_value!()
+        # Capture the return value: an ECharts spec / a table are kept raw (reduced to
+        # JSON-safe primitives here but JSON-*encoded* server-side, dodging JSON
+        # world-age in the eval frame); otherwise the richest MIME. The table check
+        # precedes rich MIME so a DataFrame renders as our interactive table rather
+        # than its own `text/html` show method.
+        # Generated assets the cell registered (`save_asset`), deduped by content path, are taken AFTER the
+        # render, since a package's `show` / `slate_render` may save one. The `finally` takes them even when
+        # the render throws: the task is reused, so the sink must not outlive this eval.
+        if value !== nothing && !quiet
+            try
+                # A bare Matrix/SparseMatrixCSC/structured-LinearAlgebra return auto-renders via
+                # slate_matrix (KaTeX / dotted notation / downsampled heatmap, picked by size and
+                # type) instead of dumping the terminal grid below — replace, then fall through the
+                # SAME dispatch (a heatmap comes back as an EChart; the KaTeX forms fall to the
+                # generic rich-MIME branch below via their `show(io, MIME"text/latex", …)` method).
+                # …EXCEPT when the matrix already knows how to typeset itself. A package whose
+                # element type carries its own `show(io, MIME"text/latex", ::AbstractArray{T})`
+                # (e.g. `Matrix{Sym}` from SymPy/SymPyCore) renders exact symbolic entries that
+                # `_matrix_texnum` cannot format at all — hijacking it discards the better
+                # rendering AND throws a MethodError from inside `show`, where the `try` above
+                # can no longer help. Defer to the value's own LaTeX in that case.
+                if value isa AbstractMatrix &&
+                   !(try Base.invokelatest(showable, MIME"text/latex"(), value) catch; false end)
+                    value = try; Base.invokelatest(slate_matrix, value); catch; value; end
+                end
+                if (try Base.invokelatest(_capture_gallery!, chunks, value) catch; false end)
+                    # a collection of figures, laid out together
+                elseif value isa EChart
+                    push!(echarts, value.option)
+                elseif value isa Animation
+                    push!(animations, (manifest = value.manifest, frames = value.frames, lut = value.lut))
+                elseif (st = (try Base.invokelatest(_as_slate_table, value) catch; nothing end)) !== nothing
+                    push!(tables, _table_wire(st))
+                elseif value isa NamedTuple && (rec = (try Base.invokelatest(record_html, value) catch; nothing end)) !== nothing
+                    # A NamedTuple of results reads as a grid of fields (record_display.jl).
+                    push!(chunks, (_RECORD_SLATE_HTML, Vector{UInt8}(rec)))
+                    # Keep the value against this cell so a field can later be opened in its own right
+                    # (a matrix in its real `slate_matrix` rendering). `filename` is "cell:<id>".
+                    startswith(filename, "cell:") &&
+                        (try Base.invokelatest(record_remember!, filename[6:end], value) catch; end)
+                else
+                    try
+                        Base.invokelatest(_capture_rich!, chunks, value)
+                    catch
+                    end
+                end
+            finally
+                assets = _harvest_assets(get(task_local_storage(), :slate_assets, nothing))
+                delete!(task_local_storage(), :slate_assets)
+            end
+        else
+            assets = _harvest_assets(get(task_local_storage(), :slate_assets, nothing))
+            delete!(task_local_storage(), :slate_assets)
+        end
+
+        # text/plain repr — skipped when richer output exists (the renderer suppresses
+        # it anyway), and `invokelatest`-guarded for the world-age reason. A NamedTuple keeps it beside
+        # its record grid: the page shows the grid, and an agent reading the result gets the numbers.
+        if value !== nothing && !quiet && (isempty(chunks) || value isa NamedTuple) && isempty(echarts) && isempty(tables) && isempty(animations)
+            try
+                # `:displaysize` bounds how much `show` even generates for big containers (≈40 rows),
+                # then `_cap_keep!` is the hard ceiling for anything still huge (e.g. a giant String value).
+                value_repr = Base.invokelatest(sprint, show, MIME("text/plain"), value;
+                                               context = (:limit => true, :displaysize => (40, 160)))
+                value_repr = _cap_keep!(overflow, "value", value_repr, "txt")
+            catch
+            end
+        end
+    end
+
     value = nothing
     err = nothing
     btrace = nothing
@@ -920,6 +1003,7 @@ function run_capture(mod::Module, source::AbstractString, filename::AbstractStri
         _logger = _CellLogger(Logging.ConsoleLogger(_logio(capture)), _progress_sink(mod), cid)
         Logging.with_logger(_logger) do
             value = _eval_cell_source(mod, source, filename)
+            render_value!()
         end
     catch e
         err = e
@@ -931,6 +1015,9 @@ function run_capture(mod::Module, source::AbstractString, filename::AbstractStri
         delete!(task_local_storage(), :slate_cell)
         delete!(task_local_storage(), :slate_replay_seq)
     end
+    # An eval that threw never reached `render_value!`, whose `finally` takes the asset sink.
+    haskey(task_local_storage(), :slate_assets) &&
+        (assets = _harvest_assets(task_local_storage(:slate_assets)); delete!(task_local_storage(), :slate_assets))
     binds = copy(get(task_local_storage(), :__slate_binds, NamedTuple[]))
     delete!(task_local_storage(), :__slate_binds)
     # Harvest the cell-effect declarations: resolve each record's statement index → its deparsed source
@@ -943,7 +1030,6 @@ function run_capture(mod::Module, source::AbstractString, filename::AbstractStri
     # Trace rows the cell recorded (empty unless it was `@trace`-wrapped). JSON-safe Dicts, like `tables`.
     trace = (tracesink === nothing || tracesink[] === nothing) ? Any[] : _trace_wire(tracesink[])
     tracesink === nothing || (tracesink[] = nothing)
-    overflow = NamedTuple[]                       # full results saved to disk for "open full output"
     # Replay in-place redraws (`\r`, backspace, cursor moves) BEFORE capping, so a progress bar reads
     # as the one line it was drawn as instead of a cascade of frames — and so those frames don't eat
     # the character budget. Cooking happens here, once, at the point the streams become the wire form,
@@ -953,96 +1039,6 @@ function run_capture(mod::Module, source::AbstractString, filename::AbstractStri
     stderr_str = _cap_keep!(overflow, "stderr", cook_terminal(raw_err), "txt")
     dur_ms = (time_ns() - t0) / 1e6
 
-    # Capture the return value: an ECharts spec / a table are kept raw (reduced to
-    # JSON-safe primitives here but JSON-*encoded* server-side, dodging JSON
-    # world-age in the eval frame); otherwise the richest MIME. The table check
-    # precedes rich MIME so a DataFrame renders as our interactive table rather
-    # than its own `text/html` show method.
-    # A cell whose last code line ends in `;` is "quiet" — suppress the RETURN
-    # value's display (like the REPL / Jupyter). stdout and explicit `display(…)`
-    # calls (already in `chunks`) still show.
-    quiet = _is_quiet_cell(source)
-    echarts = Any[]
-    tables = Any[]
-    animations = Any[]
-    # Generated assets the cell registered (empty unless it called `save_asset`), deduped by content
-    # path. Taken AFTER the return-value render rather than before it: a package's `show` /
-    # `slate_render` method runs inside that block, so a render saving an asset used to find the sink
-    # already gone and got back a path the page could not resolve. Both branches below take it, and the
-    # render's own `finally` is what guarantees the take even when the render throws — the sink must not
-    # outlive this eval, because the task is reused and a later handler would harvest into a cell that
-    # has already finished.
-    assets = Any[]
-    if err === nothing && value !== nothing && !quiet
-        # Re-establish this eval's execution context around the RETURN VALUE's rich render. The value's
-        # `show` runs HERE — AFTER the eval's `finally` already cleared `:slate_ctx`/`:slate_cell` — but a
-        # package `show` method (e.g. a Bonito figure's `setup_connection`) registers per-cell teardown via
-        # `slate_on_cleanup`, which is a no-op without the context. Set it for the render, clear it after
-        # (finally), so a re-run of the cell actually tears down what the LAST render allocated (a live
-        # session, a subscription) instead of leaking it. Explicit `display(…)` during the eval already
-        # ran inside the context; only the trailing return-value render falls outside it.
-        slate_ctx === nothing || (task_local_storage(:slate_ctx, slate_ctx); task_local_storage(:slate_cell, cid))
-        try
-            # A bare Matrix/SparseMatrixCSC/structured-LinearAlgebra return auto-renders via
-            # slate_matrix (KaTeX / dotted notation / downsampled heatmap, picked by size and
-            # type) instead of dumping the terminal grid below — replace, then fall through the
-            # SAME dispatch (a heatmap comes back as an EChart; the KaTeX forms fall to the
-            # generic rich-MIME branch below via their `show(io, MIME"text/latex", …)` method).
-            # …EXCEPT when the matrix already knows how to typeset itself. A package whose
-            # element type carries its own `show(io, MIME"text/latex", ::AbstractArray{T})`
-            # (e.g. `Matrix{Sym}` from SymPy/SymPyCore) renders exact symbolic entries that
-            # `_matrix_texnum` cannot format at all — hijacking it discards the better
-            # rendering AND throws a MethodError from inside `show`, where the `try` above
-            # can no longer help. Defer to the value's own LaTeX in that case.
-            if value isa AbstractMatrix &&
-               !(try Base.invokelatest(showable, MIME"text/latex"(), value) catch; false end)
-                value = try; Base.invokelatest(slate_matrix, value); catch; value; end
-            end
-            if (try Base.invokelatest(_capture_gallery!, chunks, value) catch; false end)
-                # a collection of figures, laid out together
-            elseif value isa EChart
-                push!(echarts, value.option)
-            elseif value isa Animation
-                push!(animations, (manifest = value.manifest, frames = value.frames, lut = value.lut))
-            elseif (st = (try Base.invokelatest(_as_slate_table, value) catch; nothing end)) !== nothing
-                push!(tables, _table_wire(st))
-            elseif value isa NamedTuple && (rec = (try Base.invokelatest(record_html, value) catch; nothing end)) !== nothing
-                # A NamedTuple of results reads as a grid of fields (record_display.jl).
-                push!(chunks, (_RECORD_SLATE_HTML, Vector{UInt8}(rec)))
-                # Keep the value against this cell so a field can later be opened in its own right
-                # (a matrix in its real `slate_matrix` rendering). `filename` is "cell:<id>".
-                startswith(filename, "cell:") &&
-                    (try Base.invokelatest(record_remember!, filename[6:end], value) catch; end)
-            else
-                try
-                    Base.invokelatest(_capture_rich!, chunks, value)
-                catch
-                end
-            end
-        finally
-            slate_ctx === nothing || (delete!(task_local_storage(), :slate_ctx); delete!(task_local_storage(), :slate_cell))
-            assets = _harvest_assets(get(task_local_storage(), :slate_assets, nothing))
-            delete!(task_local_storage(), :slate_assets)
-        end
-    else
-        assets = _harvest_assets(get(task_local_storage(), :slate_assets, nothing))
-        delete!(task_local_storage(), :slate_assets)
-    end
-
-    # text/plain repr — skipped when richer output exists (the renderer suppresses
-    # it anyway), and `invokelatest`-guarded for the world-age reason. A NamedTuple keeps it beside
-    # its record grid: the page shows the grid, and an agent reading the result gets the numbers.
-    value_repr = ""
-    if err === nothing && value !== nothing && !quiet && (isempty(chunks) || value isa NamedTuple) && isempty(echarts) && isempty(tables) && isempty(animations)
-        try
-            # `:displaysize` bounds how much `show` even generates for big containers (≈40 rows),
-            # then `_cap_keep!` is the hard ceiling for anything still huge (e.g. a giant String value).
-            value_repr = Base.invokelatest(sprint, show, MIME("text/plain"), value;
-                                           context = (:limit => true, :displaysize => (40, 160)))
-            value_repr = _cap_keep!(overflow, "value", value_repr, "txt")
-        catch
-        end
-    end
     # A cell's runtime error may still arrive wrapped in a LoadError (defensive — unwrap to the
     # REAL error: UndefVarError, DomainError, …). Parse errors arrive as `ParseError` directly.
     realerr = err isa LoadError ? err.error : err

@@ -565,6 +565,10 @@ x = 1
         @test NS._delatex(raw"The Pseudoprimes to $25 \cdot 10^9$") == "The Pseudoprimes to 25 · 10⁹"
         @test NS._delatex(raw"$10^{27}$ and $\alpha_2$") == "10²⁷ and α₂"
         @test NS._delatex(raw"snake_case stays") == "snake_case stays"   # `_` outside math untouched
+        # The live card and the plain-text blurb decode a command the same way; an unknown one the card
+        # keeps as written, the blurb drops.
+        @test NS._delatex(raw"$a \div b, \forall x \vartheta, \cdots \foo$") == raw"a ÷ b, ∀ x ϑ, ⋯ \foo"
+        @test strip(NS._demath(raw"$a \div b, \forall x \vartheta$")) == "a ÷ b, ∀ x ϑ"
         # state_json ships the key list for [@-autocomplete; the cell renders a card, not raw BibTeX
         nb = _mknb("#%% md id=refs bibliography\n@book{knuth1984, author={Knuth}, title={TeX}}\n")
         sj = NS.state_json(nb)
