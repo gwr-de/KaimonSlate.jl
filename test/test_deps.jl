@@ -24,6 +24,15 @@ ReportEngine.module_help(::CountingKernel, ::ReportEngine.Report, ::AbstractStri
 
 @testset "ReportEngine deps" begin
 
+    @testset "an edit keeps what an unchanged cell declared about itself" begin
+        r = parse_report("#%% code id=host\nh = 1\n#%% code id=other\no = 2\n")
+        build_dependencies!(r)
+        push!(r.byid["host"].flags, :volatile_declared, :everywhere_declared)
+        update_source!(r, "#%% code id=host\nh = 1\n#%% code id=other\no = 3\n")   # someone else edited
+        @test :volatile_declared in r.byid["host"].flags && :everywhere_declared in r.byid["host"].flags
+        update_source!(r, "#%% code id=host\nh = 2\n#%% code id=other\no = 3\n")   # its own source changed
+        @test !(:volatile_declared in r.byid["host"].flags)
+    end
     @testset "binding inference: reads / writes" begin
         c = Cell("c", CODE, "y = x + 1"); infer_bindings!(c)
         @test :y in c.writes

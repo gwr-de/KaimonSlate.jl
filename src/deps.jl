@@ -1266,6 +1266,11 @@ function update_source!(report::Report, new_source::AbstractString)
             nc.blocked_at = oc.blocked_at
             nc.blocked_host = oc.blocked_host
             nc.blocked_region = oc.blocked_region
+            # What the cell's last run declared about itself (`slate_effect`): the same source declares
+            # the same, and re-parsing would otherwise drop it until the notebook is next opened.
+            for fl in (:everywhere_declared, :volatile_declared)
+                fl in oc.flags && !(fl in nc.flags) && push!(nc.flags, fl)
+            end
         else
             nc.state = STALE
             nc.run === nothing || (nc.run.rerun = true)   # whatever the old source's run ends in, this one runs
