@@ -3670,15 +3670,13 @@ function teardown_remote!(k; kill::Bool = false)
         if k.port == 0                # nothing was spawned — only local resources to release
             _rlog("teardown: closing tunnel + sync on $(t.ssh_host) (no worker was spawned)")
         elseif kill
-            # Only kill a worker we actually spawned (port assigned). pkill exits nonzero when nothing
-            # matches — a normal outcome, not a failure — so route it through the quiet predicate, not _ssh_ok.
+            # Only kill a worker we actually spawned (port assigned), and through the one remote-kill path:
+            # `reap_remote_worker` escalates SIGTERM to SIGKILL, so a wedged worker cannot outlive its
+            # sidecars and keep its ports bound, and it drops the wires and tunnels that pointed at it.
             _rlog("teardown: closing tunnel + sync, killing remote worker-$(k.port).jl on $(t.ssh_host)")
-            try; _run_on(t.ssh_host, "pkill -u \"\$USER\" -f " * Sweep.shq("[w]orker-$(k.port)\\.jl")); catch; end
-            try; _ssh_test(t.ssh_host, `rm -f $("$_REMOTE_WORKER/worker-$(k.port).jl") $("$_REMOTE_WORKER/worker-$(k.port).json") $("$_REMOTE_WORKER/worker-$(k.port).state") $("$_REMOTE_WORKER/worker-$(k.port).stats")`); catch; end
-            try; _attach_clear!(t.ssh_host, k.label); catch; end   # a killed worker must not be re-dialed from the record
-            try; _evict_parked!(t.ssh_host; label = k.label, port = k.port); catch; end   # …nor via a parked wire
-            try; _evict_data_tunnels!(t.ssh_host; port = _blob_data_port_cached(t.ssh_host, k.port)); catch; end   # real port (relocated tunnel workers)
-            try; _blob_dport_forget!(t.ssh_host, k.port); catch; end
+            try; reap_remote_worker(t.ssh_host, k.port); catch; end
+            try; _attach_clear!(t.ssh_host, k.label); catch; end   # reap clears by port; the record is by label too
+            try; _evict_parked!(t.ssh_host; label = k.label, port = k.port); catch; end
         else
             _rlog("teardown: detaching from worker-$(k.port) on $(t.ssh_host) — worker stays warm (state=idle)")
             _write_worker_state!(t.ssh_host, k.port, "idle")

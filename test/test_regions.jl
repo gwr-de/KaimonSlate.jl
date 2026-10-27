@@ -847,6 +847,20 @@ end
                 end
             end
 
+            @testset "a teardown kill ends a worker that ignores SIGTERM" begin
+                mktempdir() do home
+                    cd(home) do
+                        d = joinpath(home, RE._REMOTE_WORKER); mkpath(d)
+                        port = 59873
+                        for x in ("jl", "json", "state", "stats"); write(joinpath(d, "worker-$port.$x"), "x"); end
+                        proc = run(`sh -c "trap '' TERM; sleep 60; true" worker-$port.jl`; wait = false)
+                        RE.teardown_remote!((tunnel = nothing, target = RE.RemoteTarget(""), port = port, label = "nb"); kill = true)
+                        @test timedwait(() -> !process_running(proc), 5.0; pollint = 0.05) === :ok
+                        @test !any(isfile(joinpath(d, "worker-$port.$x")) for x in ("jl", "json", "state", "stats"))
+                    end
+                end
+            end
+
             @testset "the scheduler-use view reads the history a host's commands left" begin
                 withenv("KAIMONSLATE_CACHE_HOME" => mktempdir()) do
                     p = RE.Sweep._sched_history_path(); mkpath(dirname(p))
