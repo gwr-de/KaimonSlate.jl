@@ -1001,6 +1001,10 @@ function cell_json(c::Cell, bindref::Dict{String,Tuple{Cell,BindSpec}} = Dict{St
         _rewrite_citations(c.source, bibctx === nothing ? Set{String}() : Set(keys(bibctx.tips));
                            emit = bibctx === nothing ? _cite_literal : _cite_link_emit(bibctx),
                            figrefs = figrefs, figemit = _fig_link_emit) : c.source
+    # A relative image path names a file in the project; the page loads it through this notebook's
+    # asset route (`_local_media`).
+    c.kind == MARKDOWN && report !== nothing &&
+        (_mdsrc = _local_media(_mdsrc, nbid, String(get(report.meta, "assetbase", ""))))
     d = Dict{String,Any}(
         "id"      => c.id,
         # How recent this payload is. The same cell reaches the browser over two transports, and

@@ -460,6 +460,36 @@ _nb_with_echart(spec, id) = begin
         ReentrantLock(), Channel{String}[], ReentrantLock(), "", false, Dict{String,String}())
 end
 
+# A markdown image written as a path relative to the project, the way most people write one, loads
+# through the notebook's asset route and travels into every export as a dropped file does (#79).
+@testset "a relative image path in markdown names a project file" begin
+    root = mktempdir(); mkpath(joinpath(root, "figures"))
+    png = UInt8[0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]
+    write(joinpath(root, "figures", "logo.png"), png)
+    write(joinpath(root, "figures", "a b.png"), png)
+    lm(s) = NS._local_media(s, "rel", root)
+    @test lm("![x](figures/logo.png){width=240}") == "![x](/n/rel/asset/figures/logo.png){width=240}"
+    @test lm("![x](./figures/logo.png)") == "![x](/n/rel/asset/figures/logo.png)"
+    @test lm("![x](figures/a%20b.png)") == "![x](/n/rel/asset/figures/a%20b.png)"
+    @test lm("<img src=\"figures/logo.png\" width=\"80\">") == "<img src=\"/n/rel/asset/figures/logo.png\" width=\"80\">"
+    # Not a project file, or not a relative image: left as written.
+    @test all(s -> lm(s) == s, ("![x](figures/missing.png)", "![x](https://e.org/a.png)",
+                                "![x](data:image/png;base64,AA==)", "![x](/n/other/asset/figures/logo.png)",
+                                "![x](../outside.png)", "<script src=\"figures/logo.png\"></script>"))
+
+    rep = _RE.parse_report("#%% md id=t title\n# rel\n\n#%% md id=m\n![logo](figures/logo.png){width=240}\n")
+    rep.meta["assetbase"] = root
+    nb = NS.LiveNotebook("rel", joinpath(root, "rel.jl"), rep, _RE.InProcessKernel(), 1, String[], String[],
+        ReentrantLock(), Channel{String}[], ReentrantLock(), "", false, Dict{String,String}())
+    # Live: the page loads it through this notebook's route, under whatever id it is served at.
+    @test occursin("src=\"/n/rel/asset/figures/logo.png\"", NS.cell_json(rep.cells[2]; nbid = "rel", report = rep)["output"])
+    # A standalone page inlines it; a published one keeps it as a sibling file; a bundle carries it.
+    standalone = NS.export_html(nb; inline_assets = true)
+    @test occursin("src=\"data:image/png;base64,", standalone) && !occursin("figures/logo.png", standalone)
+    @test occursin("src=\"figures/logo.png\"", NS.export_html(nb; inline_assets = false))
+    @test haskey(NS._embedded_asset_files(rep.cells, root), "figures/logo.png")
+end
+
 # A dropped clip lands in a markdown cell as `<video src="/n/<id>/asset/…">`. A standalone page has no
 # server to serve it from and a media element can't seek a `data:` URL — so the bytes must leave the body
 # for the blob registry. A published page keeps its sibling file, which HTTP can range-request.

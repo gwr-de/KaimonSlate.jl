@@ -19,6 +19,9 @@ were written when they went out. They are marked.
   otherwise the figure stays as exported and the browser console names the marks. A figure could
   show data from different control positions when one mark's sweep failed or was exported at a
   different stride. (#64, reported by @disberd)
+- A markdown image with a relative path, such as `![logo](figures/logo.png)`, loads in the notebook
+  and travels into every export. The path names a file in the notebook's project folder, as
+  `@asset`'s paths do; it used to resolve against the page's address and come back missing. (#79)
 
 ## [1.12.1] - 2026-10-26
 

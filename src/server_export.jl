@@ -955,6 +955,35 @@ function _asset_abspath(assetbase::AbstractString, rel::AbstractString)
     (p !== nothing && isfile(p)) ? p : nothing
 end
 
+# A markdown image, or the `src` of an <img>/<video>/<audio>/<source> tag in markdown, that names a file
+# in the notebook's project by a relative path, pointed at the notebook's asset route. Relative paths
+# resolve against the project dir, as `@asset`'s do. Every reader of markdown knows that route: the live
+# page loads it, and the exports inline it, copy it beside a page or stage it for Typst. The author's
+# source keeps the relative path, and a target that names no file in the project is left as written.
+const _LOCAL_MD_IMG_RE  = r"(!\[[^\]]*\]\(\s*)([^)\s]+)"
+const _LOCAL_TAG_SRC_RE = r"(<(?:img|video|audio|source)\b[^>]*?\bsrc=)([\"'])([^\"']+)\2"i
+_is_relative_ref(u::AbstractString) =
+    !isempty(u) && !startswith(u, "/") && !startswith(u, "#") && !occursin(r"^[A-Za-z][A-Za-z0-9+.-]*:", u)
+function _local_media(src::AbstractString, nbid::AbstractString, assetbase::AbstractString)
+    s = String(src)
+    (isempty(nbid) || isempty(assetbase)) && return s
+    (occursin("![", s) || occursin(r"<(?:img|video|audio|source)\b"i, s)) || return s
+    route(u) = begin
+        _is_relative_ref(u) || return nothing
+        rel = HTTP.URIs.unescapeuri(startswith(u, "./") ? u[3:end] : u)
+        _asset_abspath(assetbase, rel) === nothing && return nothing
+        "/n/" * nbid * "/asset/" * join((HTTP.URIs.escapeuri(x) for x in split(rel, '/')), "/")
+    end
+    s = replace(s, _LOCAL_MD_IMG_RE => function (m)
+        mm = match(_LOCAL_MD_IMG_RE, m); r = route(String(mm.captures[2]))
+        r === nothing ? m : string(mm.captures[1], r)
+    end)
+    return replace(s, _LOCAL_TAG_SRC_RE => function (m)
+        mm = match(_LOCAL_TAG_SRC_RE, m); r = route(String(mm.captures[3]))
+        r === nothing ? m : string(mm.captures[1], mm.captures[2], r, mm.captures[2])
+    end)
+end
+
 # Decode ONE embedded-media URL to (bytes, mime, ext), or `nothing` if it isn't a `data:`/asset ref or
 # the file is unreadable / escapes the project. `assetbase` is the notebook's asset root (`_proj_root`).
 function _embedded_media(assetbase::AbstractString, url::AbstractString)
@@ -1048,7 +1077,7 @@ function _embedded_asset_files(cells, assetbase::AbstractString)
     end
     scan(s) = (for re in (_EMBED_MD_RE, _EMBED_SRC_RE), mt in eachmatch(re, String(s)); add(mt.captures[2]); end)
     for c in cells
-        scan(c.source)
+        scan(_local_media(c.source, "_", base))       # a relative path names a project file too
         c.output === nothing && continue
         for ch in c.output.display                              # code/web cell HTML output (e.g. a WebPage)
             ch.mime == "text/html" && scan(String(copy(ch.data)))
@@ -1063,7 +1092,7 @@ end
 # and unresolvable refs collapse to their alt text — so an embedded image never aborts the compile.
 function _stage_typst_md_media(md::AbstractString, dir::AbstractString, base::AbstractString,
                                assetbase::AbstractString; sizes = nothing)
-    s = String(md)
+    s = _local_media(md, "_", assetbase)
     if occursin("data:", s) || occursin("/asset/", s)
         # Which images stand alone on their line (a figure, centred) vs sit in a run of prose (inline
         # where the author put them) — the markdown equivalent of the HTML's `p > img:only-child`.
@@ -2924,7 +2953,7 @@ function export_html(nb::LiveNotebook; include_source::Bool = true,
             sw = get(replay_table, String(get(pm, "id", "")), nothing)
             sw isa AbstractDict || continue
             sl = try
-                _prose_attr_slots(markdown_html(c.source, c.interp), get(sw, "values", nothing),
+                _prose_attr_slots(markdown_html(_local_media(c.source, nb.id, _proj_root(nb)), c.interp), get(sw, "values", nothing),
                                   _proj_root(nb); inline = inline_assets, media = media)
             catch e
                 @warn "@replay: could not resolve an interpolated attribute" cell = c.id exception = e
@@ -3018,7 +3047,7 @@ function export_html(nb::LiveNotebook; include_source::Bool = true,
         isempty(strip(fm.byline)) || print(io, "<div class=\"exp-byline\">", _esc(fm.byline), "</div>")
         if !isempty(strip(fm.abstract))
             print(io, "<div class=\"exp-abstract\"><span class=\"exp-abslabel\">Abstract</span>",
-                  _export_embed_html(markdown_html(rw(fm.abstract), CellOutput[]), _proj_root(nb); inline = inline_assets, media = media), "</div>")
+                  _export_embed_html(markdown_html(_local_media(rw(fm.abstract), nb.id, _proj_root(nb)), CellOutput[]), _proj_root(nb); inline = inline_assets, media = media), "</div>")
         end
         runnable && print(io, "<div class=\"exp-run\"><button id=\"exp-run-btn\">▶ Run this notebook live</button></div>")
         print(io, "</header>")
@@ -3049,7 +3078,7 @@ function export_html(nb::LiveNotebook; include_source::Bool = true,
                 # and `markdown_html` pairs the remaining ones positionally, so `c.interp` has to be
                 # advanced by the same amount or the body renders the title's values.
                 mdbody, mdbase = c.id == fm.titlecell ? _body_after_hoisted_h1(c) : (c.source, 0)
-                mdsrc = rw(mdbody)
+                mdsrc = _local_media(rw(mdbody), nb.id, _proj_root(nb))
                 mdinterp = mdbase == 0 ? c.interp : c.interp[min(mdbase + 1, length(c.interp) + 1):end]
                 if haskey(figidx.numbers, c.id)     # caption cell → numbered "Figure N." block
                     print(io, "<figcaption class=\"exp-figcap\" id=\"fig-", _esc(c.id), "\"><b>Figure ",
