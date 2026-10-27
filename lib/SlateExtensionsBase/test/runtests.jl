@@ -345,6 +345,39 @@ SlateExtensionsBase.to_palette_command(c::TaggedCmd) = auto_palette_command(c)
         empty!(SlateExtensionsBase._FRONTEND)
     end
 
+    # A front-end registered from a file (`@pkg_asset` → `PkgAsset`) follows edits to that file: the
+    # registry re-reads it when its mtime moves, so a JS change needs no worker restart.
+    @testset "file-backed front-end follows the file" begin
+        mktempdir() do dir
+            f = joinpath(dir, "x.js")
+            write(f, "V1")
+            a = PkgAsset(f)
+            @test a == "V1" && String(a) == "V1" && "<" * a * ">" == "<V1>" && a.path == f
+            @test sprint(print, a) == "V1" && length(a) == 2
+
+            provide_frontend!(a; id = "file:x")
+            register_component!("filekind", PkgAsset(f))
+            @test frontend_scripts()["file:x"] == "V1"
+
+            write(f, "V2"); Base.Filesystem.touch(f)
+            SlateExtensionsBase._FRONTEND_FILES["file:x"] =
+                (path = f, mtime = SlateExtensionsBase._FRONTEND_FILES["file:x"].mtime - 10)
+            SlateExtensionsBase._FRONTEND_FILES["widget:filekind"] =
+                (path = f, mtime = SlateExtensionsBase._FRONTEND_FILES["widget:filekind"].mtime - 10)
+            byid = Dict(e.id => e for e in extension_manifest().frontend)
+            @test byid["file:x"].js == "V2"
+            @test byid["widget:filekind"].js == "V2" && byid["widget:filekind"].kind == "filekind"
+
+            rm(f)                                             # a vanished file keeps its last text
+            @test frontend_scripts()["file:x"] == "V2"
+
+            provide_frontend!("INLINE"; id = "file:x")        # re-registered from a plain string: no file
+            @test !haskey(SlateExtensionsBase._FRONTEND_FILES, "file:x")
+            @test frontend_scripts()["file:x"] == "INLINE"
+        end
+        empty!(SlateExtensionsBase._FRONTEND); empty!(SlateExtensionsBase._FRONTEND_FILES)
+    end
+
     # Package-vendored asset DIRECTORIES: `provide_assets!(pkg, dir)` declares a front-end asset tree
     # (echarts-gl, Cesium's workers/assets) Slate serves from disk at `/ext-assets/<pkg>/…` while the
     # package is loaded, surfacing in `extension_manifest().assets` alongside the front-end scripts.

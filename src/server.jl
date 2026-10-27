@@ -1414,6 +1414,24 @@ function _refresh_extensions!(nb::LiveNotebook)
     end
 end
 
+# Pull the manifest before serving a page its full state, so a page load sees the front-end as the worker
+# has it now. A file-backed script (`@pkg_asset`) is re-read by the worker when its file changes, so an
+# edited extension `.js` reaches the page on a reload with no run and no worker restart. Pushes no version:
+# the state being served already carries the result. Skipped while the notebook opens, for the reason
+# `_pull_ext_assets!` gives, and when the kernel has no namespace to ask. Best-effort. Call it off `nb.lock`.
+function _refresh_extensions_for_page!(nb::LiveNotebook)
+    k = nb.kernel
+    (k isa ReportEngine.GateKernel || (k isa ReportEngine.InProcessKernel && nb.report.mod !== nothing)) ||
+        return nothing
+    _ext_assets_opening(nb) && return nothing
+    try
+        _refresh_extensions!(nb)
+    catch e
+        @debug "slate: page-load manifest pull failed" notebook = nb.id exception = e
+    end
+    return nothing
+end
+
 # The longest time that the `/ext-assets/` route holds a request for a package that is not declared yet:
 # while a watched notebook opens (a cold worker start or a precompile can take minutes), and while it
 # only drains.
