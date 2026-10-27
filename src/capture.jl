@@ -1267,7 +1267,9 @@ end
 # bytes into this run's sink, and the markup it produces references them by path. Returning the chunks
 # alone published markup whose asset paths nothing had registered, so every `Slate.asset` in a live
 # output resolved to a 404 after a page reconnect.
-function rerender_live_outputs(mod::Module)
+# `running`: cells with a run in progress. Re-rendering one would replay the source of its LAST run and
+# fire its cleanups underneath the run that is going, so it is left to that run's own result.
+function rerender_live_outputs(mod::Module; running = Set{String}())
     try; Base.invokelatest(SlateExtensionsBase.run_live_resets); catch; end
     # A re-render must carry the SAME Slate execution context a normal cell eval gets. `run_capture` FIRES the
     # previous run's `slate_on_cleanup` callbacks regardless (it reads `__slate_cleanups` off the namespace),
@@ -1281,6 +1283,7 @@ function rerender_live_outputs(mod::Module)
     ctx = _build_slate_ctx(mod, "", "", String[])
     outs = Tuple{String,Vector{Tuple{String,Vector{UInt8}}},Vector{Any}}[]
     for (cid, spec) in lock(() -> collect(_LIVE_OUTPUTS), _LIVE_OUTPUTS_LOCK)
+        String(cid) in running && continue
         w = try
             run_capture(mod, spec.source, spec.filename; capture = DemuxCapture(), slate_ctx = ctx, stop_key = "")
         catch

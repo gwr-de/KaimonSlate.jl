@@ -1855,7 +1855,7 @@ function __slate_rerender_live()
     # the hub regroups. Without this a reconnected live output published markup pointing at asset paths
     # nothing had registered.
     assets = Any[]
-    for (cid, chunks, cas) in rerender_live_outputs(_NS[])
+    for (cid, chunks, cas) in rerender_live_outputs(_NS[]; running = lock(() -> Set{String}(values(_RUN_CELLS)), _CANCEL_LOCK))
         isempty(chunks) && continue
         m, b = chunks[1]
         push!(cids, cid); push!(mimetypes, String(m)); push!(b64s, Base64.base64encode(b))

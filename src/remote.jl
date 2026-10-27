@@ -6724,17 +6724,6 @@ function _evict_worker_conn!(host, port::Int)
     return length(stale)
 end
 
-"""
-    reap_remote_worker(host, port) -> Bool
-
-Explicitly kill the worker on `host:port` and remove its script/log/manifest. Manual only — Slate
-never auto-reaps (a worker may hold results worth keeping).
-
-REMOTE only: it reaches the worker over ssh and matches its `worker-<port>.jl` script, neither of
-which exists for a local worker (spawned inline with `-e` and owned by the hub as a process).
-Returns whether the kill reached something, so the caller can report the outcome rather than
-assume it.
-"""
 # The machine a worker named by `host` runs on. A worker on a compute node is listed under the login
 # host it is reached through, since its manifest is on the shared filesystem there, but its process is
 # on the node its manifest names. That node is used while it is still routed; once the allocation is
@@ -6771,6 +6760,18 @@ function _reaped(host, port::Integer; now::Float64 = time())
     end
 end
 
+"""
+    reap_remote_worker(host, port) -> Bool
+
+Kill the worker on `host:port` (SIGTERM, then SIGKILL, with its children) and remove its
+script/log/manifest once it is gone. The one remote kill: a manual reap, a teardown kill, and the
+attach, reconcile and release paths that end a worker all come here.
+
+REMOTE only: it reaches the worker over ssh and matches its `worker-<port>.jl` script, neither of
+which exists for a local worker (spawned inline with `-e` and owned by the hub as a process).
+Returns whether the kill reached something, so the caller can report the outcome rather than
+assume it.
+"""
 function reap_remote_worker(host, port::Int)
     _mark_reaped!(host, port)
     node = _worker_node(String(host), port)

@@ -247,6 +247,21 @@ end
     end
 end
 
+@testset "a live cell that is running is not re-rendered under its run" begin
+    rep = RE.Report("rerender_running", "")
+    mod = RE.report_module(rep)
+    lock(RE._LIVE_OUTPUTS_LOCK) do
+        RE._LIVE_OUTPUTS["busy"] = (source = "HTML(\"<b>busy</b>\")", filename = "cell:busy")
+        RE._LIVE_OUTPUTS["idle"] = (source = "HTML(\"<b>idle</b>\")", filename = "cell:idle")
+    end
+    try
+        outs = RE.rerender_live_outputs(mod; running = Set(["busy"]))
+        @test [o[1] for o in outs] == ["idle"]
+    finally
+        lock(RE._LIVE_OUTPUTS_LOCK) do; delete!(RE._LIVE_OUTPUTS, "busy"); delete!(RE._LIVE_OUTPUTS, "idle"); end
+    end
+end
+
 @testset "extension-served assets on the in-process kernel" begin
     # The hub answers `/n/<id>/served/<hash>` by asking the kernel. Only GateKernel implemented it,
     # so standalone returned `nothing` and the URL 404'd — and an extension that serves its
