@@ -12,6 +12,20 @@ were written when they went out. They are marked.
 
 ## [Unreleased]
 
+### Fixed
+
+- In an exported page, a figure's `@replay` marks on one control move together or not at all. The
+  control moves the figure only when every one of those marks has its data over the same positions;
+  otherwise the figure stays as exported and the browser console names the marks. A figure could
+  show data from different control positions when one mark's sweep failed or was exported at a
+  different stride. (#64, reported by @disberd)
+- A markdown image with a relative path, such as `![logo](figures/logo.png)`, loads in the notebook
+  and travels into every export. The path names a file in the notebook's project folder, as
+  `@asset`'s paths do; it used to resolve against the page's address and come back missing. (#79)
+- An agent in the notebook's panel that closes its notebook during a turn carries on with the turn.
+  When the notebook opens again, the agent and its transcript are back in the panel, and a tab
+  showing the notebook as closed returns to it by itself. (#78)
+
 ## [1.12.1] - 2026-10-26
 
 ### Fixed

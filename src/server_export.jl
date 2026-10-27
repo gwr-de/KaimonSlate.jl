@@ -955,6 +955,35 @@ function _asset_abspath(assetbase::AbstractString, rel::AbstractString)
     (p !== nothing && isfile(p)) ? p : nothing
 end
 
+# A markdown image, or the `src` of an <img>/<video>/<audio>/<source> tag in markdown, that names a file
+# in the notebook's project by a relative path, pointed at the notebook's asset route. Relative paths
+# resolve against the project dir, as `@asset`'s do. Every reader of markdown knows that route: the live
+# page loads it, and the exports inline it, copy it beside a page or stage it for Typst. The author's
+# source keeps the relative path, and a target that names no file in the project is left as written.
+const _LOCAL_MD_IMG_RE  = r"(!\[[^\]]*\]\(\s*)([^)\s]+)"
+const _LOCAL_TAG_SRC_RE = r"(<(?:img|video|audio|source)\b[^>]*?\bsrc=)([\"'])([^\"']+)\2"i
+_is_relative_ref(u::AbstractString) =
+    !isempty(u) && !startswith(u, "/") && !startswith(u, "#") && !occursin(r"^[A-Za-z][A-Za-z0-9+.-]*:", u)
+function _local_media(src::AbstractString, nbid::AbstractString, assetbase::AbstractString)
+    s = String(src)
+    (isempty(nbid) || isempty(assetbase)) && return s
+    (occursin("![", s) || occursin(r"<(?:img|video|audio|source)\b"i, s)) || return s
+    route(u) = begin
+        _is_relative_ref(u) || return nothing
+        rel = HTTP.URIs.unescapeuri(startswith(u, "./") ? u[3:end] : u)
+        _asset_abspath(assetbase, rel) === nothing && return nothing
+        "/n/" * nbid * "/asset/" * join((HTTP.URIs.escapeuri(x) for x in split(rel, '/')), "/")
+    end
+    s = replace(s, _LOCAL_MD_IMG_RE => function (m)
+        mm = match(_LOCAL_MD_IMG_RE, m); r = route(String(mm.captures[2]))
+        r === nothing ? m : string(mm.captures[1], r)
+    end)
+    return replace(s, _LOCAL_TAG_SRC_RE => function (m)
+        mm = match(_LOCAL_TAG_SRC_RE, m); r = route(String(mm.captures[3]))
+        r === nothing ? m : string(mm.captures[1], mm.captures[2], r, mm.captures[2])
+    end)
+end
+
 # Decode ONE embedded-media URL to (bytes, mime, ext), or `nothing` if it isn't a `data:`/asset ref or
 # the file is unreadable / escapes the project. `assetbase` is the notebook's asset root (`_proj_root`).
 function _embedded_media(assetbase::AbstractString, url::AbstractString)
@@ -1048,7 +1077,7 @@ function _embedded_asset_files(cells, assetbase::AbstractString)
     end
     scan(s) = (for re in (_EMBED_MD_RE, _EMBED_SRC_RE), mt in eachmatch(re, String(s)); add(mt.captures[2]); end)
     for c in cells
-        scan(c.source)
+        scan(_local_media(c.source, "_", base))       # a relative path names a project file too
         c.output === nothing && continue
         for ch in c.output.display                              # code/web cell HTML output (e.g. a WebPage)
             ch.mime == "text/html" && scan(String(copy(ch.data)))
@@ -1063,7 +1092,7 @@ end
 # and unresolvable refs collapse to their alt text — so an embedded image never aborts the compile.
 function _stage_typst_md_media(md::AbstractString, dir::AbstractString, base::AbstractString,
                                assetbase::AbstractString; sizes = nothing)
-    s = String(md)
+    s = _local_media(md, "_", assetbase)
     if occursin("data:", s) || occursin("/asset/", s)
         # Which images stand alone on their line (a figure, centred) vs sit in a run of prose (inline
         # where the author put them) — the markdown equivalent of the HTML's `p > img:only-child`.
@@ -1577,37 +1606,48 @@ for(var y=0;y<rows;y++){var row=new Array(cols);
 for(var x=0;x<cols;x++)row[x]=flat[x*rows+y];out[y]=row;}
 return out;}
 return Array.from(flat);},
-/* `marks` each carry at least {id, control}; `apply(slice, mark)` is the renderer's one step. */
+/* Two domains naming the same positions in the same order. */
+sameDomain:function(a,b){var R=Slate.replay;if(a.length!==b.length)return false;
+for(var i=0;i<a.length;i++)if(!R.same(a[i],b[i]))return false;return true;},
+/* `marks` are ONE figure's, each carrying at least {id, control}; `apply(slice, mark)` is the renderer's
+   one step. A figure's marks on one control move together or not at all: they are wired as a group,
+   only when every one has a sweep over the same domain and all their data has loaded, and each move
+   applies one index to all of them. A group that cannot be wired leaves the figure as exported for that
+   control, and says why in the console. */
 wire:function(marks,apply){if(Slate.isLive())return;
-(marks||[]).forEach(function(m){
-/* A mark names a SWEEP, not an asset: what shipped — and at what resolution — is the export's
-   decision, published in this table. A mark with no entry never wires, so a figure whose sweep was
-   skipped leaves its control visibly disabled instead of failing at the first drag. */
-var R=Slate.replay;
-var sweep=(window.__slateReplays||{})[m.id];if(!sweep)return;
-var hosts=R.hosts(m.control);if(!hosts.length)return;
-/* A sweep whose payload rode INLINE rather than in a binary asset. Prose is the case: a position is a
-   few short strings, and a fetch + decode + narrowing step exists to move megabytes of floats. There is
-   nothing to await, so the control enables immediately. */
-var inline=Array.isArray(sweep.values)?sweep.values:null;
-var loaded=inline?null:Slate.asset(sweep.asset);
-var run=function(src){var key=R.read(src);var i=R.index(sweep.domain||[],key);if(i<0)return;
+var R=Slate.replay,table=window.__slateReplays||{},groups=new Map();
+(marks||[]).forEach(function(m){if(!groups.has(m.control))groups.set(m.control,[]);groups.get(m.control).push(m);});
+groups.forEach(function(ms,control){
+var hosts=R.hosts(control);if(!hosts.length)return;
+/* A mark names a SWEEP, not an asset: what shipped, and at what resolution, is the export's decision,
+   published in this table. */
+var sweeps=ms.map(function(m){return table[m.id];});
+var ids=ms.map(function(m){return m.id;});
+var missing=ids.filter(function(_,j){return !sweeps[j];});
+if(missing.length){console.warn("@replay: `"+control+"` does not move this figure: no data shipped for "+missing.join(", "));return;}
+var domain=sweeps[0].domain||[];
+if(!sweeps.every(function(s){return R.sameDomain(s.domain||[],domain);})){
+console.warn("@replay: `"+control+"` does not move this figure: its marks were exported at different positions ("+ids.join(", ")+")");return;}
+/* A sweep whose payload rode INLINE rather than in a binary asset is ready at once. Prose is the case:
+   a position is a few short strings, and a fetch + decode + narrowing step exists to move megabytes. */
+Promise.all(sweeps.map(function(s){return Array.isArray(s.values)?s.values:Slate.asset(s.asset);}))
+.then(function(data){
+var run=function(src){var key=R.read(src);var i=R.index(domain,key);if(i<0)return;
 /* A control surfaced beside several figures renders once per cell. Push the mover's state onto its
    copies, or the reader drags one strip and the others sit there stating something false. */
 hosts.forEach(function(h){if(h!==src)R.mirror(h,key);R.paint(h);R.relabel(h,key);});
-if(inline){apply(inline[i],m,i);return;}
-loaded.then(function(packed){apply(R.slice(packed,sweep,i),m,i);})
-.catch(function(e){console.error("replay failed",e);});};
+ms.forEach(function(m,j){var s=sweeps[j];apply(Array.isArray(s.values)?s.values[i]:R.slice(data[j],s,i),m,i);});};
 hosts.forEach(function(h){R.listen(h,function(){run(h);});});
-/* Apply the export-time position ONCE on load. A figure is already drawn at it, so this repaints the
-   same numbers — but a replayed TABLE is written with the UNION of every position (that is what the
-   order and the mask index into), so until this ran the reader saw every row and every column any
-   position can show, and only touching the control brought it back to what was exported. */
-if(inline){hosts.forEach(function(h){R.enable(h,true);});run(hosts[0]);return;}
 /* Every exported control renders DISABLED, because one that moves without changing anything reads as
-   a broken page. Enabling here — and only here — means a control is live exactly when data for it
-   actually rode along, with no coordination between the two sides. */
-loaded.then(function(){hosts.forEach(function(h){R.enable(h,true);});run(hosts[0]);}).catch(function(){});});}
+   a broken page. Enabling here, and only here, means a control is live exactly when the data for every
+   mark it drives has arrived. */
+hosts.forEach(function(h){R.enable(h,true);});
+/* Apply the export-time position ONCE. A figure is already drawn at it, so this repaints the same
+   numbers, but a replayed TABLE is written with the UNION of every position (that is what the order and
+   the mask index into), so until this ran the reader saw every row and every column any position can
+   show. */
+run(hosts[0]);})
+.catch(function(e){console.warn("@replay: `"+control+"` does not move this figure: its data did not load ("+ids.join(", ")+")",e);});});}
 };
 Slate.assetUrl=function(path){var a=window.__slateAssets[path];if(!a)return path;
 if(a.data!==undefined)return "data:"+(a.mime||"application/octet-stream")+";base64,"+a.data;return a.url||path;};
@@ -2921,7 +2961,7 @@ function export_html(nb::LiveNotebook; include_source::Bool = true,
             sw = get(replay_table, String(get(pm, "id", "")), nothing)
             sw isa AbstractDict || continue
             sl = try
-                _prose_attr_slots(markdown_html(c.source, c.interp), get(sw, "values", nothing),
+                _prose_attr_slots(markdown_html(_local_media(c.source, nb.id, _proj_root(nb)), c.interp), get(sw, "values", nothing),
                                   _proj_root(nb); inline = inline_assets, media = media)
             catch e
                 @warn "@replay: could not resolve an interpolated attribute" cell = c.id exception = e
@@ -3015,7 +3055,7 @@ function export_html(nb::LiveNotebook; include_source::Bool = true,
         isempty(strip(fm.byline)) || print(io, "<div class=\"exp-byline\">", _esc(fm.byline), "</div>")
         if !isempty(strip(fm.abstract))
             print(io, "<div class=\"exp-abstract\"><span class=\"exp-abslabel\">Abstract</span>",
-                  _export_embed_html(markdown_html(rw(fm.abstract), CellOutput[]), _proj_root(nb); inline = inline_assets, media = media), "</div>")
+                  _export_embed_html(markdown_html(_local_media(rw(fm.abstract), nb.id, _proj_root(nb)), CellOutput[]), _proj_root(nb); inline = inline_assets, media = media), "</div>")
         end
         runnable && print(io, "<div class=\"exp-run\"><button id=\"exp-run-btn\">▶ Run this notebook live</button></div>")
         print(io, "</header>")
@@ -3046,7 +3086,7 @@ function export_html(nb::LiveNotebook; include_source::Bool = true,
                 # and `markdown_html` pairs the remaining ones positionally, so `c.interp` has to be
                 # advanced by the same amount or the body renders the title's values.
                 mdbody, mdbase = c.id == fm.titlecell ? _body_after_hoisted_h1(c) : (c.source, 0)
-                mdsrc = rw(mdbody)
+                mdsrc = _local_media(rw(mdbody), nb.id, _proj_root(nb))
                 mdinterp = mdbase == 0 ? c.interp : c.interp[min(mdbase + 1, length(c.interp) + 1):end]
                 if haskey(figidx.numbers, c.id)     # caption cell → numbered "Figure N." block
                     print(io, "<figcaption class=\"exp-figcap\" id=\"fig-", _esc(c.id), "\"><b>Figure ",
@@ -5711,6 +5751,7 @@ function _agent_system_prompt_text(nb::LiveNotebook)
 
     Change the notebook's CELLS through the slate tools (slate_add_cell / slate_edit_cell / slate_run /
     slate_delete_cell / slate_rename_cell), not by hand-editing the .jl — that fights the running engine.
+    The hub picks up changes to the .jl on its own, so there is no need to close and reopen the notebook.
 
     DEPENDENCIES the notebook needs (a package a cell will `using`): add them with
     `slate_pkg(notebook="$(nb.id)", op="add", name="…")` — this installs into the NOTEBOOK's own env and
@@ -5957,7 +5998,60 @@ function _reap_agents!(nb::LiveNotebook; keep_log::Bool = false)
     end
     return nothing
 end
-_close_agent!(nb::LiveNotebook) = _reap_agents!(nb; keep_log = false)   # on notebook close
+
+# Notebook file → the crew agents (label → agent id) that were mid-turn when it closed. The
+# agent may be the one that closed it, so it lives on: its events go to the transcript on disk,
+# a reopen of the same file takes it back, and it is closed when its turn ends if none does.
+const _DETACHED_AGENTS = Dict{String,Dict{String,String}}()
+
+_agent_working(aid::AbstractString) =
+    try
+        String(get(_agent_call(:agent_status, Dict{String,Any}("agent_id" => String(aid))), "status", "")) == "working"
+    catch
+        false
+    end
+
+# On notebook close: detach the agents with a turn in flight, reap the rest.
+function _close_agent!(nb::LiveNotebook)
+    busy = _agent_available() ?
+        Dict(l => a for (l, a) in lock(() -> copy(nb.agents), _AGENT_LOCK) if _agent_working(a)) :
+        Dict{String,String}()
+    if !isempty(busy)
+        lock(_AGENT_LOCK) do
+            _DETACHED_AGENTS[abspath(nb.path)] = busy
+            for l in keys(busy); delete!(nb.agents, l); end
+        end
+    end
+    _reap_agents!(nb; keep_log = false)
+    return nothing
+end
+
+# On open: take back the agents detached when this file last closed. The transcript is reloaded
+# under the same lock the relay holds while it writes for a detached agent, so nothing it wrote
+# in between is missed.
+function _reattach_agents!(nb::LiveNotebook)
+    lock(_AGENT_LOCK) do
+        d = pop!(_DETACHED_AGENTS, abspath(nb.path), nothing)
+        d === nothing && return
+        _load_chat_log!(nb)
+        for (label, aid) in d
+            _AGENT_ROUTES[aid] = nb
+            nb.agents[label] = aid
+        end
+        nb.agent_id = get(nb.agents, "", "")
+        _AGENT_TURN[nb.id] = time()
+        nb.agent_busy = true
+    end
+    return nothing
+end
+
+# The detached entry holding `aid`, as `path => label`, or `nothing`.
+function _detached_slot(aid::AbstractString)
+    for (path, d) in _DETACHED_AGENTS, (label, a) in d
+        a == aid && return path => label
+    end
+    return nothing
+end
 
 # What the chat shows for a prompt the hub wrapped before sending: the text that was typed and the
 # cell the turn is scoped to. The agent echoes the whole prompt back as its `user_text` event, and
@@ -6001,20 +6095,35 @@ handler routes it to the chat pane. `data` already rides the bus as a JSON strin
 function relay_agent_event(channel::AbstractString, data)
     startswith(channel, "agent:") || return
     aid = String(channel)[length("agent:")+1:end]
-    nb, crew = lock(_AGENT_LOCK) do
-        get(_AGENT_ROUTES, aid, nothing), get(_AGENT_CREW, aid, "")
-    end
-    nb === nothing && return
     s = data isa AbstractString ? String(data) : String(JSON.json(data))
     env = try; JSON.parse(s); catch; nothing; end
     kind = env === nothing ? "" : get(env, "kind", "")
-    # Tag the envelope with the speaking crew member so the SPA can lane multiple
-    # agents (and replay stays attributed). Re-serialize only when we parsed cleanly.
-    if env !== nothing
-        env["crew"] = crew
-        kind == "user_text" && _attach_shown!(nb, env)
-        s = JSON.json(env)
+    is_delta = kind == "tool_input_delta" ||
+        (env !== nothing && (d = get(env, "data", nothing); d isa AbstractDict && get(d, "delta", false) === true))
+    nb, ended = lock(_AGENT_LOCK) do
+        n = get(_AGENT_ROUTES, aid, nothing)
+        n === nothing && return (nothing, false)
+        # Tag the envelope with the speaking crew member so the SPA can lane multiple
+        # agents (and replay stays attributed). Re-serialize only when we parsed cleanly.
+        if env !== nothing
+            env["crew"] = get(_AGENT_CREW, aid, "")
+            kind == "user_text" && _attach_shown!(n, env)
+            s = JSON.json(env)
+        end
+        slot = _detached_slot(aid)
+        slot === nothing && return (n, false)
+        # Its notebook is closed: the transcript on disk keeps the turn for a reopen, and the
+        # agent is closed when the turn ends with no reopen to take it back.
+        is_delta || _append_chat_log(n, s)
+        kind == "result" || return (nothing, false)
+        d = _DETACHED_AGENTS[slot.first]
+        delete!(d, slot.second)
+        isempty(d) && delete!(_DETACHED_AGENTS, slot.first)
+        delete!(_AGENT_ROUTES, aid); delete!(_AGENT_CREW, aid)
+        return (nothing, true)
     end
+    ended && Threads.@spawn try; _agent_call(:agent_close, Dict{String,Any}("agent_id" => aid)); catch; end
+    nb === nothing && return
     # Mark the agent busy across a turn so the file-watcher attributes the edits it
     # makes to "agent" (not "external"). Clear shortly AFTER the turn ends, so the
     # watcher tick that picks up the agent's final save is still inside the window.
@@ -6036,8 +6145,6 @@ function relay_agent_event(channel::AbstractString, data)
     # `tool_input_delta`) — the authoritative copies (the `delta:false` block, the
     # `tool_result`) are buffered, so replay stays clean and the cap isn't burned.
     _broadcast(nb, "agent:" * s)
-    is_delta = kind == "tool_input_delta" ||
-        (env !== nothing && (d = get(env, "data", nothing); d isa AbstractDict && get(d, "delta", false) === true))
     is_delta || _buffer_agent_log!(nb, s)   # persist non-delta envelopes for reload-replay
     return nothing
 end

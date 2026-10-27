@@ -546,51 +546,85 @@ window.Slate.replay = {
     }
     return Array.from(flat);        // rank ≥ 3 has no direct chart field; hand back the flat run
   },
-  // `marks` each carry at least `{id, control}`; `apply(slice, mark)` is the renderer's one step.
+  // Two domains naming the same positions in the same order.
+  sameDomain: function (a, b) {
+    const R = window.Slate.replay;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!R.same(a[i], b[i])) return false;
+    return true;
+  },
+  // `marks` are ONE figure's, each carrying at least `{id, control}`; `apply(slice, mark)` is the
+  // renderer's one step.
+  //
+  // A figure's marks on one control move together or not at all. They are wired as a group, and only
+  // when every one of them has a sweep over the same domain and every sweep's data has loaded; then
+  // each move applies one index to all of them. Wired one by one, a mark whose sweep failed, or one
+  // exported at a coarser stride, stayed behind while the others moved, and the figure showed data
+  // from different positions with nothing to say so. A group that cannot be wired leaves the figure
+  // as exported for that control, and says why in the console.
   wire: function (marks, apply) {
     if (window.Slate.isLive()) return;
-    const R = window.Slate.replay;
+    const R = window.Slate.replay, table = window.__slateReplays || {};
+    const groups = new Map();
     (marks || []).forEach(function (m) {
-      // A mark names a SWEEP, not an asset: what shipped — and at what resolution — is the export's
-      // decision, published in this table. A mark with no entry simply never wires, so a figure whose
-      // sweep was skipped leaves its control visibly disabled instead of failing at the first drag.
-      const sweep = (window.__slateReplays || {})[m.id];
-      if (!sweep) return;
-      const hosts = R.hosts(m.control);
+      if (!groups.has(m.control)) groups.set(m.control, []);
+      groups.get(m.control).push(m);
+    });
+    groups.forEach(function (ms, control) {
+      const hosts = R.hosts(control);
       if (!hosts.length) return;
-      // A sweep whose payload rode INLINE rather than in a binary asset. Prose is the case: a position
-      // is a few short strings, and the fetch/decode/narrow path exists to move megabytes of floats.
-      // Nothing to await, so the control enables immediately.
-      const inline = Array.isArray(sweep.values) ? sweep.values : null;
-      const loaded = inline ? null : window.Slate.asset(sweep.asset);
-      const run = function (src) {
-        const key = R.read(src);
-        const i = R.index(sweep.domain || [], key);
-        if (i < 0) return;
-        // A control surfaced beside several figures renders once per cell. Push the mover's state onto
-        // its copies, or the reader drags one strip and the others sit there stating something false.
-        hosts.forEach(function (h) {
-          if (h !== src) R.mirror(h, key);
-          R.paint(h);
-          R.relabel(h, key);
-        });
-        if (inline) { apply(inline[i], m, i); return; }
-        loaded.then(function (packed) { apply(R.slice(packed, sweep, i), m, i); })
-              .catch(function (e) { console.error('replay failed', e); });
-      };
-      // Inputs fire continuously while a thumb is dragged; the data is already in memory, so redrawing
-      // per event is cheap and gives the same feel as the live kernel path at its best.
-      hosts.forEach(function (h) { R.listen(h, function () { run(h); }); });
-      // Apply the export-time position ONCE on load. A figure is already drawn at it, so this repaints
-      // the same numbers — but a replayed TABLE is written with the UNION of every position (which is
-      // what the order and the mask index into), so until this ran the reader saw every row and every
-      // column any position can show, and only touching the control brought it back.
-      if (inline) { hosts.forEach(function (h) { R.enable(h, true); }); run(hosts[0]); return; }
-      // The export renders every control DISABLED, because one that moves without changing anything
-      // reads as a broken page. Enabling here — and only here — means a control is live exactly when
-      // data for it actually rode along, with no coordination between the two sides.
-      loaded.then(function () { hosts.forEach(function (h) { R.enable(h, true); }); run(hosts[0]); })
-            .catch(function () { /* data missing → the control stays inert, which is the truth */ });
+      // A mark names a SWEEP, not an asset: what shipped, and at what resolution, is the export's
+      // decision, published in this table.
+      const sweeps = ms.map(function (m) { return table[m.id]; });
+      const ids = ms.map(function (m) { return m.id; });
+      const missing = ids.filter(function (_, j) { return !sweeps[j]; });
+      if (missing.length) {
+        console.warn('@replay: `' + control + '` does not move this figure: no data shipped for ' + missing.join(', '));
+        return;
+      }
+      const domain = sweeps[0].domain || [];
+      if (!sweeps.every(function (s) { return R.sameDomain(s.domain || [], domain); })) {
+        console.warn('@replay: `' + control + '` does not move this figure: its marks were exported at different positions (' + ids.join(', ') + ')');
+        return;
+      }
+      // A sweep whose payload rode INLINE rather than in a binary asset is ready at once. Prose is the
+      // case: a position is a few short strings, and the fetch/decode/narrow path exists to move
+      // megabytes of floats.
+      Promise.all(sweeps.map(function (s) {
+        return Array.isArray(s.values) ? s.values : window.Slate.asset(s.asset);
+      })).then(function (data) {
+        const run = function (src) {
+          const key = R.read(src);
+          const i = R.index(domain, key);
+          if (i < 0) return;
+          // A control surfaced beside several figures renders once per cell. Push the mover's state
+          // onto its copies, or the reader drags one strip and the others sit there stating something
+          // false.
+          hosts.forEach(function (h) {
+            if (h !== src) R.mirror(h, key);
+            R.paint(h);
+            R.relabel(h, key);
+          });
+          ms.forEach(function (m, j) {
+            const s = sweeps[j];
+            apply(Array.isArray(s.values) ? s.values[i] : R.slice(data[j], s, i), m, i);
+          });
+        };
+        // Inputs fire continuously while a thumb is dragged; the data is already in memory, so
+        // redrawing per event is cheap and gives the same feel as the live kernel path at its best.
+        hosts.forEach(function (h) { R.listen(h, function () { run(h); }); });
+        // The export renders every control DISABLED, because one that moves without changing anything
+        // reads as a broken page. Enabling here, and only here, means a control is live exactly when
+        // the data for every mark it drives has arrived.
+        hosts.forEach(function (h) { R.enable(h, true); });
+        // Apply the export-time position ONCE. A figure is already drawn at it, so this repaints the
+        // same numbers, but a replayed TABLE is written with the UNION of every position (which is
+        // what the order and the mask index into), so until this ran the reader saw every row and
+        // every column any position can show.
+        run(hosts[0]);
+      }).catch(function (e) {
+        console.warn('@replay: `' + control + '` does not move this figure: its data did not load (' + ids.join(', ') + ')', e);
+      });
     });
   }
 };

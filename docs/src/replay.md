@@ -133,8 +133,11 @@ checked while you write the cell. The shape is checked when you export, so a `@r
 scalar, ragged results, or a non-`Real` element type registers fine and then fails at export with a
 message naming the problem.
 
-**One mark's failure costs that mark only.** The sweep warns, that control exports frozen, and the
-rest of the page is unaffected. A table whose sweep did not resolve degrades to an ordinary static
+**A figure moves as a whole or not at all.** All of a figure's marks on one control move together:
+the control drives the figure only when every one of those marks has its data, swept over the same
+positions. If one mark's sweep fails, or a per-mark stride gives it different positions, that figure
+stays as exported when the control moves, and the browser console names the marks. Other figures on
+the same control still follow it. A table whose sweep did not resolve degrades to an ordinary static
 table.
 
 **A `@replay` cell is never cached.** Restoring a memoized cell skips its body, which would bring the

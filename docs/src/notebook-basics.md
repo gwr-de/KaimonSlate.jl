@@ -260,6 +260,11 @@ Pandoc/Quarto) overrides how it is drawn:
 works on a `<video>` or `<audio>` you dropped into the cell, and on an interpolated `{{ }}` image.
 Sizes carry into the HTML export and the PDF; unrecognised keys are dropped rather than emitted.
 
+A relative path, such as `plot.png` or `figures/plot.png`, names a file in the notebook's project
+folder, the same place `@asset` reads from. The notebook loads it from there, and every export
+carries it: a standalone page and the PDF embed it, a published site copies it beside the page, and
+an app or bundle takes the file along.
+
 ## Completion
 
 Tab-completion uses Julia's REPL completions against the live kernel **plus** the cell's own
