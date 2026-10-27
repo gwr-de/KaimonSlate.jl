@@ -334,6 +334,7 @@ function showSrcError(msg) {
 // refreshes badges/outputs/controls; the user's unsaved source stays put, ready to re-run.
 const _GRACE_MS = 1200, _PROBE_MS = 1500;
 let _es = null, _connDown = false, _modalShown = false, _graceTimer = null, _probeTimer = null;
+const _REOPEN_WATCH_MS = 3000;   // while closed, how often to check whether it is open again
 let _closedByHub = false;   // a deliberate close (SSE "closed:") — no reconnect, no auto-reopen
 // A deliberate close from the hub (slate.close / the TUI's [c]): back up in-flight edits,
 // stand down ALL recovery (the auto-reopen would respawn the notebook), and show the
@@ -347,6 +348,11 @@ function _notebookClosed() {
   _connDown = false;
   const dm = document.getElementById('disconnmodal'); if (dm) dm.style.display = 'none';
   const m = document.getElementById('closedmodal'); if (m) m.style.display = 'flex';
+  // Someone else (an agent, another tab) may open it again: come back when they do. Only watch,
+  // never reopen, so a deliberate close stays closed.
+  const watch = setInterval(async () => {
+    try { if ((await fetch(_apipath('/api/state'))).ok) { clearInterval(watch); location.reload(); } } catch (_) {}
+  }, _REOPEN_WATCH_MS);
 }
 // The overlay's button: ask the server to re-open the file we remember, then reload —
 // the boot path re-syncs and reconcileBackup() restores any backed-up unsaved edits.
