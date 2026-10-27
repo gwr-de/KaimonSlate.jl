@@ -450,6 +450,18 @@ x = 1
             @test [String(get(d, "slug", "")) for d in NS.site_docs("My Portfolio")] == ["beta"]
             @test !NS.unexport_from_site("My Portfolio", "alpha").removed             # idempotent (already gone)
             @test !NS.unexport_from_site("nope", "x").removed                         # unknown site
+            # The slug a doc is built under is found by its docid, so a custom slug or a later title edit
+            # still names its own entry; only an entry with no docid is matched by title.
+            c = withfig(_mknb("#%% md id=t\n# Gamma\n\n#%% code id=fig\n3\n"))
+            c.report.meta["docid"] = "doc-gamma"
+            NS.export_to_site(c, "My Portfolio"; slug = "custom-gamma")
+            @test NS._site_slug_for("My Portfolio", c) == "custom-gamma"
+            c2 = withfig(_mknb("#%% md id=t\n# Gamma, renamed\n\n#%% code id=fig\n3\n"))
+            c2.report.meta["docid"] = "doc-gamma"
+            @test NS._site_slug_for("My Portfolio", c2; by_title = false) == "custom-gamma"
+            other = withfig(_mknb("#%% md id=t\n# Gamma\n\n#%% code id=fig\n4\n"))
+            other.report.meta["docid"] = "doc-other"
+            @test NS._site_slug_for("My Portfolio", other; by_title = false) == ""   # same title, not its entry
         end
     end
 

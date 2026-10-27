@@ -56,6 +56,7 @@ module WscallBinary; include("test_wscall_binary.jl"); end
 module WsOrder;   include("test_ws_order.jl");   end
 module BindObs;   include("test_bind_observable.jl"); end
 module RecordDisplay; include("test_record_display.jl"); end
+module MatrixDisplay; include("test_matrix_display.jl"); end
 
 # Every module above belongs here. A file that is `include`d but left out of this tuple is still
 # COMPILED, so it never looks broken — it is simply never run, and its testsets pass silently by

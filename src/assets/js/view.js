@@ -914,11 +914,15 @@ function mountPicks(c, cell) {
 }
 
 // Wire every bound widget in a cell — its own @bind widget and/or control strip.
-function mountControls(c) {
+// `hosts`: the control hosts to wire (default: the whole cell). `wireControl` adds listeners, so a host
+// that is already wired must not be passed again.
+function mountControls(c, hosts) {
   const cell = document.getElementById('cell-' + c.id);
   if (!cell) return;
-  cell.querySelectorAll('[data-bind]').forEach(wireControl);
-  cell.querySelectorAll('.radiogroup, .checkgroup, .mslist').forEach(typeset);   // render rich ($math$) option labels
+  for (const h of (hosts || [cell])) {
+    h.querySelectorAll('[data-bind]').forEach(wireControl);
+    h.querySelectorAll('.radiogroup, .checkgroup, .mslist').forEach(typeset);   // render rich ($math$) option labels
+  }
   mountOutputComponents(cell);                                                   // return-value component outputs
   mountPicks(c, cell);                                                           // pick_on! click targets on a figure
 }

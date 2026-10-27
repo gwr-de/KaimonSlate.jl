@@ -515,19 +515,20 @@ function Cell({ cell, selectedId, selSet, live, focusId, editingId, collapsed })
     // picker, which mutates `controls` (not `binds`), actually re-renders the strip.
     const bindKey = JSON.stringify((c.binds || []).map(b => [b.name, b.widget, b.params, b.hosted, b.hostedby]));
     const ctrlKey = JSON.stringify((c.controls || []).map(col => col.map(s => [s.name, s.widget, s.params])));
-    let rebuilt = false;
+    const rebuilt = [];
     if (bindKey !== last.current.bindKey) {
       last.current.bindKey = bindKey;
       const host = el.querySelector('.binds');
       // Let any custom widgets clean up before the swap orphans their nodes (mirrors the .ichart dispose above).
-      if (host) { _keepFocus(host, () => { window.teardownCustomWidgets(host); host.innerHTML = window.bindsInner(c); }); rebuilt = true; }
+      if (host) { _keepFocus(host, () => { window.teardownCustomWidgets(host); host.innerHTML = window.bindsInner(c); }); rebuilt.push(host); }
     }
     if (ctrlKey !== last.current.ctrlKey) {
       last.current.ctrlKey = ctrlKey;
       const host = el.querySelector('.controls');
-      if (host) { _keepFocus(host, () => { window.teardownCustomWidgets(host); host.innerHTML = window.controlStripInner(c); }); rebuilt = true; }
+      if (host) { _keepFocus(host, () => { window.teardownCustomWidgets(host); host.innerHTML = window.controlStripInner(c); }); rebuilt.push(host); }
     }
-    if (rebuilt) window.mountControls(c);             // wire the freshly-built controls
+    // Wire only the hosts just rebuilt: wiring is not idempotent, and the other host's controls are live.
+    if (rebuilt.length) window.mountControls(c, rebuilt);
 
     // Markdown renders its prose and nothing else — but the strip above is built first, because
     // `{{ }}` interpolation puts prose in the reactive graph, so a markdown cell can host a

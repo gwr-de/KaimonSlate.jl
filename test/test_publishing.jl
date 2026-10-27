@@ -326,6 +326,10 @@ end
     @test NS._split_ssh_dest("u@h:/p") == ("u@h", "/p")
     @test NS._split_ssh_dest("/no-colon") == ("", "/no-colon")
     @test !NS.preflight(NS.RsyncServeTarget(; name = "x", dest = "/no-colon", port = 99999)).ok
+    # loopback by default, with no derived URL; a public bind derives one from the dest
+    lo = NS.RsyncServeTarget(; name = "x", dest = "u@h:/srv/site")
+    @test lo.bind == "127.0.0.1" && lo.url == ""
+    @test NS.RsyncServeTarget(; name = "x", dest = "u@h:/srv/site", bind = "0.0.0.0").url == "http://h:8080/"
     @test "rsync-serve" in NS._TARGET_KINDS
 
     @test_throws ErrorException NS.target_from_ledger(PL.Target("z", "totally-unknown-kind"))

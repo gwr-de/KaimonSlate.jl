@@ -118,8 +118,8 @@ function rlRenderKnown(curHost) {
   if (!known.length) { el.innerHTML = ''; return; }
   el.innerHTML = '<div class="rlknownhead">Known remotes</div>' + known.map(h => {
     const isDef = h === ((_rlHosts && _rlHosts.global) || '');
-    return '<div class="rlrow' + (h === curHost ? ' on' : '') + '" role="button" title="use this remote" onclick="rlUse(\'' +
-      _rlEsc(h) + '\')"><span>' + (isDef ? '★' : '🖧') + ' ' + _rlEsc(h) + (isDef ? ' <em>(default)</em>' : '') + '</span></div>';
+    return '<div class="rlrow' + (h === curHost ? ' on' : '') + '" role="button" title="use this remote" onclick="rlUse(' +
+      window.slateJsArg(h) + ')"><span>' + (isDef ? '★' : '🖧') + ' ' + _rlEsc(h) + (isDef ? ' <em>(default)</em>' : '') + '</span></div>';
   }).join('');
 }
 function rlUse(h) {
@@ -222,7 +222,7 @@ async function rlManageWorkers(ev) {
       _rlEsc(mf.notebook || '?') + '<div class="rldetail">last activity: ' + age +
       (abandoned ? ' · <span class="rlabandon">possibly abandoned</span>' : '') +
       (mf.spawned ? ' · since ' + _rlEsc(mf.spawned) : '') + '</div></div>' +
-      '<button class="rlreap" onclick="rlReap(\'' + _rlEsc(host) + '\',' + w.port + ')" title="kill this worker + remove its files">Reap</button></div>';
+      '<button class="rlreap" onclick="rlReap(' + window.slateJsArg(host) + ',' + w.port + ')" title="kill this worker + remove its files">Reap</button></div>';
   }).join('');
   box.innerHTML = '<div class="rlnote">Workers on ' + _rlEsc(host) + ' — reap only ones you\'re sure about (results are lost):</div>' + rows;
 }

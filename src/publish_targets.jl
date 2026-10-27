@@ -141,14 +141,13 @@ struct RsyncServeTarget <: PublishTarget
     port::Int           # remote bind port
 end
 
-# Bind 0.0.0.0 by DEFAULT so the site is directly reachable at http://<host>:<port>/ — no SSH
-# tunnel. `url` auto-derives from the dest host + port when left blank, so the "live" link points
-# at the real address instead of localhost. (Set bind=127.0.0.1 to keep it private and front it
-# with your own proxy/tunnel.)
+# Binds 127.0.0.1 by default, the same as a target read from the ledger: the site stays private
+# until you front it with a tunnel or proxy, or set `bind = "0.0.0.0"`. With a non-loopback bind and
+# no `url`, the URL is derived from the dest host and port.
 function RsyncServeTarget(; name, dest::AbstractString, url = "", delete::Bool = true,
-                         bind::AbstractString = "0.0.0.0", port::Integer = 8080)
+                         bind::AbstractString = "127.0.0.1", port::Integer = 8080)
     u = String(url)
-    if isempty(strip(u))
+    if isempty(strip(u)) && !(String(bind) in ("127.0.0.1", "localhost", "::1"))
         host = first(_split_ssh_dest(String(dest)))          # "user@host" → host
         h = isempty(host) ? "" : String(split(host, '@')[end])
         isempty(h) || (u = "http://$h:$(Int(port))/")
@@ -159,6 +158,7 @@ end
 # The bundled deployables (shipped in src/serve/), staged to the remote control dir on each publish.
 const _SLATE_SERVE_SCRIPT    = normpath(joinpath(@__DIR__, "serve", "slate_serve.jl"))
 const _SLATE_SERVE_BOOTSTRAP = normpath(joinpath(@__DIR__, "serve", "bootstrap.sh"))
+const _SLATE_SERVE_MIME      = normpath(joinpath(@__DIR__, "serve", "mime_types.jl"))
 
 # "user@host:/path" → ("user@host", "/path"). No colon ⇒ ("", dest) (invalid; flagged in preflight).
 function _split_ssh_dest(dest::AbstractString)
@@ -194,6 +194,7 @@ function _rsync_serve_steps(t::RsyncServeTarget, dir, host, remote_dir, slug, ct
         `rsync $rargs`,
         `ssh $host mkdir -p $ctrl`,
         `scp -q $_SLATE_SERVE_SCRIPT $host:$ctrl/slate_serve.jl`,
+        `scp -q $_SLATE_SERVE_MIME $host:$ctrl/mime_types.jl`,
         `scp -q $_SLATE_SERVE_BOOTSTRAP $host:$ctrl/bootstrap.sh`,
         `ssh $host bash $ctrl/bootstrap.sh $slug $remote_dir $(t.bind) $(string(t.port))`,
     ]

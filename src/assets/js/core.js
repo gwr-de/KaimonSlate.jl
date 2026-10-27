@@ -10,6 +10,10 @@ const _apipath = p => p.replace(/^\/api\//, '/api/' + NB_ID + '/');
 // can reach it too — a classic script's lexical `const` is invisible to them.
 window.slateEscHtml = s => String(s == null ? '' : s).replace(/[&<>"']/g,
   c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// A value as a JS string argument inside an inline handler attribute: `onclick="f(' + slateJsArg(v) + ')"`.
+// HTML-escaping alone is not enough there: the attribute is decoded before the handler is compiled,
+// so an escaped `'` comes back as a quote that ends the string.
+window.slateJsArg = v => window.slateEscHtml(JSON.stringify(v == null ? '' : String(v)));
 
 // Is this page an APP (server_app.jl)? Read from the bootstrap object the server injects into
 // <head>, so it is true from the very first script — `body.app` is only added on DOMContentLoaded
@@ -937,11 +941,8 @@ function renderCharts(c) {
     // The GL-lib deferral that applied to the whole cell now applies per placeholder — same rule,
     // narrower scope: init only after `requireScripts` has loaded.
     window.chartRuntime.scripts(spec).then(() => {
-      if (!el._inst) el._inst = _initChart(el, spec);
-      _applySize(el, el._inst, spec);
-      return _ensurePrereqs(spec)
-        .then(() => _geoSafeSetOption(el._inst, spec))
-        .then(() => _wireEchartReplay(el._inst, spec));
+      const rt = window.chartRuntime;
+      return rt.apply(el, el.__inst || rt.init(el, spec), spec);   // the same init/apply a code cell's chart gets
     });
   });
 }
