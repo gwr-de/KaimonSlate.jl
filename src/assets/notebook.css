@@ -1426,6 +1426,7 @@ input.toggle:checked::after { left:18px; }
 .apmsg.tool .toolcode { margin:4px 0 2px; padding:6px 8px; background:var(--bg); border:1px solid var(--bg3); border-radius:5px; font-size:.72rem; line-height:1.45; max-height:200px; overflow:auto; white-space:pre-wrap; word-break:break-word; color:var(--text); }
 .apmsg.tool .toolresult { margin:2px 0 2px; padding:6px 8px; background:var(--bg); border:1px solid var(--bg3); border-left:2px solid var(--accent); border-radius:5px; font-size:.72rem; line-height:1.45; max-height:200px; overflow:auto; white-space:pre-wrap; word-break:break-word; color:var(--green,#56d364); }
 .apmsg.tool .toolresult.err { border-left-color:var(--red,#e57575); color:var(--red,#e57575); }
+.apmsg.tool.failed { color:var(--red,#e57575); }
 /* Click a tool row to reveal its full args + result (terse rows like "ToolSearch" otherwise show only a name). */
 .apmsg.tool.expandable { cursor:pointer; }
 .apmsg.tool .toolcaret { display:inline-block; color:var(--dim); font-size:.7em; margin-right:3px; transition:transform .12s; }

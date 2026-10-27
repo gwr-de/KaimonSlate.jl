@@ -943,10 +943,10 @@ function toggleSource(id, mode) {
 // The ✎ "edit source" header button, for ANY cell kind. md / @bind cells render OUTPUT by default and
 // keep their source in a hidden `.srcedit` overlay → toggle it. code / web cells show their editor
 // inline (no overlay) → just focus it, un-hiding the code first if it was hidden via 🙈.
-function editCellSource(id, kind) {
+async function editCellSource(id, kind) {
   const cell = document.getElementById('cell-' + id); if (!cell) return;
   if (cell.querySelector('.srcedit')) { toggleSource(id, kind === 'md' ? 'markdown' : 'julia'); return; }
-  if (cell.classList.contains('codehidden')) toggleHideCode(id);   // reveal hidden code before focusing
+  if (cell.classList.contains('codehidden')) await toggleHideCode(id);   // reveal hidden code before focusing
   if (window.ensureEditor) window.ensureEditor(id);                // mount if it hasn't lazily yet
   if (window.edFocus) window.edFocus(id);
 }

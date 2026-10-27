@@ -142,7 +142,7 @@ function _filesRow(r) {
     if (n.notebook) ico.title = 'a Slate notebook — double-click to open it';
     el.appendChild(ico);
     el.appendChild(document.createTextNode(' ' + n.name));
-    if (n.path === (_filesTree.self || ' ')) {
+    if (n.path === (_filesTree.self || '\0')) {
       const s = document.createElement('span'); s.className = 'ftself'; s.textContent = 'notebook';
       s.title = "this notebook's own source"; el.appendChild(s);
     }
@@ -376,6 +376,8 @@ async function _fileOpMkdir(dir) {
   if (j) { _openDirs.add(path); await _filesLoadTree({ select: path }); }
 }
 
+// `p` is `dir` itself or a path inside it.
+const _underPath = (p, dir) => p === dir || p.startsWith(dir + '/');
 async function _fileOpRename(n) {
   const to = await promptDark('Rename ' + n.path + ' to:', n.name, { ok: 'Rename' });
   if (!to || to === n.name) return;
@@ -383,8 +385,12 @@ async function _fileOpRename(n) {
   const dst = _joinRel(_dirName(n.path), to).replace(/^\/+/, '');
   const j = await _fileOp({ op: 'rename', path: n.path, to: dst });
   if (!j) return;
-  if (_fileOpen === n.path) { _fileOpen = j.path; _filesSetPath(j.path); _filesSetDownload(j.path); }
-  if (_fileStates[n.path]) { _fileStates[j.path] = _fileStates[n.path]; delete _fileStates[n.path]; }
+  if (_fileOpen && _underPath(_fileOpen, n.path)) {
+    _fileOpen = j.path + _fileOpen.slice(n.path.length); _filesSetPath(_fileOpen); _filesSetDownload(_fileOpen);
+  }
+  for (const p of Object.keys(_fileStates)) {
+    if (_underPath(p, n.path)) { _fileStates[j.path + p.slice(n.path.length)] = _fileStates[p]; delete _fileStates[p]; }
+  }
   await _filesLoadTree({ select: j.path });
   _toast('Renamed → ' + j.path);
 }
@@ -408,7 +414,7 @@ async function _fileOpDelete(n) {
   if (!await confirmDark(msg, 'Delete', 'danger')) return;
   const j = await _fileOp({ op: 'delete', path: n.path, recursive: isDir });
   if (!j) return;
-  if (_fileOpen && (_fileOpen === n.path || (isDir && _fileOpen.startsWith(n.path + '/')))) _filesClose();
+  if (_fileOpen && _underPath(_fileOpen, n.path)) _filesClose();
   delete _fileStates[n.path];
   _fileSel = _dirName(n.path);
   await _filesLoadTree();
