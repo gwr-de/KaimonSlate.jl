@@ -141,6 +141,15 @@ function _interrupt_inflight!(nb::LiveNotebook)
     return n < 0 ? 0 : n
 end
 
+# Let a boot in progress finish before replacing or resetting the kernel. The boot installs its kernel
+# under `nb.lock`, so a kernel op on the placeholder made while holding that lock would wait on it for
+# good; and a kernel swapped in meanwhile would be overwritten when the boot lands. Off the lock.
+function _settle_boot!(nb::LiveNotebook)
+    k = nb.kernel
+    k isa ReportEngine.PendingKernel && try; ReportEngine._await_real(k); catch; end   # a failed boot is fine too
+    return nothing
+end
+
 function restart_kernel!(nb::LiveNotebook)
     # Tear down + reset synchronously (fast), mark a background re-run underway, and RETURN — the
     # full re-eval (which respawns the worker on prepare! and streams cells back) runs async, so the
@@ -151,6 +160,7 @@ function restart_kernel!(nb::LiveNotebook)
     # a BLOCKING round-trip, so it runs OFF `nb.lock` (protocol: never hold nb.lock across a kernel call).
     # Interrupt any in-flight eval first so `shutdown!` doesn't block behind it (the deadlock this fixes:
     # holding nb.lock across `shutdown!` while the runner needs nb.lock to finish → hub wedges).
+    _settle_boot!(nb)
     _interrupt_inflight!(nb)
     try; ReportEngine.shutdown!(nb.kernel; kill_remote = true); catch; end
     _teardown_region!(nb; kill = true)       # region kernels restart fresh too (+ sync state reset)
@@ -194,6 +204,7 @@ end
 # Tears down the current kernel, RE-PICKS the kernel type (remote attach vs local) via _select_kernel,
 # and re-runs — async, same "instant" pattern as restart_kernel!. Runtime-only (not written to the .jl).
 function set_remote_worker!(nb::LiveNotebook, spec::AbstractString)
+    _settle_boot!(nb)
     _interrupt_inflight!(nb)   # switching workers stops the current evaluation immediately (don't drain)
     try; ReportEngine.shutdown!(nb.kernel); catch; end         # blocking teardown — OFF nb.lock (local killed; remote detached, idles warm)
     with_report(nb) do report
@@ -2383,6 +2394,7 @@ function _make_router(h::Hub)
         _json(state_json(nb))
     end))
     HTTP.register!(router, "POST", "/api/{id}/reset", req -> _withnb(h, req, nb -> begin
+        _settle_boot!(nb)
         with_report(nb) do report; ReportEngine.reset!(nb.kernel, report); build_dependencies!(report); end
         _eval!(nb); _json(state_json(nb))
     end))

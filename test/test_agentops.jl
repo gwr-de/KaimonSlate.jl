@@ -441,7 +441,8 @@ end
         @test nb2.id == id
         @test NS.undo_label(nb2) == ""             # the label of an undo the new stack does not hold
 
-        # A restart owns the failure state: the last bring-up's error does not outlive it.
+        # A restart owns the failure state: the last bring-up's error does not outlive it. The reopen's
+        # boot is still in flight here, so this is also a restart that has to wait for it rather than hang.
         nb2.report.meta["hydrate_error"] = "an earlier failure"
         NS.restart_kernel!(nb2)
         timedwait(() -> !haskey(nb2.report.meta, "hydrating"), 30.0)
