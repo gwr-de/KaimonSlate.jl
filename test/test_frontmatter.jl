@@ -579,6 +579,9 @@ x = 1
         r = RE.parse_report("#%% md id=a\nSee [@b] then [@a].\n\n#%% md id=refs bibliography\n@book{a,title={A}}\n@book{b,title={B}}\n")
         nums = NS.citation_numbers(r, Set(["a", "b"]))
         @test nums == Dict("b" => 1, "a" => 2)     # `b` is cited first → [1]
+        # a figure cross-reference or a key with no entry takes no number
+        r = RE.parse_report("#%% md id=a\nSee [@fig:flow], [@nope] and [@a].\n\n#%% md id=refs bibliography\n@book{a,title={A}}\n")
+        @test NS.citation_numbers(r, Set(["a"])) == Dict("a" => 1)
         # live HTML-link emit tracks the bibstyle: numeric → [3, p. 7], author-date → (Knuth, 1984)
         numctx = (anchor = "refs", tips = Dict("k" => "Knuth · TeX"), labels = Dict("k" => "3"),
                   numeric = true, numbers = Dict("k" => 3))

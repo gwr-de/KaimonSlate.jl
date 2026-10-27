@@ -1344,7 +1344,8 @@ end
 # detection (code-skipping + defined-key check) via a recording emit, so it never drifts.
 function citation_numbers(report, citekeys)
     order = String[]; seen = Set{String}()
-    rec = (key, _sup, _form) -> (k = String(key); (k in seen || (push!(order, k); push!(seen, k))); "")
+    # Only a key in the bibliography takes a number: `[@fig:…]` and unknown keys reach `emit` too.
+    rec = (key, _sup, _form) -> (k = String(key); (k in citekeys && !(k in seen)) && (push!(order, k); push!(seen, k)); "")
     for c in report.cells
         (c.kind == MARKDOWN && !(:bibliography in c.flags)) || continue
         _rewrite_citations(c.source, citekeys; emit = rec)

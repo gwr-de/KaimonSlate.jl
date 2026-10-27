@@ -1002,7 +1002,7 @@ end
 # cells stay local, cross-boundary MUTATION is undefined (same as the release-plan validity rule).
 const _REGION_KERNELS = Dict{Tuple{String,String},Any}()   # (nb id, region name) → GateKernel
 const _REGION_SYNCED = Dict{String,Dict{String,String}}()  # nb id → "side:name" → freshness token
-const _REGION_PRIMED = Dict{Tuple{String,UInt},UInt}()     # (nb id, kernel objectid) → signature of primed `using` cells
+const _REGION_PRIMED = Dict{Tuple{String,UInt},UInt}()     # (nb id, `_worker_key`) → signature of primed `using` cells
 # Keys currently being primed. `_prime_namespace!` stages each EVERYWHERE cell's data reads through
 # `_region_presync!`, which primes both sides before its first transfer — so the two call each other.
 # A nested prime for a key already in flight is a no-op: the outer call is establishing that kernel.
@@ -1703,7 +1703,7 @@ function restart_region!(nb::LiveNotebook, side::AbstractString)
     isempty(side) && return restart_kernel!(nb)
     k = lock(_REGION_LOCK) do
         kk = pop!(_REGION_KERNELS, (nb.id, String(side)), nothing)
-        kk === nothing || delete!(_REGION_PRIMED, (nb.id, objectid(kk)))   # fresh kernel re-primes itself
+        kk === nothing || delete!(_REGION_PRIMED, (nb.id, _worker_key(kk)))   # fresh kernel re-primes itself
         delete!(_REGION_SYNCED, nb.id)   # coarse (keyed per-nb): re-ships boundary values to the fresh kernel
         kk
     end
@@ -1883,7 +1883,7 @@ function _liveness_sweep!(nb::LiveNotebook)
             end
         end
     end
-    _LAST_RUNNING[nb.id] = (ids, anyok)
+    lock(_WD_LOCK) do; _LAST_RUNNING[nb.id] = (ids, anyok); end
     return nothing
 end
 
@@ -1910,7 +1910,7 @@ end
 # `nothing` if NO kernel could be queried (all unreachable) — in which case we must not judge anything
 # orphaned. Reads the sweep's cache (populated just before the reconciler runs) to avoid double-pinging.
 function _worker_running_ids(nb::LiveNotebook)
-    cached = get(_LAST_RUNNING, nb.id, nothing)
+    cached = lock(_WD_LOCK) do; get(_LAST_RUNNING, nb.id, nothing); end
     cached === nothing && return nothing
     ids, anyok = cached
     return anyok ? ids : nothing

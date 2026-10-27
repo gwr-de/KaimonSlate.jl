@@ -227,6 +227,12 @@ mean(data)
         @test length(ids) == length(unique(ids))
     end
 
+    @testset "a repeated explicit id gets a free suffix" begin
+        r = @test_logs (:warn, r"`a`.*`a_2`") (:warn, r"`a`.*`a_3`") parse_report(
+            "#%% code id=a\nx = 1\n#%% code id=a\ny = 2\n#%% code id=a_2_x\nw = 0\n#%% code id=a\nz = 3\n")
+        @test [c.id for c in r.cells] == ["a", "a_2", "a_2_x", "a_3"]
+    end
+
     @testset "ECharts DSL — clear ArgumentError on bad input" begin
         S = ReportEngine.series
         @test_throws ArgumentError S(:line, [1, 2, 3], [1, 2])       # mismatched x/y

@@ -426,6 +426,31 @@ end
     end
 end
 
+@testset "a reopened notebook starts without the closed one's per-id state" begin
+    hub = NS.start_hub(; port = 8869)
+    try
+        nbp = tempname() * ".jl"
+        write(nbp, "#%% code id=a\nbase = 10\n")
+        id = NS.open_notebook!(hub, nbp; autorun = false)
+        nb = hub.notebooks[id]
+        NS._snapshot!(nb; label = "edit a")
+        @test NS.undo_label(nb) == "edit a"
+
+        NS.close_notebook!(hub, id)
+        nb2 = hub.notebooks[NS.open_notebook!(hub, nbp; autorun = false)]
+        @test nb2.id == id
+        @test NS.undo_label(nb2) == ""             # the label of an undo the new stack does not hold
+
+        # A restart owns the failure state: the last bring-up's error does not outlive it.
+        nb2.report.meta["hydrate_error"] = "an earlier failure"
+        NS.restart_kernel!(nb2)
+        timedwait(() -> !haskey(nb2.report.meta, "hydrating"), 30.0)
+        @test !haskey(nb2.report.meta, "hydrate_error")
+    finally
+        NS.stop_hub(hub)
+    end
+end
+
 @testset "locked cell self-heals on a fresh autorun=false open (a cold reopen has nothing in memory)" begin
     hub = NS.start_hub(; port = 8861)
     try
