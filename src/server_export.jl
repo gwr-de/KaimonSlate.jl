@@ -1577,37 +1577,48 @@ for(var y=0;y<rows;y++){var row=new Array(cols);
 for(var x=0;x<cols;x++)row[x]=flat[x*rows+y];out[y]=row;}
 return out;}
 return Array.from(flat);},
-/* `marks` each carry at least {id, control}; `apply(slice, mark)` is the renderer's one step. */
+/* Two domains naming the same positions in the same order. */
+sameDomain:function(a,b){var R=Slate.replay;if(a.length!==b.length)return false;
+for(var i=0;i<a.length;i++)if(!R.same(a[i],b[i]))return false;return true;},
+/* `marks` are ONE figure's, each carrying at least {id, control}; `apply(slice, mark)` is the renderer's
+   one step. A figure's marks on one control move together or not at all: they are wired as a group,
+   only when every one has a sweep over the same domain and all their data has loaded, and each move
+   applies one index to all of them. A group that cannot be wired leaves the figure as exported for that
+   control, and says why in the console. */
 wire:function(marks,apply){if(Slate.isLive())return;
-(marks||[]).forEach(function(m){
-/* A mark names a SWEEP, not an asset: what shipped — and at what resolution — is the export's
-   decision, published in this table. A mark with no entry never wires, so a figure whose sweep was
-   skipped leaves its control visibly disabled instead of failing at the first drag. */
-var R=Slate.replay;
-var sweep=(window.__slateReplays||{})[m.id];if(!sweep)return;
-var hosts=R.hosts(m.control);if(!hosts.length)return;
-/* A sweep whose payload rode INLINE rather than in a binary asset. Prose is the case: a position is a
-   few short strings, and a fetch + decode + narrowing step exists to move megabytes of floats. There is
-   nothing to await, so the control enables immediately. */
-var inline=Array.isArray(sweep.values)?sweep.values:null;
-var loaded=inline?null:Slate.asset(sweep.asset);
-var run=function(src){var key=R.read(src);var i=R.index(sweep.domain||[],key);if(i<0)return;
+var R=Slate.replay,table=window.__slateReplays||{},groups=new Map();
+(marks||[]).forEach(function(m){if(!groups.has(m.control))groups.set(m.control,[]);groups.get(m.control).push(m);});
+groups.forEach(function(ms,control){
+var hosts=R.hosts(control);if(!hosts.length)return;
+/* A mark names a SWEEP, not an asset: what shipped, and at what resolution, is the export's decision,
+   published in this table. */
+var sweeps=ms.map(function(m){return table[m.id];});
+var ids=ms.map(function(m){return m.id;});
+var missing=ids.filter(function(_,j){return !sweeps[j];});
+if(missing.length){console.warn("@replay: `"+control+"` does not move this figure: no data shipped for "+missing.join(", "));return;}
+var domain=sweeps[0].domain||[];
+if(!sweeps.every(function(s){return R.sameDomain(s.domain||[],domain);})){
+console.warn("@replay: `"+control+"` does not move this figure: its marks were exported at different positions ("+ids.join(", ")+")");return;}
+/* A sweep whose payload rode INLINE rather than in a binary asset is ready at once. Prose is the case:
+   a position is a few short strings, and a fetch + decode + narrowing step exists to move megabytes. */
+Promise.all(sweeps.map(function(s){return Array.isArray(s.values)?s.values:Slate.asset(s.asset);}))
+.then(function(data){
+var run=function(src){var key=R.read(src);var i=R.index(domain,key);if(i<0)return;
 /* A control surfaced beside several figures renders once per cell. Push the mover's state onto its
    copies, or the reader drags one strip and the others sit there stating something false. */
 hosts.forEach(function(h){if(h!==src)R.mirror(h,key);R.paint(h);R.relabel(h,key);});
-if(inline){apply(inline[i],m,i);return;}
-loaded.then(function(packed){apply(R.slice(packed,sweep,i),m,i);})
-.catch(function(e){console.error("replay failed",e);});};
+ms.forEach(function(m,j){var s=sweeps[j];apply(Array.isArray(s.values)?s.values[i]:R.slice(data[j],s,i),m,i);});};
 hosts.forEach(function(h){R.listen(h,function(){run(h);});});
-/* Apply the export-time position ONCE on load. A figure is already drawn at it, so this repaints the
-   same numbers — but a replayed TABLE is written with the UNION of every position (that is what the
-   order and the mask index into), so until this ran the reader saw every row and every column any
-   position can show, and only touching the control brought it back to what was exported. */
-if(inline){hosts.forEach(function(h){R.enable(h,true);});run(hosts[0]);return;}
 /* Every exported control renders DISABLED, because one that moves without changing anything reads as
-   a broken page. Enabling here — and only here — means a control is live exactly when data for it
-   actually rode along, with no coordination between the two sides. */
-loaded.then(function(){hosts.forEach(function(h){R.enable(h,true);});run(hosts[0]);}).catch(function(){});});}
+   a broken page. Enabling here, and only here, means a control is live exactly when the data for every
+   mark it drives has arrived. */
+hosts.forEach(function(h){R.enable(h,true);});
+/* Apply the export-time position ONCE. A figure is already drawn at it, so this repaints the same
+   numbers, but a replayed TABLE is written with the UNION of every position (that is what the order and
+   the mask index into), so until this ran the reader saw every row and every column any position can
+   show. */
+run(hosts[0]);})
+.catch(function(e){console.warn("@replay: `"+control+"` does not move this figure: its data did not load ("+ids.join(", ")+")",e);});});}
 };
 Slate.assetUrl=function(path){var a=window.__slateAssets[path];if(!a)return path;
 if(a.data!==undefined)return "data:"+(a.mime||"application/octet-stream")+";base64,"+a.data;return a.url||path;};

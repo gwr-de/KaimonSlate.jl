@@ -1870,7 +1870,7 @@ function _run_replay_sweeps(sweeps::Dict{String,Any}, lk::ReentrantLock = Reentr
             "b64" => Base64.base64encode(reinterpret(UInt8, vec(A)))), extra)
         catch e
             msg = sprint(showerror, e)
-            @warn "@replay: sweeping `$(get(s, :name, id))` failed — that control exports frozen" id msg
+            @warn "@replay: sweeping `$(get(s, :name, id))` failed — the figure holding this mark stays as exported when the control moves" id msg
             out[id] = Dict{String,Any}("control" => String(get(s, :name, "")),
                                        "cell" => String(get(s, :cell, "")), "error" => msg)
         end

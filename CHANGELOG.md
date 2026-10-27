@@ -12,6 +12,14 @@ were written when they went out. They are marked.
 
 ## [Unreleased]
 
+### Fixed
+
+- In an exported page, a figure's `@replay` marks on one control move together or not at all. The
+  control moves the figure only when every one of those marks has its data over the same positions;
+  otherwise the figure stays as exported and the browser console names the marks. A figure could
+  show data from different control positions when one mark's sweep failed or was exported at a
+  different stride. (#64, reported by @disberd)
+
 ## [1.12.1] - 2026-10-26
 
 ### Fixed
