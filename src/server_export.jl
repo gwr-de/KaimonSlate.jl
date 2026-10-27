@@ -5908,26 +5908,27 @@ function relay_agent_event(channel::AbstractString, data)
     kind = env === nothing ? "" : get(env, "kind", "")
     is_delta = kind == "tool_input_delta" ||
         (env !== nothing && (d = get(env, "data", nothing); d isa AbstractDict && get(d, "delta", false) === true))
-    nb, ended = lock(_AGENT_LOCK) do
+    nb, crew, ended = lock(_AGENT_LOCK) do
         n = get(_AGENT_ROUTES, aid, nothing)
-        n === nothing && return (nothing, false)
+        n === nothing && return (nothing, "", false)
+        c = get(_AGENT_CREW, aid, "")
         # Tag the envelope with the speaking crew member so the SPA can lane multiple
         # agents (and replay stays attributed). Re-serialize only when we parsed cleanly.
         if env !== nothing
-            env["crew"] = get(_AGENT_CREW, aid, "")
+            env["crew"] = c
             s = JSON.json(env)
         end
         slot = _detached_slot(aid)
-        slot === nothing && return (n, false)
+        slot === nothing && return (n, c, false)
         # Its notebook is closed: the transcript on disk keeps the turn for a reopen, and the
         # agent is closed when the turn ends with no reopen to take it back.
         is_delta || _append_chat_log(n, s)
-        kind == "result" || return (nothing, false)
+        kind == "result" || return (nothing, c, false)
         d = _DETACHED_AGENTS[slot.first]
         delete!(d, slot.second)
         isempty(d) && delete!(_DETACHED_AGENTS, slot.first)
         delete!(_AGENT_ROUTES, aid); delete!(_AGENT_CREW, aid)
-        return (nothing, true)
+        return (nothing, c, true)
     end
     ended && Threads.@spawn try; _agent_call(:agent_close, Dict{String,Any}("agent_id" => aid)); catch; end
     nb === nothing && return
