@@ -5692,6 +5692,7 @@ function _agent_system_prompt(nb::LiveNotebook)
 
     Change the notebook's CELLS through the slate tools (slate_add_cell / slate_edit_cell / slate_run /
     slate_delete_cell / slate_rename_cell), not by hand-editing the .jl — that fights the running engine.
+    The hub picks up changes to the .jl on its own, so there is no need to close and reopen the notebook.
 
     DEPENDENCIES the notebook needs (a package a cell will `using`): add them with
     `slate_pkg(notebook="$(nb.id)", op="add", name="…")` — this installs into the NOTEBOOK's own env and
@@ -5833,7 +5834,60 @@ function _reap_agents!(nb::LiveNotebook; keep_log::Bool = false)
     end
     return nothing
 end
-_close_agent!(nb::LiveNotebook) = _reap_agents!(nb; keep_log = false)   # on notebook close
+
+# Notebook file → the crew agents (label → agent id) that were mid-turn when it closed. The
+# agent may be the one that closed it, so it lives on: its events go to the transcript on disk,
+# a reopen of the same file takes it back, and it is closed when its turn ends if none does.
+const _DETACHED_AGENTS = Dict{String,Dict{String,String}}()
+
+_agent_working(aid::AbstractString) =
+    try
+        String(get(_agent_call(:agent_status, Dict{String,Any}("agent_id" => String(aid))), "status", "")) == "working"
+    catch
+        false
+    end
+
+# On notebook close: detach the agents with a turn in flight, reap the rest.
+function _close_agent!(nb::LiveNotebook)
+    busy = _agent_available() ?
+        Dict(l => a for (l, a) in lock(() -> copy(nb.agents), _AGENT_LOCK) if _agent_working(a)) :
+        Dict{String,String}()
+    if !isempty(busy)
+        lock(_AGENT_LOCK) do
+            _DETACHED_AGENTS[abspath(nb.path)] = busy
+            for l in keys(busy); delete!(nb.agents, l); end
+        end
+    end
+    _reap_agents!(nb; keep_log = false)
+    return nothing
+end
+
+# On open: take back the agents detached when this file last closed. The transcript is reloaded
+# under the same lock the relay holds while it writes for a detached agent, so nothing it wrote
+# in between is missed.
+function _reattach_agents!(nb::LiveNotebook)
+    lock(_AGENT_LOCK) do
+        d = pop!(_DETACHED_AGENTS, abspath(nb.path), nothing)
+        d === nothing && return
+        _load_chat_log!(nb)
+        for (label, aid) in d
+            _AGENT_ROUTES[aid] = nb
+            nb.agents[label] = aid
+        end
+        nb.agent_id = get(nb.agents, "", "")
+        _AGENT_TURN[nb.id] = time()
+        nb.agent_busy = true
+    end
+    return nothing
+end
+
+# The detached entry holding `aid`, as `path => label`, or `nothing`.
+function _detached_slot(aid::AbstractString)
+    for (path, d) in _DETACHED_AGENTS, (label, a) in d
+        a == aid && return path => label
+    end
+    return nothing
+end
 
 # Last turn-start time per notebook id — so a `result`'s delayed busy-clear can't clobber the
 # busy flag of a NEWER turn that started inside its window (which would mislabel that turn's edits).
@@ -5849,19 +5903,34 @@ handler routes it to the chat pane. `data` already rides the bus as a JSON strin
 function relay_agent_event(channel::AbstractString, data)
     startswith(channel, "agent:") || return
     aid = String(channel)[length("agent:")+1:end]
-    nb, crew = lock(_AGENT_LOCK) do
-        get(_AGENT_ROUTES, aid, nothing), get(_AGENT_CREW, aid, "")
-    end
-    nb === nothing && return
     s = data isa AbstractString ? String(data) : String(JSON.json(data))
     env = try; JSON.parse(s); catch; nothing; end
     kind = env === nothing ? "" : get(env, "kind", "")
-    # Tag the envelope with the speaking crew member so the SPA can lane multiple
-    # agents (and replay stays attributed). Re-serialize only when we parsed cleanly.
-    if env !== nothing
-        env["crew"] = crew
-        s = JSON.json(env)
+    is_delta = kind == "tool_input_delta" ||
+        (env !== nothing && (d = get(env, "data", nothing); d isa AbstractDict && get(d, "delta", false) === true))
+    nb, ended = lock(_AGENT_LOCK) do
+        n = get(_AGENT_ROUTES, aid, nothing)
+        n === nothing && return (nothing, false)
+        # Tag the envelope with the speaking crew member so the SPA can lane multiple
+        # agents (and replay stays attributed). Re-serialize only when we parsed cleanly.
+        if env !== nothing
+            env["crew"] = get(_AGENT_CREW, aid, "")
+            s = JSON.json(env)
+        end
+        slot = _detached_slot(aid)
+        slot === nothing && return (n, false)
+        # Its notebook is closed: the transcript on disk keeps the turn for a reopen, and the
+        # agent is closed when the turn ends with no reopen to take it back.
+        is_delta || _append_chat_log(n, s)
+        kind == "result" || return (nothing, false)
+        d = _DETACHED_AGENTS[slot.first]
+        delete!(d, slot.second)
+        isempty(d) && delete!(_DETACHED_AGENTS, slot.first)
+        delete!(_AGENT_ROUTES, aid); delete!(_AGENT_CREW, aid)
+        return (nothing, true)
     end
+    ended && Threads.@spawn try; _agent_call(:agent_close, Dict{String,Any}("agent_id" => aid)); catch; end
+    nb === nothing && return
     # Mark the agent busy across a turn so the file-watcher attributes the edits it
     # makes to "agent" (not "external"). Clear shortly AFTER the turn ends, so the
     # watcher tick that picks up the agent's final save is still inside the window.
@@ -5880,8 +5949,6 @@ function relay_agent_event(channel::AbstractString, data)
     # `tool_input_delta`) — the authoritative copies (the `delta:false` block, the
     # `tool_result`) are buffered, so replay stays clean and the cap isn't burned.
     _broadcast(nb, "agent:" * s)
-    is_delta = kind == "tool_input_delta" ||
-        (env !== nothing && (d = get(env, "data", nothing); d isa AbstractDict && get(d, "delta", false) === true))
     is_delta || _buffer_agent_log!(nb, s)   # persist non-delta envelopes for reload-replay
     return nothing
 end

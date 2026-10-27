@@ -3038,6 +3038,7 @@ function open_notebook!(h::Hub, path::AbstractString; threads::AbstractString = 
         id = _unique_id(h, file)
         nb = load_notebook(file; id = id, threads = threads, runon = runon, autorun = autorun, inactive = inactive)
         h.notebooks[id] = nb
+        _reattach_agents!(nb)
         _start_watcher!(nb)
         return id
     end

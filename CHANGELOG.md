@@ -22,6 +22,8 @@ were written when they went out. They are marked.
 - A markdown image with a relative path, such as `![logo](figures/logo.png)`, loads in the notebook
   and travels into every export. The path names a file in the notebook's project folder, as
   `@asset`'s paths do; it used to resolve against the page's address and come back missing. (#79)
+- An agent in the notebook's panel that closes its notebook during a turn carries on with the turn.
+  When the notebook opens again, the agent and its transcript are back in the panel. (#78)
 
 ## [1.12.1] - 2026-10-26
 

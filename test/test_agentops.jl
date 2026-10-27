@@ -375,6 +375,57 @@ end
     end
 end
 
+@testset "an agent mid-turn outlives its notebook's close and returns on reopen" begin
+    # A stand-in agent service: `slate-w` has a turn in flight, `slate-w-rev` is idle.
+    closed = String[]
+    NS._AGENT_SERVICE[] = (tool, args) -> begin
+        aid = String(get(args, "agent_id", ""))
+        tool == :agent_close && push!(closed, aid)
+        tool == :agent_status ? "{\"status\":\"$(aid == "slate-w" ? "working" : "idle")\"}" : "{}"
+    end
+    bind!(nb) = lock(NS._AGENT_LOCK) do
+        for (label, aid) in ("" => "slate-w", "rev" => "slate-w-rev")
+            nb.agents[label] = aid; NS._AGENT_ROUTES[aid] = nb; NS._AGENT_CREW[aid] = label
+        end
+    end
+    event(kind, text = "") = NS.relay_agent_event("agent:slate-w",
+        "{\"kind\":\"$kind\",\"turn\":1,\"data\":{\"text\":\"$text\"}}")
+    hub = NS.start_hub(; port = 8868)
+    withenv("XDG_CACHE_HOME" => mktempdir()) do
+        try
+            nbp = tempname() * ".jl"
+            write(nbp, "#%% code id=a\nbase = 10\n")
+            id = NS.open_notebook!(hub, nbp; autorun = false)
+            nb = hub.notebooks[id]
+            bind!(nb)
+
+            NS.close_notebook!(hub, id)
+            @test closed == ["slate-w-rev"]                          # the idle agent is reaped
+            @test NS._AGENT_ROUTES["slate-w"] === nb                 # the busy one lives on
+            @test haskey(NS._DETACHED_AGENTS, abspath(nbp))
+
+            event("text", "while closed")                            # goes to the transcript on disk
+            nb2 = hub.notebooks[NS.open_notebook!(hub, nbp; autorun = false)]
+            @test nb2.agents == Dict("" => "slate-w")
+            @test nb2.agent_id == "slate-w"
+            @test NS._AGENT_ROUTES["slate-w"] === nb2
+            @test !haskey(NS._DETACHED_AGENTS, abspath(nbp))
+            @test any(l -> occursin("while closed", l), get(NS._AGENT_LOG, nb2.id, String[]))
+
+            # Closed again and never reopened: the agent is closed when its turn ends.
+            NS.close_notebook!(hub, nb2.id)
+            @test haskey(NS._AGENT_ROUTES, "slate-w")
+            event("result")
+            @test timedwait(() -> "slate-w" in closed, 5.0) === :ok
+            @test !haskey(NS._AGENT_ROUTES, "slate-w")
+            @test isempty(NS._DETACHED_AGENTS)
+        finally
+            NS._AGENT_SERVICE[] = nothing
+            NS.stop_hub(hub)
+        end
+    end
+end
+
 @testset "locked cell self-heals on a fresh autorun=false open (a cold reopen has nothing in memory)" begin
     hub = NS.start_hub(; port = 8861)
     try
