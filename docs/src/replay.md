@@ -117,6 +117,28 @@ from the resolution you chose last time.
 
 Publishing does not carry that setting. A published site sweeps every mark at full resolution.
 
+Each mark sweeps on its own. When several marks take a field each from one expensive call, the
+export makes that call once per mark at every position:
+
+```julia
+y1 = @replay(θ, simulate(θ).position)
+y2 = @replay(θ, simulate(θ).velocity)    # simulate runs twice per position
+```
+
+Compute the results over the control's domain once, in a cell of their own, and have each `@replay`
+read from them:
+
+```julia
+runs = Dict(v => simulate(v) for v in 0:5:70)    # the control's domain
+```
+
+```julia
+y1 = @replay(θ, runs[θ].position)
+y2 = @replay(θ, runs[θ].velocity)
+```
+
+The first cell does not read `θ`, so moving the control does not run it again.
+
 ## What the reader gets
 
 Each control is enabled only once its data has loaded, so a control that is live is a control
