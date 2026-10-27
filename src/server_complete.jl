@@ -2191,8 +2191,11 @@ function _make_router(h::Hub)
     end)
     # Full result for a truncated output — only serves temp files WE registered (no path traversal).
     HTTP.register!(router, "GET", "/api/{id}/output/{name}", req -> begin
-        path = outfile_get(string(HTTP.getparam(req, "id"), "/", HTTP.getparam(req, "name")))
-        (path === nothing || !isfile(path)) && return HTTP.Response(404, "no such output")
+        id, name = HTTP.getparam(req, "id"), HTTP.getparam(req, "name")
+        path = outfile_get(string(id, "/", name))
+        path === nothing && return HTTP.Response(404, "no such output")
+        isfile(path) || (path = _fetch_overflow!(h, id, name))
+        path === nothing && return HTTP.Response(404, "The full output is no longer on the machine that produced it.")
         mime = endswith(path, ".html") ? "text/html; charset=utf-8" : "text/plain; charset=utf-8"
         HTTP.Response(200, ["Content-Type" => mime, "Cache-Control" => "public, max-age=31536000, immutable"], read(path))
     end)
@@ -4477,6 +4480,27 @@ function _forget_notebook_state!(nb::LiveNotebook)
     lock(_WD_LOCK) do; delete!(_NB_HEALTH, id); delete!(_LAST_RUNNING, id); end
     delete!(_AGENT_TURN, id)
     return nothing
+end
+
+# An overflow file a remote worker wrote: find the cell whose output names it and the kernel that ran
+# that cell, copy the bytes here, and serve the copy from then on. Only a kernel that is already running
+# is asked; an old output is not a reason to start one. The name is a hash of the contents, so the copy
+# never goes stale.
+function _fetch_overflow!(h::Hub, id::AbstractString, name::AbstractString)
+    nb = lock(h.lock) do; get(h.notebooks, String(id), nothing); end
+    nb === nothing && return nothing
+    cell = findfirst(c -> c.output !== nothing &&
+                          any(e -> basename(String(_ovget(e, :path, ""))) == name, c.output.overflow), nb.report.cells)
+    cell === nothing && return nothing
+    side = _cell_side(nb, nb.report.cells[cell])
+    k = isempty(side) ? nb.kernel : lock(() -> get(_REGION_KERNELS, (nb.id, side), nothing), _REGION_LOCK)
+    k === nothing && return nothing
+    bytes = ReportEngine.get_overflow_file(k, nb.report, name)
+    bytes === nothing && return nothing
+    local_path = joinpath(ReportEngine._overflow_dir(), String(name))
+    try; write(local_path, bytes); catch; return nothing; end
+    _outfile_put!(id, name, local_path)
+    return local_path
 end
 
 "Remove a notebook from the hub: drain its SSE connections and drop it."

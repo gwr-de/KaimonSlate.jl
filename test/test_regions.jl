@@ -10,6 +10,11 @@ using KaimonSlate
 const NS = KaimonSlate.NotebookServer
 const RE = KaimonSlate.ReportEngine
 include("stubgate.jl")
+include(joinpath(@__DIR__, "freeport.jl"))
+
+# A kernel that answers only the overflow fetch, as a remote worker holding the file would.
+struct _OverflowKernel <: RE.Kernel; bytes::Vector{UInt8}; end
+RE.get_overflow_file(k::_OverflowKernel, ::RE.Report, ::AbstractString) = k.bytes
 
 # A Slurm on this machine, for a region whose `host` is "": `squeue` prints the file `queue`, and
 # `scancel` appends its arguments to `cancelled` and empties the queue. A file `down` makes `squeue`
@@ -2837,5 +2842,29 @@ end
             # host generated for itself, which is why only HELD entries are touched.
             @test "keepme/k.txt" in after && "src/main.jl" in after
         end
+    end
+end
+
+@testset "a remote worker's full output is fetched for the link" begin
+    hub = NS.start_hub(; port = freeport())
+    try
+        nbp = tempname() * ".jl"
+        write(nbp, "#%% code id=a\nx = 1\n")
+        nb = hub.notebooks[NS.open_notebook!(hub, nbp; autorun = false)]
+        name = "remote-$(rand(UInt32)).txt"
+        remote = "/elsewhere/.cache/kaimonslate/overflow/" * name        # a path on the worker's machine
+        c = nb.report.cells[1]
+        c.output = RE.CellOutput("", RE.MimeChunk[], Any[], Any[], RE.BindSpec[], "", nothing, nothing, 0.0,
+                                 Any[], "", Any[(kind = "stdout", path = remote, bytes = 9, clipped = false)])
+        bar = NS._overflow_bar(nb.id, c.output.overflow)
+        @test occursin("/api/$(nb.id)/output/$name", bar) && !occursin("vscode://", bar)   # offered, no editor link
+        nb.kernel = _OverflowKernel(Vector{UInt8}("full text"))
+        got = NS._fetch_overflow!(hub, nb.id, name)
+        @test got !== nothing && read(got, String) == "full text"
+        @test NS.outfile_get("$(nb.id)/$name") == got                               # served locally from now on
+        nb.kernel = _OverflowKernel(UInt8[])
+        @test NS._fetch_overflow!(hub, nb.id, "not-$name") === nothing                 # no cell names it
+    finally
+        NS.stop_hub(hub)
     end
 end

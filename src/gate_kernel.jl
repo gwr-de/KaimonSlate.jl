@@ -1661,6 +1661,19 @@ function get_served_asset(k::GateKernel, report::Report, hash::AbstractString)
 end
 get_served_asset(::Kernel, ::Report, ::AbstractString) = nothing
 
+# The bytes of an overflow file (a truncated output's full result) the worker wrote, by file name, for
+# a hub that is not on the worker's machine. `nothing` when the worker no longer has it.
+function get_overflow_file(k::GateKernel, report::Report, name::AbstractString)
+    res = try
+        _tool(k, "__slate_overflow_file", Dict{String,Any}("name" => String(name)); timeout = 60.0)
+    catch
+        return nothing
+    end
+    (res !== nothing && hasproperty(res, :ok) && res.ok === true && hasproperty(res, :b64)) || return nothing
+    return try; Vector{UInt8}(Base64.base64decode(String(res.b64))); catch; nothing; end
+end
+get_overflow_file(::Kernel, ::Report, ::AbstractString) = nothing
+
 # In-process: the extension registered its bytes in THIS process, so the registry is a direct read
 # rather than a round-trip. Without this the hub could not answer `/n/<id>/served/<hash>` at all in
 # standalone, and an extension that serves its front-end runtime that way — BonitoSlate emits

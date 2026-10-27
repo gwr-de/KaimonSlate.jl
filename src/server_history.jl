@@ -886,7 +886,9 @@ function _overflow_bar(nbid::AbstractString, entries)
     isempty(nbid) && return ""
     items = String[]
     for e in entries
-        path = String(_ovget(e, :path, "")); isfile(path) || continue
+        # A path that is not on this machine was written by a remote worker: the route fetches it
+        # from there on first use (`_fetch_overflow!`), so the link is offered either way.
+        path = String(_ovget(e, :path, "")); isempty(path) && continue
         name = basename(path); _outfile_put!(nbid, name, path)
         url = string("/api/", nbid, "/output/", name)
         kind = String(_ovget(e, :kind, "output"))
@@ -896,7 +898,7 @@ function _overflow_bar(nbid::AbstractString, entries)
         push!(items, string(
             "<span class=\"ovitem\">⚠ full ", kind, " (", kb, " KB", clipped ? ", clipped at cap" : "", "): ",
             "<a href=\"", url, "\" target=\"_blank\" rel=\"noopener\">open ↗</a> · ",
-            "<a href=\"vscode://file", path, "\">editor</a> · ",
+            isfile(path) ? string("<a href=\"vscode://file", path, "\">editor</a> · ") : "",
             "<a href=\"", url, "\" download=\"", kind, "-", name, "\">download</a></span>"))
     end
     isempty(items) ? "" : string("<div class=\"ovbar\">", join(items, ""), "</div>")

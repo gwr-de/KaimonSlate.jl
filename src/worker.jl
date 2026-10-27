@@ -1832,6 +1832,15 @@ function __slate_get_served_asset(; hash::String = "")
     return (; ok = true, mime = a.mime, b64 = Base64.base64encode(a.bytes))
 end
 
+"Bytes of an overflow file this worker wrote (`_write_overflow`), for a hub on another machine to serve.
+Only a file directly inside this worker's overflow folder is handed out, by its name."
+function __slate_overflow_file(; name::String = "")
+    (isempty(name) || name != basename(name)) && return (; ok = false)
+    p = joinpath(_overflow_dir(), name)
+    isfile(p) || return (; ok = false)
+    return (; ok = true, b64 = Base64.base64encode(read(p)))
+end
+
 "Re-render every retained live (session-bound) cell output for a browser page that just (re)connected —
 resets per-page runtime (SEB `on_live_reset`) then re-renders each retained value. Returns FLAT parallel
 arrays `(; cids, mimetypes, b64s)` (base64 bytes) — a nested `[(cid, wire)…]` doesn't survive the gate's
@@ -2822,6 +2831,7 @@ function tools()
         KaimonGate.GateTool("__slate_bundle_info", __slate_bundle_info),
         KaimonGate.GateTool("__slate_extension_manifest", __slate_extension_manifest),
         KaimonGate.GateTool("__slate_get_served_asset", __slate_get_served_asset),
+        KaimonGate.GateTool("__slate_overflow_file", __slate_overflow_file),
         KaimonGate.GateTool("__slate_rerender_live", __slate_rerender_live),
         KaimonGate.GateTool("__slate_worker_reset", __slate_worker_reset),
         KaimonGate.GateTool("__slate_pkg", __slate_pkg),
