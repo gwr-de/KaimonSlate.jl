@@ -1197,6 +1197,9 @@ const _REGION_PRIMED = Dict{Tuple{String,UInt},UInt}()     # (nb id, `_worker_ke
 # `_region_presync!`, which primes both sides before its first transfer — so the two call each other.
 # A nested prime for a key already in flight is a no-op: the outer call is establishing that kernel.
 const _REGION_PRIMING = Set{Tuple{String,UInt}}()
+# (nb id, side) → setup that failed on that side's worker: a prime of an EVERYWHERE cell or the opening
+# of a RESOURCE cell, as "cell id: error". A cell that then fails on that side names them (`_with_setup_note`).
+const _SETUP_FAILED = Dict{Tuple{String,String},Dict{String,String}}()
 const _REGION_LOCK = ReentrantLock()
 
 # Codes a BLOCKED cell carries. The page turns each into words; nothing here is a sentence.
@@ -2533,6 +2536,43 @@ function _region_bringup_pending(nb::LiveNotebook, k)
     isempty(env) && return false
     return lock(_REGION_LOCK) do; get(_REGION_PRIMED, (nb.id, _worker_key(k)), UInt(0)); end != sig
 end
+# Replay `src` on `k` for setup (a prime or a resource open). The cell's own code failing comes back as
+# an `exception` on the result, not as a throw, so both count. `nothing` when it ran clean, else the error.
+function _replay_on(k, nb::LiveNotebook, src::AbstractString, tag::AbstractString)
+    out = try
+        ReportEngine.eval_capture(k, nb.report, src, tag, nothing)
+    catch e
+        return sprint(showerror, e)
+    end
+    ex = (out !== nothing && hasproperty(out, :exception)) ? out.exception : nothing
+    return ex === nothing ? nothing : String(ex)
+end
+
+function _note_setup!(nb::LiveNotebook, side::AbstractString, cid::AbstractString, err)
+    lock(_REGION_LOCK) do
+        k = (nb.id, String(side))
+        if err === nothing
+            d = get(_SETUP_FAILED, k, nothing)
+            d === nothing || (delete!(d, String(cid)); isempty(d) && delete!(_SETUP_FAILED, k))
+        else
+            get!(Dict{String,String}, _SETUP_FAILED, k)[String(cid)] = String(err)
+        end
+    end
+    return nothing
+end
+
+# A cell that failed on a side where setup also failed says so: its error is most likely that one.
+function _with_setup_note(out::ReportEngine.CellOutput, nb::LiveNotebook, side::AbstractString)
+    out.exception === nothing && return out
+    failed = lock(() -> copy(get(_SETUP_FAILED, (nb.id, String(side)), Dict{String,String}())), _REGION_LOCK)
+    isempty(failed) && return out
+    where = isempty(side) ? "the main worker" : "region `$side`"
+    note = string("\n\nSetting up ", where, " failed for ",
+                  join(("cell `$id`: $(first(e, 300))" for (id, e) in sort!(collect(failed))), "; "), ".")
+    return ReportEngine.CellOutput((f === :exception ? out.exception * note : getfield(out, f)
+                                    for f in fieldnames(ReportEngine.CellOutput))...)
+end
+
 
 function _prime_namespace!(nb::LiveNotebook, k, side::AbstractString)
     # Cells that ESTABLISH state on every side — pure `using`/`import`, the import scaffold, a `set_theme!`
@@ -2550,6 +2590,7 @@ function _prime_namespace!(nb::LiveNotebook, k, side::AbstractString)
     lock(_REGION_LOCK) do
         key in _REGION_PRIMING ? true : (push!(_REGION_PRIMING, key); false)
     end && return nothing
+    clean = true
     try
         for c in env
             # Stage this cell's cross-boundary DATA reads before replaying it. A definition primed here may
@@ -2565,28 +2606,20 @@ function _prime_namespace!(nb::LiveNotebook, k, side::AbstractString)
                                    first(sprint(showerror, e), 160))
             end
             prime_src = _everywhere_replay_source(c)   # the marked statements when safe, else the whole cell
-            try
-                ReportEngine.eval_capture(k, nb.report, prime_src, "cell:" * c.id * "#prime", nothing)
-            catch e
-                # Per-statement replay can throw if a marked statement referenced a cell-local name defined by
-                # an UNMARKED earlier statement — fall back to the whole cell source (always sufficient).
-                if prime_src != c.source
-                    try
-                        ReportEngine.eval_capture(k, nb.report, c.source, "cell:" * c.id * "#prime", nothing)
-                    catch e2
-                        ReportEngine._rlog("region: namespace prime of $(c.id) on $(_side_label(nb, side)) failed: " *
-                                           first(sprint(showerror, e2), 160))
-                    end
-                else
-                    ReportEngine._rlog("region: namespace prime of $(c.id) on $(_side_label(nb, side)) failed: " *
-                                       first(sprint(showerror, e), 160))
-                end
-            end
+            err = _replay_on(k, nb, prime_src, "cell:" * c.id * "#prime")
+            # Per-statement replay can fail if a marked statement referenced a cell-local name defined by
+            # an UNMARKED earlier statement — fall back to the whole cell source (always sufficient).
+            err !== nothing && prime_src != c.source && (err = _replay_on(k, nb, c.source, "cell:" * c.id * "#prime"))
+            _note_setup!(nb, side, c.id, err)
+            err === nothing && continue
+            clean = false
+            ReportEngine._rlog("region: namespace prime of $(c.id) on $(_side_label(nb, side)) failed: " * first(err, 160))
         end
     finally
         lock(_REGION_LOCK) do; delete!(_REGION_PRIMING, key); end
     end
-    lock(_REGION_LOCK) do; _REGION_PRIMED[key] = sig; end
+    # Recorded only when every cell primed, so a failure is tried again on the next bring-up.
+    clean && lock(_REGION_LOCK) do; _REGION_PRIMED[key] = sig; end
     return nothing
 end
 
@@ -2627,6 +2660,7 @@ function _teardown_region!(nb::LiveNotebook; kill::Bool = false, wait::Bool = tr
         got = [pop!(_REGION_KERNELS, key) for key in collect(keys(_REGION_KERNELS)) if key[1] == nb.id]
         delete!(_REGION_SYNCED, nb.id)
         filter!(kv -> kv[1][1] != nb.id, _REGION_PRIMED)   # forget priming so a re-setup re-primes fresh kernels
+        filter!(kv -> kv[1][1] != nb.id, _SETUP_FAILED)    # …and what failed setting up the kernels that went
         got
     end
     for k in ks
@@ -4400,7 +4434,12 @@ function _ensure_resource_on!(nb::LiveNotebook, cell::Cell, dst_k, dst_side::Abs
     end
     # Open the handle HERE by replaying the cell's source on `dst_k` — its value never crosses the wire.
     tag = "cell:" * cell.id * "#resource@" * (isempty(dst_side) ? "main" : dst_side)
-    ReportEngine.eval_capture(dst_k, nb.report, cell.source, tag, nothing)
+    err = _replay_on(dst_k, nb, cell.source, tag)
+    _note_setup!(nb, dst_side, cell.id, err)
+    if err !== nothing        # not marked as opened, so the next reader tries again
+        ReportEngine._rlog("resource: opening cell $(cell.id) on $(_side_label(nb, dst_side)) failed: " * first(err, 160))
+        return nothing
+    end
     opened = isempty(cell.writes) ? cell.id : join(cell.writes, ", ")
     ReportEngine._rlog("resource: opened $opened on $(_side_label(nb, dst_side)) — " *
                        "replayed cell $(cell.id) (handle not shipped)")
@@ -4415,6 +4454,39 @@ end
 function _region_xfer_mode()
     v = lowercase(strip(get(ENV, "KAIMONSLATE_REGION_XFER", "")))
     v == "relay" ? :relay : v == "direct" ? :direct : :auto
+end
+
+# The transfer token for name `r` written by `writer` on `src_side`, read by `cell`: a value whose token
+# matches the one last shipped to a side is already there. `digests` is `state_digests` for the notebook.
+function _transfer_token(nb::LiveNotebook, cell::Cell, writer::Cell, r, src_side::AbstractString,
+                         digests::AbstractDict)
+    # Freshness token: the writer's latest run PLUS every same-side mutator's — a mutation
+    # changes the value without touching the writer, and a stale transfer would resurrect
+    # the pre-mutation bytes on the other side.
+    token = string(writer.src_hash, ':', objectid(writer.output))
+    # A `@bind` value changes WITHOUT its widget cell re-running — the output objectid is stable,
+    # so fold the current bound value into the token. Else a slider move on one region never
+    # re-ships the new value to a reader on ANOTHER region (dedup sees an unchanged token → the
+    # downstream cell recomputes with the stale value).
+    for b in writer.binds
+        b.name === r && (token *= string('@', b.value))
+    end
+    haskey(digests, string(r)) && (token *= string('#', digests[string(r)]))
+    for o in nb.report.cells
+        (o !== cell && r in o.mutates && _cell_side(nb, o) == src_side && o.output !== nothing) &&
+            (token *= string('+', o.src_hash, ':', objectid(o.output)))
+    end
+    # Manual `needs=` edges harden the boundary too: a linked predecessor running on the
+    # writer's side may be the hidden mutator the edge exists to declare — fold its runs in,
+    # so the single-kernel edge workaround keeps working across a region boundary. A false
+    # positive just re-ships an unchanged value, which content addressing dedups.
+    for t in ReportEngine._manual_needs(cell)
+        j = _index_of(nb.report.cells, t); j === nothing && continue
+        o = nb.report.cells[j]
+        (o.output !== nothing && _cell_side(nb, o) == src_side) &&
+            (token *= string('~', o.src_hash, ':', objectid(o.output)))
+    end
+    return token
 end
 
 # Ship every cross-boundary input of `cell` to the kernel it is about to run on: each read name
@@ -4453,6 +4525,9 @@ function _region_presync!(nb::LiveNotebook, cell::Cell, dst_k; dst_side::Abstrac
     checked = Set{String}()
     _source_current!(side, k) = side in checked || (ReportEngine.prepare!(k, nb.report);
         _check_side!(nb, side, k) && throw(SideReplaced(side)); push!(checked, side))
+    # Reactive writes and a sweep's landed results change a value without re-running its cell; the memo
+    # key reads the same identities (`state_digests`), so a value whose identity moved is shipped again.
+    digests = something(ReportEngine.state_digests(nb.report.id), Dict{String,String}())
     for r in cell.reads
         # The theme sentinel (`##makie_theme##`) is a synthetic ordering/effect token the graphics
         # analysis injects to chain `set_theme!` cells → figures — NOT a real global. Shipping it
@@ -4490,31 +4565,7 @@ function _region_presync!(nb::LiveNotebook, cell::Cell, dst_k; dst_side::Abstrac
             _ensure_resource_on!(nb, writer, dst_k, dst_side)
             continue
         end
-        # Freshness token: the writer's latest run PLUS every same-side mutator's — a mutation
-        # changes the value without touching the writer, and a stale transfer would resurrect
-        # the pre-mutation bytes on the other side.
-        token = string(writer.src_hash, ':', objectid(writer.output))
-        # A `@bind` value changes WITHOUT its widget cell re-running — the output objectid is stable,
-        # so fold the current bound value into the token. Else a slider move on one region never
-        # re-ships the new value to a reader on ANOTHER region (dedup sees an unchanged token → the
-        # downstream cell recomputes with the stale value).
-        for b in writer.binds
-            b.name === r && (token *= string('@', b.value))
-        end
-        for o in nb.report.cells
-            (o !== cell && r in o.mutates && _cell_side(nb, o) == src_side && o.output !== nothing) &&
-                (token *= string('+', o.src_hash, ':', objectid(o.output)))
-        end
-        # Manual `needs=` edges harden the boundary too: a linked predecessor running on the
-        # writer's side may be the hidden mutator the edge exists to declare — fold its runs in,
-        # so the single-kernel edge workaround keeps working across a region boundary. A false
-        # positive just re-ships an unchanged value, which content addressing dedups.
-        for t in ReportEngine._manual_needs(cell)
-            j = _index_of(nb.report.cells, t); j === nothing && continue
-            o = nb.report.cells[j]
-            (o.output !== nothing && _cell_side(nb, o) == src_side) &&
-                (token *= string('~', o.src_hash, ':', objectid(o.output)))
-        end
+        token = _transfer_token(nb, cell, writer, r, src_side, digests)
         # `:g<gen>` folds the dst worker's namespace generation in, so a SWAP (fresh namespace) re-ships
         # this value (the new worker doesn't hold it) while a reattach still dedups.
         key = string(isempty(dst_side) ? "main" : dst_side, ':', r, ":g", _kgen(dst_k))
@@ -5094,6 +5145,7 @@ function _eval_one_run!(nb::LiveNotebook, cid::AbstractString, run::ReportEngine
     # cell references, except the side that just ran. Results discarded (the main run's output
     # stands); a failure logs rather than erroring the cell (that side surfaces it on first use).
     out.memo == "absent" && return _hold_locked!(nb, cid, run)   # restore-only, and nothing was stored
+    out = _with_setup_note(out, nb, side)
     if _region_active(nb) && ReportEngine._is_pure_using(cell.source) && out.exception === nothing
         sides = Set{String}([""])
         for c in nb.report.cells

@@ -2868,3 +2868,42 @@ end
         NS.stop_hub(hub)
     end
 end
+
+@testset "a failed setup replay is not success, and a failing cell names it" begin
+    hub = NS.start_hub(; port = freeport())
+    try
+        nbp = tempname() * ".jl"
+        write(nbp, "#%% code id=a\nx = 1\n")
+        nb = hub.notebooks[NS.open_notebook!(hub, nbp; autorun = false)]
+        k = RE.InProcessKernel()
+        # The cell's own code failing comes back as an exception on the result, not a throw.
+        err = NS._replay_on(k, nb, "error(\"no such package here\")", "cell:boot#prime")
+        @test err !== nothing && occursin("no such package here", err)
+        @test NS._replay_on(k, nb, "y = 2", "cell:ok#prime") === nothing
+        NS._note_setup!(nb, "gpu", "boot", err)
+        failing = RE.CellOutput("", RE.MimeChunk[], Any[], Any[], RE.BindSpec[], "", "UndefVarError: `f`", nothing, 0.0)
+        noted = NS._with_setup_note(failing, nb, "gpu")
+        @test occursin("UndefVarError", noted.exception) && occursin("region `gpu`", noted.exception) &&
+              occursin("cell `boot`", noted.exception)
+        @test NS._with_setup_note(failing, nb, "").exception == failing.exception        # another side
+        NS._note_setup!(nb, "gpu", "boot", nothing)                                        # it primed later
+        @test NS._with_setup_note(failing, nb, "gpu").exception == failing.exception
+    finally
+        NS.stop_hub(hub)
+    end
+end
+
+@testset "a reactive value whose identity moved is shipped again" begin
+    r = RE.parse_report("#%% code id=w\nlevel = 1\n#%% code id=reader\nlevel + 1\n")
+    RE.build_dependencies!(r)
+    nb = NS.LiveNotebook("tok", tempname() * ".jl", r, RE.InProcessKernel(), 0, String[], String[],
+                         ReentrantLock(), Channel{String}[], ReentrantLock(), "", false, Dict{String,String}())
+    w, reader = r.byid["w"], r.byid["reader"]
+    w.output = RE.CellOutput("", RE.MimeChunk[], Any[], Any[], RE.BindSpec[], "1", nothing, nothing, 0.0)
+    t0 = NS._transfer_token(nb, reader, w, :level, "", Dict{String,String}())
+    # A reactive write changes `level` without re-running `w`: same output object, new identity.
+    t1 = NS._transfer_token(nb, reader, w, :level, "", Dict("level" => "d1"))
+    t2 = NS._transfer_token(nb, reader, w, :level, "", Dict("level" => "d2"))
+    @test t0 != t1 && t1 != t2
+    @test NS._transfer_token(nb, reader, w, :level, "", Dict("other" => "d9")) == t0   # another name's identity
+end
