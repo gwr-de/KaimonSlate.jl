@@ -1632,9 +1632,10 @@ function cancel!(l::PbsLauncher, root::AbstractString, names)
     isempty(ns) && return 0
     ok, out = (_ssh(l, join(("ids=\$(qselect -N $(n) -u \"\$USER\" 2>/dev/null) || { echo UNREACHABLE; ids=; }; " *
                              "[ -n \"\$ids\" ] && qdel \$ids >/dev/null 2>&1 && echo CANCELLED"
-                             for n in ns), "\n")))
+                             for n in ns), "\n") * "\necho ANSWERED"))
+    # The last line's status is whether ITS job was live, so the host having answered is the marker.
     replies = strip.(split(out, '\n'; keepempty = false))
-    (ok && !("UNREACHABLE" in replies)) ||
+    ("ANSWERED" in replies && !("UNREACHABLE" in replies)) ||
         error("cancel: the scheduler on $(l.host) did not answer, so whether the jobs stopped is not known")
     return count(==("CANCELLED"), replies)
 end
