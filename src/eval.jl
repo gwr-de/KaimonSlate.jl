@@ -478,10 +478,13 @@ function _await_real(k::PendingKernel)
     return k.real::Kernel
 end
 
-# The 19 Kernel operations with no generic `::Kernel` fallback — each blocks for the real
-# kernel, then forwards. (`shutdown!`, `cancel_cells`, `memo_pin!`, `worker_log_tail`, the
-# 5-arg memo `eval_capture`, and `_kernel_status` already have safe non-blocking `::Kernel`
-# fallbacks above/elsewhere and need no override here.)
+# Each override blocks for the real kernel, then forwards. Two notes on what is and isn't here:
+#   - the 5-arg memo `eval_capture` must stay: its generic `::Kernel` fallback drops `memo`, so an
+#     eval that races the boot would reach the real kernel with no memo key, and neither restore
+#     nor store;
+#   - `shutdown!`, `cancel_cells`, `memo_pin!`, `worker_log_tail`, `_kernel_status` and
+#     `run_cleanups!` keep their non-blocking `::Kernel` fallbacks. Nothing has run on a kernel that
+#     is still booting, so there is nothing to cancel, pin or clean up.
 prepare!(k::PendingKernel, report::Report) = prepare!(_await_real(k), report)
 reset!(k::PendingKernel, report::Report) = reset!(_await_real(k), report)
 eval_capture(k::PendingKernel, report::Report, source::AbstractString, filename::AbstractString = "string";
@@ -902,12 +905,7 @@ function pkg_op(k::InProcessKernel, ::Report, op::AbstractString, name::Abstract
         isempty(k.envdir) && return Dict{String,Any}("ok" => false, "message" => "this notebook has no environment of its own")
         ensure_notebook_env!(k.envdir)   # first add materialises it — base mode until then
     end
-    r = _in_env(dir) do
-        op == "add"    ? add_installed_first!([Pkg.PackageSpec(name = String(name))]) :
-        op == "update" ? Pkg.update(String(name)) :
-                         Pkg.rm(String(name))
-        return Dict{String,Any}("ok" => true, "message" => "")
-    end
+    r = _in_env(() -> _pkg_apply(op, name), dir)   # the specs the worker accepts (pkg_ops.jl)
     # No re-layering afterwards: `_in_notebook_env` rebuilds the scope from `k` at every eval, so an
     # env that only came into existence just now is picked up by the next cell on its own.
     return r

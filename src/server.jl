@@ -3123,7 +3123,7 @@ function _liveness_sweep!(nb::LiveNotebook; replies = nothing)
             end
         end
     end
-    _LAST_RUNNING[nb.id] = (ids, answered, asked)
+    lock(_WD_LOCK) do; _LAST_RUNNING[nb.id] = (ids, answered, asked); end
     return nothing
 end
 
@@ -3152,7 +3152,7 @@ end
 # its cells, whatever the main kernel answered, while a side with no connected kernel at all cannot
 # be running anything. Reads the sweep's cache (populated just before the reconciler runs).
 function _worker_running_ids(nb::LiveNotebook)
-    cached = get(_LAST_RUNNING, nb.id, nothing)
+    cached = lock(_WD_LOCK) do; get(_LAST_RUNNING, nb.id, nothing); end
     cached === nothing && return nothing
     ids, answered, asked = cached
     return isempty(answered) ? nothing : (; ids, answered, asked)

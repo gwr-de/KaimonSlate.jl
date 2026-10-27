@@ -51,7 +51,10 @@ var cycle=[['--accent','#569cd6'],['--green','#56d364'],['--orange','#ce9178'],[
 var vir=['#440154','#472d7b','#3b528b','#2c728e','#21918c','#28ae80','#5ec962','#addc30','#fde725'];
 var ax={axisLine:{lineStyle:{color:border}},axisTick:{lineStyle:{color:border}},axisLabel:{color:dim,fontSize:14},nameTextStyle:{color:text,fontSize:15},splitLine:{lineStyle:{color:border,opacity:0.4}},splitArea:{areaStyle:{color:['transparent','transparent']}}};
 var dark=_slateIsDark(V('--bg',''));
-var t={color:cycle,backgroundColor:'transparent',textStyle:{color:text,fontFamily:'inherit',fontSize:14},title:{left:'center',textStyle:{color:text,fontSize:19,fontWeight:'bold'},subtextStyle:{color:dim,fontSize:12}},legend:{textStyle:{color:dim,fontSize:14}},categoryAxis:ax,valueAxis:ax,logAxis:ax,timeAxis:ax,line:{symbolSize:5},graph:{color:cycle},tooltip:{backgroundColor:bg2,borderColor:border,textStyle:{color:text},valueFormatter:_slateValueFormatter},visualMap:{textStyle:{color:dim},inRange:{color:vir}},timeline:{lineStyle:{color:dim},label:{color:dim}},calendar:{splitLine:{lineStyle:{color:border}},itemStyle:{borderColor:border}}};
+/* A real font stack, as core.js resolves it: canvas rejects 'inherit', and with it every fontSize. */
+var fam=(getComputedStyle(document.body||document.documentElement).fontFamily||'').trim()||"system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif";
+fam=fam.replace(/"/g,"'");
+var t={color:cycle,backgroundColor:'transparent',textStyle:{color:text,fontFamily:fam,fontSize:14},title:{left:'center',textStyle:{color:text,fontSize:19,fontWeight:'bold'},subtextStyle:{color:dim,fontSize:12}},legend:{textStyle:{color:dim,fontSize:14}},categoryAxis:ax,valueAxis:ax,logAxis:ax,timeAxis:ax,line:{symbolSize:5},graph:{color:cycle},tooltip:{backgroundColor:bg2,borderColor:border,textStyle:{color:text},valueFormatter:_slateValueFormatter},visualMap:{textStyle:{color:dim},inRange:{color:vir}},timeline:{lineStyle:{color:dim},label:{color:dim}},calendar:{splitLine:{lineStyle:{color:border}},itemStyle:{borderColor:border}}};
 /* ECharts picks auto label contrast from `darkMode`, inferred from a 'transparent' background as light. */
 if(dark!==null)t.darkMode=dark;
 return t;}
@@ -1740,8 +1743,14 @@ end
 _has_esm_frontend(nb) = any(e -> e.esm, _frontend_scripts(nb))
 
 # Light-family Slate palettes — page chrome + code-highlight theme flip on these; all others are dark.
-const _LIGHT_PALETTES = Set(["daylight", "solarized-light"])
-_export_is_light(name::AbstractString) = String(name) in _LIGHT_PALETTES
+# A palette is light when its page background is (`SLATE_PALETTES`, slate_look.jl), so a new palette needs no entry here.
+function _export_is_light(name::AbstractString)
+    p = get(ReportEngine.SLATE_PALETTES, String(name), nothing)
+    p === nothing && return false
+    h = lstrip(p.bg, '#')
+    r, g, b = (parse(Int, h[i:i+1]; base = 16) for i in (1, 3, 5))
+    return (0.299r + 0.587g + 0.114b) / 255 >= 0.5
+end
 # Resolve an export `theme` arg to a Slate palette NAME: back-compat "dark"/"light" → the canonical
 # midnight/daylight, and any real palette name (charttheme: "nord", "daylight", …) passes through.
 function _resolve_export_theme(theme::AbstractString)
@@ -4119,8 +4128,9 @@ function export_app(nb::LiveNotebook, dir::AbstractString; appdefaults::Abstract
     # A workbook saves the student's answers over the notebook it ships, so the exercises as the
     # author wrote them have to survive somewhere else — this copy is what the Reset button reads
     # (`_workbook_stub_path`). Dotfile-named so it doesn't read as a second notebook to open.
-    workbook && write(joinpath(d, "." * bname * ".original"),
-                      export_standalone(nb; history = false, include = String[]))
+    # Reset reads only cell sources from it, so it is the plain notebook text, without the bundle,
+    # memo results or preview the shipped copy carries.
+    workbook && write(joinpath(d, "." * bname * ".original"), serialize_report(nb.report))
     write(joinpath(d, _SITE_RUNJL), _run_script(""; agent = agent, bundle_name = bname,
                                                 app = true, workbook = workbook,
                                                 appdefaults = appdefaults, port = Int(port),
@@ -4866,41 +4876,8 @@ end
 # Existing local sites (slugified names), newest-content first isn't meaningful here → sorted.
 list_local_sites() = (d = _sites_dir(); isdir(d) ? sort(filter(n -> isdir(joinpath(d, n)), readdir(d))) : String[])
 
-_site_ctype(p) = (e = lowercase(splitext(p)[2]);
-    e == ".html" ? "text/html; charset=utf-8" :
-    e in (".js", ".mjs") ? "application/javascript; charset=utf-8" :
-    e == ".css" ? "text/css; charset=utf-8" :
-    e == ".json" ? "application/json; charset=utf-8" :
-    e == ".png" ? "image/png" :
-    e in (".jpg", ".jpeg") ? "image/jpeg" :
-    e == ".svg" ? "image/svg+xml" :
-    e == ".gif" ? "image/gif" :
-    e == ".webp" ? "image/webp" :
-    e == ".avif" ? "image/avif" :
-    e == ".bmp" ? "image/bmp" :
-    e == ".ico" ? "image/x-icon" :
-    # Media a cell can embed by drag/drop. A media element dispatches its decoder on the declared type,
-    # so `application/octet-stream` here is not a harmless default — it makes the clip unplayable
-    # anywhere the bytes aren't content-sniffed (an inlined `data:` URL, a `nosniff` route).
-    e == ".mp4" ? "video/mp4" :
-    e == ".m4v" ? "video/x-m4v" :
-    e == ".webm" ? "video/webm" :
-    e == ".mov" ? "video/quicktime" :
-    e == ".ogv" ? "video/ogg" :
-    e == ".mp3" ? "audio/mpeg" :
-    e == ".wav" ? "audio/wav" :
-    e in (".ogg", ".oga", ".opus") ? "audio/ogg" :
-    e == ".flac" ? "audio/flac" :
-    e in (".m4a", ".aac") ? "audio/mp4" :
-    e == ".pdf" ? "application/pdf" :
-    e == ".woff2" ? "font/woff2" :
-    e == ".woff" ? "font/woff" :
-    e == ".ttf" ? "font/ttf" :
-    e == ".wasm" ? "application/wasm" :             # WebAssembly.instantiateStreaming requires this exact MIME
-    e == ".glb" ? "model/gltf-binary" :
-    e == ".gltf" ? "model/gltf+json" :
-    e in (".txt", ".jl", ".map") ? "text/plain; charset=utf-8" :
-    "application/octet-stream")
+include(joinpath(@__DIR__, "serve", "mime_types.jl"))   # SITE_MIME_TYPES, shared with slate_serve.jl
+_site_ctype(p) = site_content_type(String(p))
 
 # Resolve `<name>/<sub>` to a servable file under the site dir, with a `..`-traversal guard: the
 # resolved path must stay inside the site. A directory (or empty `sub`) serves its `index.html`.
@@ -5391,7 +5368,7 @@ const _TEX_MACRO = Dict(
     "neq"=>"≠","approx"=>"≈","sim"=>"∼","simeq"=>"≃","equiv"=>"≡","propto"=>"∝","infty"=>"∞","partial"=>"∂",
     "nabla"=>"∇","int"=>"∫","sum"=>"∑","prod"=>"∏","sqrt"=>"√","angle"=>"∠","rightarrow"=>"→","to"=>"→",
     "leftarrow"=>"←","Rightarrow"=>"⇒","mapsto"=>"↦","langle"=>"⟨","rangle"=>"⟩","ldots"=>"…","cdots"=>"⋯",
-    "in"=>"∈","notin"=>"∉","forall"=>"∀","exists"=>"∃","hbar"=>"ℏ","ell"=>"ℓ","circ"=>"∘","cap"=>"∩",
+    "in"=>"∈","notin"=>"∉","div"=>"÷","dots"=>"…","subset"=>"⊂","forall"=>"∀","exists"=>"∃","hbar"=>"ℏ","ell"=>"ℓ","circ"=>"∘","cap"=>"∩",
     "cup"=>"∪",  # function names keep their letters (drop only the backslash); unknown macros are dropped
     "cos"=>"cos","sin"=>"sin","tan"=>"tan","sec"=>"sec","csc"=>"csc","cot"=>"cot","sinh"=>"sinh",
     "cosh"=>"cosh","tanh"=>"tanh","log"=>"log","ln"=>"ln","exp"=>"exp","lim"=>"lim","min"=>"min",
@@ -5400,7 +5377,7 @@ const _TEX_SUP = Dict{Char,Char}(zip("0123456789+-=()ni", "⁰¹²³⁴⁵⁶⁷
 const _TEX_SUB = Dict{Char,Char}(zip("0123456789+-=()", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎"))
 # `^{…}`/`^x` (or `_…`) → Unicode only when EVERY char maps, else the bare body (e.g. `x^{2θ}` → `x2θ`).
 _tex_script(m, sub) = (b = replace(m, r"^[\^_]\{?" => "", "}" => "");
-                       (!isempty(b) && all(c -> haskey(sub, c), b)) ? String([sub[c] for c in b]) : b)
+                       isempty(b) ? b : something(_tex_mapscript(b, sub), b))   # export_typst.jl
 function _demath(s::AbstractString)
     t = String(s)
     ('$' in t || occursin("\\(", t) || occursin("\\[", t)) || return t   # no inline maths → untouched

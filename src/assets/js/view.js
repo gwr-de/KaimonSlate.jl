@@ -1476,11 +1476,15 @@ function mountPicks(c, cell) {
 }
 
 // Wire every bound widget in a cell — its own @bind widget and/or control strip.
-function mountControls(c) {
+// `hosts`: the control hosts to wire (default: the whole cell). `wireControl` adds listeners, so a host
+// that is already wired must not be passed again.
+function mountControls(c, hosts) {
   const cell = document.getElementById('cell-' + c.id);
   if (!cell) return;
-  cell.querySelectorAll('[data-bind]').forEach(wireControl);
-  cell.querySelectorAll('.radiogroup, .checkgroup, .mslist').forEach(typeset);   // render rich ($math$) option labels
+  for (const h of (hosts || [cell])) {
+    h.querySelectorAll('[data-bind]').forEach(wireControl);
+    h.querySelectorAll('.radiogroup, .checkgroup, .mslist').forEach(typeset);   // render rich ($math$) option labels
+  }
   mountOutputComponents(cell);                                                   // return-value component outputs
   mountPicks(c, cell);                                                           // pick_on! click targets on a figure
 }
@@ -1505,10 +1509,10 @@ function toggleSource(id, mode) {
 // The ✎ "edit source" header button, for ANY cell kind. md / @bind cells render OUTPUT by default and
 // keep their source in a hidden `.srcedit` overlay → toggle it. code / web cells show their editor
 // inline (no overlay) → just focus it, un-hiding the code first if it was hidden via 🙈.
-function editCellSource(id, kind) {
+async function editCellSource(id, kind) {
   const cell = document.getElementById('cell-' + id); if (!cell) return;
   if (cell.querySelector('.srcedit')) { toggleSource(id, kind === 'md' ? 'markdown' : 'julia'); return; }
-  if (cell.classList.contains('codehidden')) toggleHideCode(id);   // reveal hidden code before focusing
+  if (cell.classList.contains('codehidden')) await toggleHideCode(id);   // reveal hidden code before focusing
   if (window.ensureEditor) window.ensureEditor(id);                // mount if it hasn't lazily yet
   if (window.edFocus) window.edFocus(id);
 }

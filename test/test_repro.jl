@@ -426,6 +426,12 @@ end
             @test read(joinpath(inst, "data", "saved.csv"), String) == "user,data\n"  # user data survives
             @test !ispath(joinpath(inst, "stale.jl"))    # a file v2 no longer carries is not left behind
             @test isfile(joinpath(inst, "Project.toml")) && isfile(joinpath(inst, ".slatebundle.json"))
+
+            # What comes back describes the bundle just installed, not the one it replaced.
+            b3 = _make_bundle_b64(proj, [(name = "Foo", source = localpkg)], "renamed.jl", cells2)
+            write(sj, cells2 * "\n" * _bundle_footer(b3) * "\n")
+            r3 = _reconstruct_bundle!(sj)
+            @test r3.fresh && endswith(r3.notebook, "renamed.jl")
         end
     end
 

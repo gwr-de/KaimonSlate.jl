@@ -937,11 +937,8 @@ function renderCharts(c) {
     // The GL-lib deferral that applied to the whole cell now applies per placeholder — same rule,
     // narrower scope: init only after `requireScripts` has loaded.
     window.chartRuntime.scripts(spec).then(() => {
-      if (!el._inst) el._inst = _initChart(el, spec);
-      _applySize(el, el._inst, spec);
-      return _ensurePrereqs(spec)
-        .then(() => _geoSafeSetOption(el._inst, spec))
-        .then(() => _wireEchartReplay(el._inst, spec));
+      const rt = window.chartRuntime;
+      return rt.apply(el, el.__inst || rt.init(el, spec), spec);   // the same init/apply a code cell's chart gets
     });
   });
 }

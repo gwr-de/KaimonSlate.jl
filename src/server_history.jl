@@ -344,18 +344,20 @@ end
 function set_notebook_config!(nb::LiveNotebook, key::AbstractString, value; clear::Bool = false)
     it = _config_item(String(key))
     it === nothing && return Dict{String,Any}("ok" => false, "message" => "unknown config key '$key'")
-    if clear || (value isa AbstractString && isempty(strip(String(value))))
-        delete!(nb.report.meta, it.key)
-    else
-        nb.report.meta[it.key] = it.type === :bool ? (value === true || value == "true") :
-                                 it.type === :int  ? something(tryparse(Int, string(value)), it.default) :
-                                 String(string(value))
+    @report_op nb report begin   # a run mutates the report concurrently; the persist must not tear it
+        if clear || (value isa AbstractString && isempty(strip(String(value))))
+            delete!(report.meta, it.key)
+        else
+            report.meta[it.key] = it.type === :bool ? (value === true || value == "true") :
+                                  it.type === :int  ? something(tryparse(Int, string(value)), it.default) :
+                                  String(string(value))
+        end
+        it.key == "threads" && nb.kernel isa ReportEngine.GateKernel &&
+            (nb.kernel.threads = get(report.meta, "threads", ""))
+        it.key == "juliaflags" && nb.kernel isa ReportEngine.GateKernel &&
+            (nb.kernel.extra_flags = get(report.meta, "juliaflags", ""))
+        _persist!(nb)
     end
-    it.key == "threads" && nb.kernel isa ReportEngine.GateKernel &&
-        (nb.kernel.threads = get(nb.report.meta, "threads", ""))
-    it.key == "juliaflags" && nb.kernel isa ReportEngine.GateKernel &&
-        (nb.kernel.extra_flags = get(nb.report.meta, "juliaflags", ""))
-    _persist!(nb)
     it.restart && restart_kernel!(nb)
     return Dict{String,Any}("ok" => true)
 end
@@ -1067,7 +1069,7 @@ function cell_json(c::Cell, bindref::Dict{String,Tuple{Cell,BindSpec}} = Dict{St
         "deps"    => collect(c.deps),
         # Top-level names this cell defines — drives ⌘-click go-to-definition in the editor. A name the
         # cell only MUTATES (`prog[] = …`) isn't defined here, so it's excluded (go-to-def lands on the definer).
-        "defs"    => c.kind == CODE || c.kind == ReportEngine.TOOL || c.kind == ReportEngine.JOB ?
+        "defs"    => ReportEngine.is_code_kind(c.kind) ?
                      sort!(String[string(w) for w in cell_definitions(c)]) : String[],
     )
     # A web cell ships its three panes (split from the `@web(...)` source) so the editor can mount a
@@ -1084,7 +1086,7 @@ function cell_json(c::Cell, bindref::Dict{String,Tuple{Cell,BindSpec}} = Dict{St
     # itself. "cacheable"/"" ⇒ no badge. Drives the cell cache badge + the run-status restore counter
     # (a fast restore burst otherwise reads as a glitch), mirroring the DAG's cache indicator.
     memostate = ""; memowhy = ""    # computed once, shared by the cell badge (here) AND the DAG stats card (below)
-    if c.kind == CODE
+    if ReportEngine.is_code_kind(c.kind)
         o = c.output
         rt = o === nothing ? "" : o.memo
         memostate, memowhy = rt in ("restored", "stored", "handle", "uncacheable") ? (rt, o.memo_why) :
@@ -1191,7 +1193,7 @@ function cell_json(c::Cell, bindref::Dict{String,Tuple{Cell,BindSpec}} = Dict{St
     end
     # Names this cell defines that are ALSO defined by another cell — a silent footgun in a shared
     # namespace (last-writer-wins). The UI flags it so collisions don't masquerade as dead reactivity.
-    if c.kind == CODE && !isempty(multidef)
+    if ReportEngine.is_code_kind(c.kind) && !isempty(multidef)
         dup = sort!(String[string(w) for w in cell_definitions(c) if string(w) in multidef])
         isempty(dup) || (d["dupdefs"] = dup)
     end
@@ -1207,7 +1209,7 @@ function cell_json(c::Cell, bindref::Dict{String,Tuple{Cell,BindSpec}} = Dict{St
     nd = ReportEngine._manual_needs(c.flags)
     isempty(nd) || (d["needs"] = nd)
     # Truncated outputs → append an access bar (open ↗ / editor / download) to the rendered output.
-    if c.kind == CODE && c.output !== nothing && !isempty(c.output.overflow)
+    if ReportEngine.is_code_kind(c.kind) && c.output !== nothing && !isempty(c.output.overflow)
         bar = _overflow_bar(nbid, c.output.overflow)
         isempty(bar) || (d["output"] = String(d["output"]) * bar)
     end

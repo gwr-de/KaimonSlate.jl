@@ -118,6 +118,7 @@ include(joinpath(@__DIR__, "record_display.jl")) # record_html — a NamedTuple 
 include(joinpath(@__DIR__, "gpustats.jl"))  # gpu_sample — the GPUs' load from NVML, for the telemetry sample
 include(joinpath(@__DIR__, "sysstats.jl"))  # sys_sample! — host, process and job figures from /proc and the cgroup
 include(joinpath(@__DIR__, "capture.jl"))   # run_capture — uses EChart + SlateTable above
+include(joinpath(@__DIR__, "pkg_ops.jl"))   # _pkg_apply — package add/update/rm (shared with the engine)
 include(joinpath(@__DIR__, "completion.jl")) # slate_completions — REPLCompletions in the NB namespace
 include(joinpath(@__DIR__, "prepare.jl"))   # PrepareTracker — classify precompile output into structured status (shared w/ engine)
 include(joinpath(@__DIR__, "framepool.jl")) # FramePool — reused buffers for binary frames sent on the emit channel
@@ -671,7 +672,8 @@ function __slate_memo_snapshot(; cells::Dict = Dict{String,Any}())
                 binds = keep(:binds, NamedTuple[]), value_repr = vrepr,
                 exception = nothing, backtrace = nothing, duration_ms = ms,
                 trace = Any[], stderr = "", overflow = NamedTuple[],
-                animations = keep(:animations, Any[]))
+                animations = keep(:animations, Any[]), effects = keep(:effects, Any[]),
+                assets = keep(:assets, Any[]), live = keep(:live, false))
         ok = try
             _memo_store(key, names, wire; unread = unread, safe = safe)
         catch
@@ -2114,62 +2116,8 @@ function __slate_extension_manifest()
     return out
 end
 
-"Add or remove package(s) in the worker's OWN active project (the notebook's deps).
-`op` is \"add\" or \"rm\". `name` is one spec, or several separated by whitespace/commas — all applied
-in a single resolve (one precompile). Each add-spec may be a registry name (`Foo` or `Foo@1.2`), a git
-URL (`https://…​[.git][#rev]`, `git@…`) → `Pkg.add(url=…)`, or a LOCAL path (`/…`, `~/…`, `./…`, or an
-existing dir) → `Pkg.develop(path=…)` (so it's a dev'd dep, hot-reloadable + carried to remote workers).
-Returns `{ok, message}`."
-# Classify each add-token into a registry/git spec (→ Pkg.add) or a local-path spec (→ Pkg.develop),
-# with a human label. Shared by the notebook-env add and the parent-project add.
-function _pkg_add_specs(tokens)
-    adds = Pkg.PackageSpec[]; devs = Pkg.PackageSpec[]; labels = String[]
-    for tok in tokens
-        t = String(tok)
-        if occursin(r"^(https?://|git://|git@|ssh://)"i, t) || endswith(t, ".git") || endswith(t, ".git/")
-            parts = split(t, '#'; limit = 2)                      # url or url#rev (branch/tag/sha)
-            url = String(parts[1]); rev = length(parts) == 2 ? String(parts[2]) : ""
-            push!(adds, isempty(rev) ? Pkg.PackageSpec(url = url) : Pkg.PackageSpec(url = url, rev = rev))
-        elseif startswith(t, "/") || startswith(t, "~/") || startswith(t, "./") ||
-               startswith(t, "../") || isdir(expanduser(t))
-            push!(devs, Pkg.PackageSpec(path = abspath(expanduser(t))))
-        elseif occursin('@', t)                                   # name@version
-            nm, ver = split(t, '@'; limit = 2)
-            push!(adds, Pkg.PackageSpec(name = String(nm), version = String(ver)))
-        else
-            push!(adds, Pkg.PackageSpec(name = t))
-        end
-        push!(labels, t)
-    end
-    return (adds = adds, devs = devs, labels = labels)
-end
-
-function __slate_pkg(op, name)
-    tokens = filter(!isempty, split(String(name), r"[\s,]+"))
-    isempty(tokens) && return Dict{String,Any}("ok" => false, "message" => "empty package name")
-    o = String(op)
-    try
-        if o == "rm"
-            Pkg.rm(String.(tokens))
-            return Dict{String,Any}("ok" => true, "message" => "removed $(join(tokens, ", "))")
-        elseif o == "update"
-            # Distinct from `add`: adding a package that's already a dep keeps the resolved version,
-            # so an upgrade needs `Pkg.update`. Scoped to the named packages — a bare update would
-            # move the notebook's whole environment, which is not what "update this one" means.
-            Pkg.update(String.(tokens))
-            return Dict{String,Any}("ok" => true, "message" => "updated $(join(tokens, ", "))")
-        elseif o == "add"
-            s = _pkg_add_specs(tokens)
-            add_installed_first!(s.adds)
-            isempty(s.devs) || Pkg.develop(s.devs)
-            return Dict{String,Any}("ok" => true, "message" => "added $(join(s.labels, ", "))")
-        else
-            return Dict{String,Any}("ok" => false, "message" => "unknown op '$o'")
-        end
-    catch e
-        return Dict{String,Any}("ok" => false, "message" => sprint(showerror, e))
-    end
-end
+# `slate_pkg` / the package pane: `_pkg_apply` (pkg_ops.jl), shared with the in-process kernel.
+__slate_pkg(op, name) = _pkg_apply(op, name)
 
 """
     _same_registry(reg, url) -> Bool

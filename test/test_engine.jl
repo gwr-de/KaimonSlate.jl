@@ -227,6 +227,34 @@ mean(data)
         @test length(ids) == length(unique(ids))
     end
 
+    @testset "a return value's show writes into the cell's own streams" begin
+        r = parse_report("""
+            #%% code id=a
+            struct _Loud end
+            Base.show(io::IO, ::MIME"text/plain", ::_Loud) = (println("from show"); @warn "show warned"; print(io, "loud"))
+            _Loud()
+            """)
+        eval_report!(r)
+        o = r.cells[1].output
+        @test o.exception === nothing && o.value_repr == "loud"
+        @test occursin("from show", o.stdout) && occursin("show warned", o.stderr)
+    end
+
+    @testset "package specs parse the same for every kernel" begin
+        s = ReportEngine._pkg_add_specs(["Foo", "Bar@1.2", "https://github.com/x/Y.jl#main", "./local"])
+        @test [p.name for p in s.adds[1:2]] == ["Foo", "Bar"]
+        @test s.adds[3].url == "https://github.com/x/Y.jl" && s.adds[3].rev == "main"
+        @test length(s.devs) == 1 && s.devs[1].path == abspath("./local")
+        @test s.labels == ["Foo", "Bar@1.2", "https://github.com/x/Y.jl#main", "./local"]
+        @test ReportEngine._pkg_apply("add", " , ")["ok"] == false            # nothing named
+    end
+
+    @testset "a repeated explicit id gets a free suffix" begin
+        r = @test_logs (:warn, r"`a`.*`a_2`") (:warn, r"`a`.*`a_3`") parse_report(
+            "#%% code id=a\nx = 1\n#%% code id=a\ny = 2\n#%% code id=a_2_x\nw = 0\n#%% code id=a\nz = 3\n")
+        @test [c.id for c in r.cells] == ["a", "a_2", "a_2_x", "a_3"]
+    end
+
     @testset "ECharts DSL — clear ArgumentError on bad input" begin
         S = ReportEngine.series
         @test_throws ArgumentError S(:line, [1, 2, 3], [1, 2])       # mismatched x/y

@@ -675,7 +675,7 @@
       <input type="checkbox" id="mdreadme"> Save as <code>README.md</code> (renders on GitHub)</label></div>
   <div class="setrow exrow fmt-markdown sethint"><span></span>GitHub-flavored Markdown — paste into Discourse / Slack / GitHub, or save a <code>.md</code>. Figures embed as data-URI images (GitHub won't render those; upload a PNG alongside).</div>
   <div class="setrow exrow fmt-website"><label>Theme</label>
-    <select id="sitetheme"><option value="dark">Dark (matches UI)</option><option value="light">Light (publication)</option></select></div>
+    <select id="sitetheme"><option value="asis">As-is</option><option value="dark">Dark</option><option value="light">Light (publication)</option></select></div>
   <div class="setrow exrow fmt-website"><label>Source</label>
     <label style="font-weight:400;font-size:0.9em;color:var(--dim);display:flex;align-items:center;gap:6px">
       <input type="checkbox" id="sitesource" checked> Include cell source (uncheck for a clean reading page)</label></div>
@@ -717,15 +717,7 @@
        duplicate would resolve to whichever comes first in the document (the popover) — so this
        picker would silently read someone else's element. -->
   <div class="setrow exrow fmt-app"><label for="appexptheme" title="What a visitor sees before choosing their own. They can still change it in the app's settings.">Theme</label>
-    <select id="appexptheme">
-      <option value="">Midnight (default)</option>
-      <option value="graphite">Graphite</option>
-      <option value="nord">Nord</option>
-      <option value="dracula">Dracula</option>
-      <option value="solarized-dark">Solarized Dark</option>
-      <option value="daylight">Daylight</option>
-      <option value="solarized-light">Solarized Light</option>
-    </select></div>
+    <select id="appexptheme"></select></div>
   <div class="setrow exrow fmt-app"><label title="Reading-column width in px. Wide suits dashboards; the default suits prose.">Page width</label>
     <input id="apppagewidth" type="number" min="720" max="3000" step="20" placeholder="980"
       style="width:110px;background:var(--bg3);border:1px solid var(--border);border-radius:5px;padding:4px 8px;color:var(--text);font-size:.82rem"/>

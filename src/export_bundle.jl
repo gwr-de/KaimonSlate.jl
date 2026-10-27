@@ -975,8 +975,8 @@ function _reconstruct_bundle!(jl_path::AbstractString)
             # serving the old notebook indefinitely, with nothing on screen to say so.
             _read_bundle_stamp(dir).sha == sha &&
                 return (; _read_coords(dir)..., fresh = false, install = true)
-            return (; _read_coords(dir)...,
-                    fresh = _refresh_install!(b64, dir, sha), install = true)
+            fresh = _refresh_install!(b64, dir, sha)   # first: it rewrites the coordinates read next
+            return (; _read_coords(dir)..., fresh = fresh, install = true)
         end
         (isdir(dir) && !isempty(_foreign_entries(dir))) &&
             error("SLATE_INSTALL_DIR is a non-empty directory that isn't a Slate install: $dir\n" *

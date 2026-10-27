@@ -89,7 +89,7 @@ async function loadPackages() {
     : '';
   const row = (p, removable) =>
     `<div class="pkgrow"><span class="pkgname">${_esc(p.name)}</span>${srcBadge(p)}<span class="pkgver">${_esc(p.version || '')}</span>` +
-    (removable ? `<button class="cdel" onclick="pkgRm('${_esc(p.name)}')" title="remove">✕</button>` : '') + '</div>';
+    (removable ? `<button class="cdel" onclick="pkgRm(${window.slateJsArg(p.name)})" title="remove">✕</button>` : '') + '</div>';
   let html = '';
   html += `<div class="pkggrouphdr">Notebook${r.detached ? ' (detached — all deps)' : ' adds'}</div>`;
   html += nb.length ? nb.map(p => row(p, _pkgManageable)).join('') : '<div class="phint">No notebook-specific packages yet.</div>';

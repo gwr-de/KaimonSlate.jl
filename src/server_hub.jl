@@ -109,16 +109,7 @@ const _VENDOR_CACHE = get(ENV, "KAIMONSLATE_ASSET_CACHE",
                           joinpath(get(DEPOT_PATH, 1, joinpath(homedir(), ".julia")), "scratchspaces", "kaimonslate-assets"))
 const _VENDOR_LOCK = ReentrantLock()
 
-function _vendor_ctype(p)
-    e = lowercase(splitext(p)[2])
-    return e in (".js", ".mjs")   ? "application/javascript; charset=utf-8" :
-           e == ".css"            ? "text/css; charset=utf-8" :
-           e == ".woff2"          ? "font/woff2" :
-           e == ".woff"           ? "font/woff" :
-           e == ".ttf"            ? "font/ttf" :
-           e in (".map", ".json") ? "application/json; charset=utf-8" :
-           "application/octet-stream"
-end
+_vendor_ctype(p) = site_content_type(String(p))   # serve/mime_types.jl
 
 # Resolve `<pkg>/<sub>` to a cached local file, fetching from the pinned base URL on first
 # request (atomic write under a lock). Returns the path, or nothing on bad input / unknown

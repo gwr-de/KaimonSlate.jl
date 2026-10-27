@@ -154,6 +154,15 @@ function _interrupt_inflight!(nb::LiveNotebook)
     return n < 0 ? 0 : n
 end
 
+# Let a boot in progress finish before replacing or resetting the kernel. The boot installs its kernel
+# under `nb.lock`, so a kernel op on the placeholder made while holding that lock would wait on it for
+# good; and a kernel swapped in meanwhile would be overwritten when the boot lands. Off the lock.
+function _settle_boot!(nb::LiveNotebook)
+    k = nb.kernel
+    k isa ReportEngine.PendingKernel && try; ReportEngine._await_real(k); catch; end   # a failed boot is fine too
+    return nothing
+end
+
 # Restart a notebook's kernel: kill its worker (a gate worker is a real subprocess;
 # no-op in-process), then re-evaluate from a fresh namespace. The gate kernel
 # respawns a worker on the next `prepare!`.
@@ -167,6 +176,7 @@ function restart_kernel!(nb::LiveNotebook)
     # a BLOCKING round-trip, so it runs OFF `nb.lock` (protocol: never hold nb.lock across a kernel call).
     # Interrupt any in-flight eval first so `shutdown!` doesn't block behind it (the deadlock this fixes:
     # holding nb.lock across `shutdown!` while the runner needs nb.lock to finish → hub wedges).
+    _settle_boot!(nb)
     _interrupt_inflight!(nb)
     try; stop_debug!(nb; serialize = false, force = true); catch; end   # the frame lives in the worker about to die
     try; ReportEngine.shutdown!(nb.kernel; kill_remote = true); catch; end
@@ -181,6 +191,7 @@ function restart_kernel!(nb::LiveNotebook)
         # A restart is not a ▶ on any cell. A ▶ still waiting to be served would make the re-run below
         # compute a locked cell nobody just asked for.
         delete!(_FORCE_RUN, nb.id)
+        delete!(report.meta, "hydrate_error")   # a new bring-up owns the failure state
         nb.version += 1
     end
     _broadcast(nb, "restart")
@@ -215,6 +226,7 @@ end
 # Tears down the current kernel, RE-PICKS the kernel type (remote attach vs local) via _select_kernel,
 # and re-runs — async, same "instant" pattern as restart_kernel!. Runtime-only (not written to the .jl).
 function set_remote_worker!(nb::LiveNotebook, spec::AbstractString)
+    _settle_boot!(nb)
     _interrupt_inflight!(nb)   # switching workers stops the current evaluation immediately (don't drain)
     try; ReportEngine.shutdown!(nb.kernel); catch; end         # blocking teardown — OFF nb.lock (local killed; remote detached, idles warm)
     with_report(nb) do report
@@ -227,6 +239,7 @@ function set_remote_worker!(nb::LiveNotebook, spec::AbstractString)
         _drop_runs!(nb)
         ReportEngine.reset_all!(report)
         report.meta["hydrating"] = true
+        delete!(report.meta, "hydrate_error")
         nb.version += 1
     end
     _broadcast(nb, "restart")
@@ -2778,9 +2791,11 @@ function _make_router(h::Hub)
                              bundle = get(b, "bundle", false) === true, history = get(b, "history", false) === true)
             # Remember WHERE this notebook publishes so the dialog pre-fills next time (and a CI
             # action can read the target). Authored intent → travels in the Slate.config footer.
-            nb.report.meta["publishrepo"] = String(repo)
-            nb.report.meta["publishslug"] = r.home ? "" : String(r.slug)
-            _persist!(nb)
+            with_report(nb) do report
+                report.meta["publishrepo"] = String(repo)
+                report.meta["publishslug"] = r.home ? "" : String(r.slug)
+                _persist!(nb)
+            end
             record_publish_site!(nb, String(repo), r)   # keep the publish ledger (history + doc↔target) in sync
             return _json(Dict("url" => r.url, "docUrl" => r.docUrl, "slug" => r.slug, "repo" => r.repo,
                               "created" => r.created, "docCount" => r.docCount, "home" => r.home,
@@ -3364,49 +3379,25 @@ function _make_router(h::Hub)
         get(res, "ok", false) === true || return _json(res)
         j = state_json(nb); j["config"] = notebook_config_payload(nb); _json(j)
     end))
-    # Per-notebook toggle for parent /src hot-reload (Revise). Stored in report meta.
-    HTTP.register!(router, "POST", "/api/{id}/hotreload", req -> _withnb(h, req, nb -> begin
-        nb.report.meta["hotreload"] = get(_body(req), "enabled", true) === true
-        _persist!(nb)                                    # write the Slate.config footer so it sticks
-        _json(state_json(nb))                            # return the full state so the client stays in sync
-    end))
-    # Per-notebook toggle for parallel (inter-cell) execution. Stored in report meta; the runner reads
-    # it each iteration, so it takes effect on the next run with no worker restart.
-    HTTP.register!(router, "POST", "/api/{id}/parallel", req -> _withnb(h, req, nb -> begin
-        nb.report.meta["parallel"] = get(_body(req), "enabled", false) === true
-        _persist!(nb)                                    # write the Slate.config footer so it sticks
-        _json(state_json(nb))                            # return the full state so the client stays in sync
-    end))
     # Per-notebook slide-deck presentation prefs (heading level / transition / theme / PDF ratio).
     # Stored in report meta; persisted to the Slate.config footer. No worker restart — purely
     # presentation. Body keys: level (int), transition, theme, ratio (any subset).
     HTTP.register!(router, "POST", "/api/{id}/slideconfig", req -> _withnb(h, req, nb -> begin
         b = _body(req)
-        haskey(b, "level") && (nb.report.meta["slidelevel"] = something(tryparse(Int, string(b["level"])), 2))
-        haskey(b, "transition") && (nb.report.meta["slidetransition"] = String(b["transition"]))
-        haskey(b, "theme") && (nb.report.meta["slidetheme"] = String(b["theme"]))
-        haskey(b, "ratio") && (nb.report.meta["slideratio"] = String(b["ratio"]))
-        haskey(b, "bibstyle") && (nb.report.meta["bibstyle"] = String(b["bibstyle"]))
-        _persist!(nb)
-        _json(state_json(nb))
-    end))
-    # Per-notebook worker-thread override. "" clears it (back to the global). Applies by respawning this
-    # notebook's worker — so changing it kills + restarts the process (lose the warm namespace), unlike
-    # the parallel toggle. Stored in meta so it survives reloads; the .jl footer carries it across restarts.
-    HTTP.register!(router, "POST", "/api/{id}/threads", req -> _withnb(h, req, nb -> begin
-        spec = strip(String(get(_body(req), "threads", "")))
-        if isempty(spec)
-            delete!(nb.report.meta, "threads")
-        else
-            nb.report.meta["threads"] = spec
+        with_report(nb) do report
+            haskey(b, "level") && (report.meta["slidelevel"] = something(tryparse(Int, string(b["level"])), 2))
+            haskey(b, "transition") && (report.meta["slidetransition"] = String(b["transition"]))
+            haskey(b, "theme") && (report.meta["slidetheme"] = String(b["theme"]))
+            haskey(b, "ratio") && (report.meta["slideratio"] = String(b["ratio"]))
+            haskey(b, "bibstyle") && (report.meta["bibstyle"] = String(b["bibstyle"]))
+            _persist!(nb)
         end
-        nb.kernel isa ReportEngine.GateKernel && (nb.kernel.threads = spec)   # update the live kernel's override
-        _persist!(nb)                                                          # write the Slate.config footer
-        restart_kernel!(nb)                                                    # respawn the worker with it
         _json(state_json(nb))
     end))
     HTTP.register!(router, "POST", "/api/{id}/reset", req -> _withnb(h, req, nb -> begin
-        ReportEngine.reset!(nb.kernel, nb.report); build_dependencies!(nb.report); _eval!(nb); _json(state_json(nb))
+        _settle_boot!(nb)
+        with_report(nb) do report; ReportEngine.reset!(nb.kernel, report); build_dependencies!(report); end
+        _eval!(nb); _json(state_json(nb))
     end))
     # Split this notebook off from a copy it shares a document (and therefore history, chat and
     # preview) with. Copies the stores rather than resetting them, so neither side loses anything.
@@ -4468,6 +4459,26 @@ function open_notebook!(h::Hub, path::AbstractString; threads::AbstractString = 
     return id
 end
 
+# Per-notebook state that lives in module globals keyed by the notebook's id. An id is REUSED when the
+# same file (or another with the same name) opens again, so all of it goes with the notebook:
+#   - the ▶ force markers of cells still waiting would make the reopen look like a run someone asked
+#     for, and its region cells would request their nodes (`_FORCE_RUN`, under `nb.lock`);
+#   - session-state digests describe reactive values the reopened notebook no longer has (`_STATE_DIGESTS`);
+#   - undo/redo labels would name actions the new, empty undo stack does not hold;
+#   - cell timings, health and the liveness cache describe the closed notebook's runs.
+# The generation counters (`_MAIN_GEN`, `_WORKER_GEN`) stay: they only grow, so a task left over from
+# the closed notebook can never match the reopened one's generation.
+function _forget_notebook_state!(nb::LiveNotebook)
+    id = nb.id
+    lock(nb.lock) do; delete!(_FORCE_RUN, id); end
+    ReportEngine.forget_state_writes!(id)
+    lock(_LBL_LOCK) do; delete!(_UNDO_LBL, id); delete!(_REDO_LBL, id); end
+    lock(_CELL_STATS_LOCK) do; delete!(_CELL_STATS, id); end
+    lock(_WD_LOCK) do; delete!(_NB_HEALTH, id); delete!(_LAST_RUNNING, id); end
+    delete!(_AGENT_TURN, id)
+    return nothing
+end
+
 "Remove a notebook from the hub: drain its SSE connections and drop it."
 function close_notebook!(h::Hub, id::AbstractString)
     # Remove from the hub under `h.lock` (so no new request routes to it), then tear the kernel down
@@ -4498,14 +4509,7 @@ function close_notebook!(h::Hub, id::AbstractString)
         ReportEngine._rlog("slate: closing $(id) with its runner still draining — signalling it to stop")
         lock(_RUNNER_LOCK) do; _RUNNER_CANCEL[id] = true; end
     end
-    # An id is REUSED when the same file is reopened: the ▶ force markers of cells that were still
-    # waiting, left over, would make the reopen look like a run someone asked for, and its region cells
-    # would request their nodes.
-    lock(nb.lock) do; delete!(_FORCE_RUN, id); end
-    # …and the session-state digests, for the same reason: the reopened notebook's reactives are back
-    # at their declared initial values, so last session's identities describe values that no longer
-    # exist (see `_STATE_DIGESTS`).
-    ReportEngine.forget_state_writes!(id)
+    _forget_notebook_state!(nb)
     _interrupt_inflight!(nb)               # stop an in-flight eval so `shutdown!` doesn't block behind it
     # Before the region detaches: a warm worker outlives this notebook, and a live debug
     # session leaves its interpreter scoped to our modules for whoever adopts it next.

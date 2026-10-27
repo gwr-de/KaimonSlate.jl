@@ -490,6 +490,18 @@ function _unique_auto_id(kind::CellKind, source::AbstractString, idx::Integer, u
     return id
 end
 
+# An explicit id that is already taken (a cell copied in an editor, header and all) gets the first
+# free `_2`, `_3`… suffix, so every id-keyed lookup still sees one cell per id. The next save writes
+# the new id into the file.
+function _unique_explicit_id(id::AbstractString, used::AbstractSet{String})
+    id in used || return String(id)
+    n = 2
+    while string(id, "_", n) in used; n += 1; end
+    new = string(id, "_", n)
+    @warn "Two cells in this notebook have the id `$id`; the later one is now `$new`."
+    return new
+end
+
 "Trim a leading and trailing run of blank lines, preserving interior blanks."
 function _strip_blank_edges(lines::Vector{<:AbstractString})
     lo = firstindex(lines)
@@ -647,7 +659,7 @@ function parse_report(text::AbstractString; id::AbstractString = "r", title::Abs
             if format < 2 && kind === CODE && occursin(r"@campaign\b", src)
                 kind = JOB; push!(changes, "campaign")
             end
-            id_ = cid === nothing ? _unique_auto_id(kind, src, idx, used_ids) : cid
+            id_ = cid === nothing ? _unique_auto_id(kind, src, idx, used_ids) : _unique_explicit_id(cid, used_ids)
             push!(used_ids, id_)
             cell = Cell(id_, kind, src)
             cell.controls = ctrls
@@ -1051,6 +1063,7 @@ include(joinpath(@__DIR__, "termcook.jl"))  # cook_terminal — replay \r/cursor
 include(joinpath(@__DIR__, "record_display.jl")) # record_html — a NamedTuple value as a grid of fields (used by capture.jl)
 include(joinpath(@__DIR__, "record_source.jl")) # record_field_range — where a record field came from in the cell source
 include(joinpath(@__DIR__, "capture.jl"))   # shared run_capture (engine + worker)
+include(joinpath(@__DIR__, "pkg_ops.jl"))   # shared package add/update/rm specs (engine + worker)
 include(joinpath(@__DIR__, "format.jl"))    # _format_cell — server-side table cell renderer (JS mirror: fmtCell)
 include(joinpath(@__DIR__, "completion.jl")) # shared REPLCompletions (engine + worker)
 include(joinpath(@__DIR__, "macroexpand.jl")) # shared cell macro-expansion (engine + worker)

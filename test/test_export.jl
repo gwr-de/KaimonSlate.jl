@@ -710,7 +710,7 @@ end
     @test NS._site_ctype("m.wasm") == "application/wasm"
     @test NS._site_ctype("scene.glb") == "model/gltf-binary"
     @test NS._site_ctype("scene.gltf") == "model/gltf+json"
-    @test NS._site_ctype("worker.js") == "application/javascript; charset=utf-8"
+    @test NS._site_ctype("worker.js") == "text/javascript; charset=utf-8"
 
     # `_register_assets!` registry semantics: new pkg → changed; identical dir → unchanged; moved → changed.
     nb2 = _nb_with_echart(_gl_spec(), "gl2")
@@ -736,7 +736,7 @@ end
     snb = _gl_nb()
     NS._register_frontend!(snb, "boot", "fetch(\"/ext-assets/GlobeSlate/echarts-gl.min.js\");", false, "")
     sstand = NS._frontend_export_head(snb, true)
-    @test occursin("data:application/javascript;charset=utf-8;base64,", sstand)  # mime carries no raw space
+    @test occursin("data:text/javascript;charset=utf-8;base64,", sstand)  # mime carries no raw space
     @test !occursin("ext-assets/GlobeSlate/echarts-gl.min.js", sstand)           # no path reference survives
     @test occursin("./ext-assets/GlobeSlate/echarts-gl.min.js", NS._frontend_export_head(snb, false))
 
@@ -799,7 +799,7 @@ end
     unmapped = NS._export_ext_asset_html(_html_nb(), "<script>import(\"/ext-assets/GlobeSlate/lib.mjs\")</script><img src=\"/ext-assets/GlobeSlate/earth.png\">";
                                          inline = true, mapped = Dict{String,String}())
     @test occursin("import(\"/ext-assets/GlobeSlate/lib.mjs\")", unmapped)
-    @test !occursin("data:application/javascript", unmapped)
+    @test !occursin("data:text/javascript", unmapped)
     @test occursin("src=\"data:image/png;base64,", unmapped)
     # A cache-busted module url is still a module. `splitext` alone reads `lib.mjs?v=2` as `.mjs?v=2`,
     # which would keep it out of the import map AND let the call site inline it.

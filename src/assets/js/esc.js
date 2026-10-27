@@ -11,3 +11,7 @@
 // have. A copy carried in ansi.js would be the drift this file exists to prevent.
 window.slateEscHtml = s => String(s == null ? '' : s).replace(/[&<>"']/g,
   c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+// A value as a JS string argument inside an inline handler attribute: `onclick="f(' + slateJsArg(v) + ')"`.
+// HTML-escaping alone is not enough there: the attribute is decoded before the handler is compiled,
+// so an escaped `'` comes back as a quote that ends the string.
+window.slateJsArg = v => window.slateEscHtml(JSON.stringify(v == null ? '' : String(v)));

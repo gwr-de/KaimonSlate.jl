@@ -11,8 +11,9 @@ import { signal, computed } from '@preact/signals';
 // Seed from the last state the classic boot published (window.__slateState). The boot's
 // reload() is async and may run before this module loads, so it stashes state there for us.
 export const nbState  = signal(window.__slateState || null); // the whole /api/state payload
-export const selected = signal(window.selectedId || null);   // ACTIVE/anchor cell id (command mode; the one single-cell ops act on)
-export const selectedSet = signal(new Set(window.selectedId ? [window.selectedId] : [])); // ALL selected ids (multi-select)
+const _sel0 = (window.slateSelectedId && window.slateSelectedId()) || null;
+export const selected = signal(_sel0);   // ACTIVE/anchor cell id (command mode; the one single-cell ops act on)
+export const selectedSet = signal(new Set(_sel0 ? [_sel0] : [])); // ALL selected ids (multi-select)
 export const focus    = signal(null);                        // dep-focus: show ONLY this cell's dependency chain
 // EDIT MODE: the id of the cell whose editor holds the keyboard, else null. Mode has to be state,
 // not a class poked onto the DOM: <Cell> rewrites the cell's `class` whenever its computed value

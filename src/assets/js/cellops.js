@@ -336,7 +336,8 @@ function _cellsData(ids) {
 function copyCells(silent) {
   const ids = selectedIds(); if (!ids.length) return;
   const data = _cellsData(ids); _writeClip(data);
-  try { navigator.clipboard && navigator.clipboard.writeText(data.map(c => c.source).join('\n\n')); } catch (e) {}
+  // Best effort: it is refused when the page is not focused or the permission is denied.
+  navigator.clipboard?.writeText(data.map(c => c.source).join('\n\n')).catch(() => {});
   if (!silent) toast(_idsLabel(ids) + ' copied', 2000);
 }
 async function cutCells() {

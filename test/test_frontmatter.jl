@@ -450,6 +450,18 @@ x = 1
             @test [String(get(d, "slug", "")) for d in NS.site_docs("My Portfolio")] == ["beta"]
             @test !NS.unexport_from_site("My Portfolio", "alpha").removed             # idempotent (already gone)
             @test !NS.unexport_from_site("nope", "x").removed                         # unknown site
+            # The slug a doc is built under is found by its docid, so a custom slug or a later title edit
+            # still names its own entry; only an entry with no docid is matched by title.
+            c = withfig(_mknb("#%% md id=t\n# Gamma\n\n#%% code id=fig\n3\n"))
+            c.report.meta["docid"] = "doc-gamma"
+            NS.export_to_site(c, "My Portfolio"; slug = "custom-gamma")
+            @test NS._site_slug_for("My Portfolio", c) == "custom-gamma"
+            c2 = withfig(_mknb("#%% md id=t\n# Gamma, renamed\n\n#%% code id=fig\n3\n"))
+            c2.report.meta["docid"] = "doc-gamma"
+            @test NS._site_slug_for("My Portfolio", c2; by_title = false) == "custom-gamma"
+            other = withfig(_mknb("#%% md id=t\n# Gamma\n\n#%% code id=fig\n4\n"))
+            other.report.meta["docid"] = "doc-other"
+            @test NS._site_slug_for("My Portfolio", other; by_title = false) == ""   # same title, not its entry
         end
     end
 
@@ -553,6 +565,10 @@ x = 1
         @test NS._delatex(raw"The Pseudoprimes to $25 \cdot 10^9$") == "The Pseudoprimes to 25 · 10⁹"
         @test NS._delatex(raw"$10^{27}$ and $\alpha_2$") == "10²⁷ and α₂"
         @test NS._delatex(raw"snake_case stays") == "snake_case stays"   # `_` outside math untouched
+        # The live card and the plain-text blurb decode a command the same way; an unknown one the card
+        # keeps as written, the blurb drops.
+        @test NS._delatex(raw"$a \div b, \forall x \vartheta, \cdots \foo$") == raw"a ÷ b, ∀ x ϑ, ⋯ \foo"
+        @test strip(NS._demath(raw"$a \div b, \forall x \vartheta$")) == "a ÷ b, ∀ x ϑ"
         # state_json ships the key list for [@-autocomplete; the cell renders a card, not raw BibTeX
         nb = _mknb("#%% md id=refs bibliography\n@book{knuth1984, author={Knuth}, title={TeX}}\n")
         sj = NS.state_json(nb)
@@ -579,6 +595,9 @@ x = 1
         r = RE.parse_report("#%% md id=a\nSee [@b] then [@a].\n\n#%% md id=refs bibliography\n@book{a,title={A}}\n@book{b,title={B}}\n")
         nums = NS.citation_numbers(r, Set(["a", "b"]))
         @test nums == Dict("b" => 1, "a" => 2)     # `b` is cited first → [1]
+        # a figure cross-reference or a key with no entry takes no number
+        r = RE.parse_report("#%% md id=a\nSee [@fig:flow], [@nope] and [@a].\n\n#%% md id=refs bibliography\n@book{a,title={A}}\n")
+        @test NS.citation_numbers(r, Set(["a"])) == Dict("a" => 1)
         # live HTML-link emit tracks the bibstyle: numeric → [3, p. 7], author-date → (Knuth, 1984)
         numctx = (anchor = "refs", tips = Dict("k" => "Knuth · TeX"), labels = Dict("k" => "3"),
                   numeric = true, numbers = Dict("k" => 3), open = "[", close = "]")
