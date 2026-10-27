@@ -214,6 +214,10 @@ submission_name(chunks) =
 jobs_dir(root) = joinpath(root, "jobs")
 index_path(root, name) = joinpath(jobs_dir(root), name * ".index")
 
+# Was submission `name` written after `t`? An answer taken before it cannot mention it, so its absence
+# there does not mean it is gone.
+_submitted_after(root, name, t::Real) = (f = index_path(root, name); isfile(f) && mtime(f) > t)
+
 # Per-chunk submission counts.
 #
 # This cannot be derived from the index files: a submission is NAMED by a digest of its chunk set,
@@ -543,9 +547,10 @@ skips shards that are already in the store, so a chunk killed at 90% resumes rat
 """
 # `job_state` is the scheduler's answer when the caller already has it. One query covers every
 # submission in a store, so a page watching four sweeps asked the same question four times; the
-# caller that holds a shared answer passes it here instead. `nothing` means ask.
+# caller that holds a shared answer passes it here instead. `nothing` means ask. `job_state_at` is when
+# that answer was taken; a submission made since then is waiting, not missing.
 function plan(root::AbstractString, sweep::AbstractString; launcher = nothing,
-              job_state::Union{Nothing,AbstractDict} = nothing,
+              job_state::Union{Nothing,AbstractDict} = nothing, job_state_at::Real = Inf,
               max_attempts::Integer = MAX_ATTEMPTS,
               failure_policy::FailurePolicy = FailurePolicy())
     chunks = sweep_chunks(root, sweep)
@@ -600,6 +605,12 @@ function plan(root::AbstractString, sweep::AbstractString; launcher = nothing,
                 for c in get(subs, name, String[])
                     # running beats pending when a chunk appears in more than one submission
                     (get(live, c, :pending) === :running) || (live[c] = st)
+                end
+            end
+            for n in names
+                (get(states, n, :unknown) === :unknown && _submitted_after(root, n, job_state_at)) || continue
+                for c in get(subs, n, String[])
+                    haskey(live, c) || (live[c] = :pending)
                 end
             end
         end
@@ -678,9 +689,9 @@ Firing thousands of jobs should take an explicit decision, not happen because a 
 """
 function reconcile!(root::AbstractString, sweep::AbstractString, launcher, specfn;
                     submit::Bool = true, cap::Integer = 0,
-                    job_state::Union{Nothing,AbstractDict} = nothing,
+                    job_state::Union{Nothing,AbstractDict} = nothing, job_state_at::Real = Inf,
                     failure_policy::FailurePolicy = FailurePolicy())
-    p = plan(root, sweep; launcher, job_state, failure_policy)
+    p = plan(root, sweep; launcher, job_state, job_state_at, failure_policy)
     # A tripped breaker produces an empty submit list, so this is belt and braces; being explicit
     # keeps it true if the plan's ordering ever changes.
     # A cancelled sweep must not be resurrected by the next reconcile — that is the whole point of

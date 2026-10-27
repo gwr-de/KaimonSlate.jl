@@ -95,6 +95,9 @@ end
 What the scheduler says about every submission in this store — one query for the whole store rather
 than one per sweep. Falls back to the last answer when the query fails.
 """
+# When `collect_jobs`'s answer was taken (0 = never), so a plan can tell what was submitted since.
+collected_at(t::ClusterTarget) = (c = collector(t); lock(() -> c.polled, c.poll_lk))
+
 function collect_jobs(t::ClusterTarget; force::Bool = false)
     isempty(t.host) && return Dict{String,Symbol}()
     c = collector(t)

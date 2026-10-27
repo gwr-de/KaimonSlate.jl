@@ -1304,8 +1304,9 @@ function cluster_status(name::AbstractString = "";
     l = launcher_for(t)
     try
         js = isempty(target_host(t)) ? nothing : collect_jobs(t)
+        js_at = js === nothing ? Inf : collected_at(t)
         for (sw, created) in store_sweeps(root)
-            p = BatchSweep.plan(root, sw; launcher = l, job_state = js)
+            p = BatchSweep.plan(root, sw; launcher = l, job_state = js, job_state_at = js_at)
             sp = BatchSweep.spans(root, sw)
             # NOT `t`: that is the target, and everything after this loop still needs it.
             tel = BatchSweep.telemetry(root, sw; launcher = l, plan = p)
@@ -4056,10 +4057,13 @@ function status_payload(target::SweepTarget, run::AbstractString, params, keys;
     # The scheduler's answer covers every submission in the store, so it is asked once per cluster
     # and handed to the plan rather than asked again per sweep on the page.
     js = target isa ClusterTarget && !isempty(target.host) ? collect_jobs(target) : nothing
+    js_at = js === nothing ? Inf : collected_at(target)
     p = advance ? reconcile_and_sync!(target, run, l; submit = started && _reachable(target),
-                                      job_state = js,
+                                      job_state = js, job_state_at = js_at,
                                       failure_policy = sweep_policy(target)) :
-                  BatchSweep.plan(root, run; launcher = l, job_state = js)
+                  BatchSweep.plan(root, run; launcher = l, job_state = js, job_state_at = js_at)
+    # What it just submitted is not in the cached answer: the next tick asks the scheduler again.
+    (advance && started && !isempty(p.to_submit)) && collect_invalidate!(target)
     t = BatchSweep.telemetry(root, run; launcher = l, plan = p)
     jobs = run_jobs(target, run)
     # Started, nothing with the scheduler, and an environment that has not passed its test: held

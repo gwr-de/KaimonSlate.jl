@@ -931,6 +931,23 @@ end
         @test occursin("|| exit 1", BL._PBS_POLL)
     end
 
+    @testset "a submission just made is not gone because an older answer leaves it out" begin
+        # The card hands the plan a cached answer, taken before its own submission.
+        mktempdir() do root
+            sweep, chunks = mksweep(root)
+            BS.reconcile!(root, sweep, FakeLauncher(), specfn(root); failure_policy = NOPROBE)
+            name = first(keys(BS.known_submissions(root)))
+            stale = time() - 60                                   # an answer taken before the submission
+            p = BS.plan(root, sweep; launcher = NoPollLauncher(), job_state = Dict(name => :unknown),
+                        job_state_at = stale)
+            @test isempty(p.to_submit) && all(==(:pending), values(p.chunk_state))
+            # An answer taken after it does mean gone.
+            p = BS.plan(root, sweep; launcher = NoPollLauncher(), job_state = Dict(name => :unknown),
+                        job_state_at = time() + 1)
+            @test !isempty(p.to_submit)
+        end
+    end
+
     @testset "a chunk runs once it has started; until then it waits its turn" begin
         # One submission covers several chunks, and the scheduler reports it running as soon as any
         # of them is: a local run keeps a few processes going, an array job runs some elements while
