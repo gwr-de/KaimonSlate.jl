@@ -594,6 +594,9 @@ function plan(root::AbstractString, sweep::AbstractString; launcher = nothing,
                      BatchLauncher.poll(launcher, root, names)
             for (name, st) in states
                 st === :unknown && continue
+                # The scheduler did not answer for it: it may well be running, so it is treated as
+                # waiting rather than gone, and nothing it covers is submitted again on this answer.
+                st === :unreachable && (st = :pending)
                 for c in get(subs, name, String[])
                     # running beats pending when a chunk appears in more than one submission
                     (get(live, c, :pending) === :running) || (live[c] = st)

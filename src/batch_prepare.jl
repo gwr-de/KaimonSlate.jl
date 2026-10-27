@@ -100,6 +100,7 @@ function _batch_test!(t, envdir::AbstractString, measured, note; qos::AbstractSt
         sleep(15)
         st = get(BatchLauncher.poll(l, t.root_remote, [name]), name, :unknown)
         st === :unknown && break
+        st === :unreachable && (note("the scheduler did not answer; asking again"); continue)
         note(st === :pending ? "queued as job $id" : "running as job $id")
     end
     f = t.kind === :pbs ? "$logdir/$name.1.out" : "$logdir/$name.$(id)_1.out"

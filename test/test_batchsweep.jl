@@ -910,6 +910,27 @@ end
         end
     end
 
+    @testset "a scheduler that does not answer is not one that holds nothing" begin
+        # A failed query used to read as every job :unknown, which the plan takes as gone, so the work
+        # still running was submitted again.
+        mktempdir() do root
+            sweep, chunks = mksweep(root)
+            BS.reconcile!(root, sweep, FakeLauncher(), specfn(root); failure_policy = NOPROBE)
+            name = first(keys(BS.known_submissions(root)))
+            p = BS.plan(root, sweep; launcher = NoPollLauncher(), job_state = Dict(name => :unreachable))
+            @test isempty(p.to_submit) && all(==(:pending), values(p.chunk_state))
+            @test p.state === :running
+        end
+        # Each launcher says so for a query that failed, and a cancel it cannot confirm is an error.
+        down = (h, sc) -> (false, "")
+        for l in (BL.SlurmLauncher("login"; runner = down), BL.PbsLauncher("login"; runner = down))
+            @test BL.poll(l, "/r", ["a", "b"]) == Dict("a" => :unreachable, "b" => :unreachable)
+            @test_throws ErrorException BL.cancel!(l, "/r", ["a"])
+        end
+        # The PBS query fails rather than answering "no jobs" when the server does not.
+        @test occursin("|| exit 1", BL._PBS_POLL)
+    end
+
     @testset "a chunk runs once it has started; until then it waits its turn" begin
         # One submission covers several chunks, and the scheduler reports it running as soon as any
         # of them is: a local run keeps a few processes going, an array job runs some elements while

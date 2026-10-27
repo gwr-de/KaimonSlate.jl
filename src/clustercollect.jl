@@ -104,8 +104,15 @@ function collect_jobs(t::ClusterTarget; force::Bool = false)
         (force || due) || return
         try
             subs = BatchSweep.known_submissions(store_root(t))
-            c.jobs = isempty(subs) ? Dict{String,Symbol}() :
-                     BatchLauncher.poll(launcher_for(t), store_root(t), collect(keys(subs)))
+            fresh = isempty(subs) ? Dict{String,Symbol}() :
+                    BatchLauncher.poll(launcher_for(t), store_root(t), collect(keys(subs)))
+            # A name the scheduler did not answer for keeps its last answer, as the docstring promises.
+            gaps = [n for (n, st) in fresh if st === :unreachable]
+            for n in gaps
+                haskey(c.jobs, n) && (fresh[n] = c.jobs[n])
+            end
+            c.jobs = fresh
+            c.err = isempty(gaps) ? "" : "the scheduler did not answer for $(length(gaps)) submission(s)"
             c.polled = time()
         catch e
             c.err = _short_err(e)

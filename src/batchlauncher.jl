@@ -460,6 +460,10 @@ function job_pids(l::ExecLauncher, root::AbstractString, name::AbstractString)
     return [something(tryparse(Int, x), 0) for x in split(txt; keepempty = false)]
 end
 
+# Every name `:unreachable`: the scheduler (or the host) did not answer. Distinct from `:unknown`, which
+# means it answered and does not hold the job, so a caller can tell "gone" from "not known".
+_unreachable(names) = Dict{String,Symbol}(String(n) => :unreachable for n in names)
+
 function poll(l::ExecLauncher, root::AbstractString, names)
     _remote(l) && return _exec_poll_there(l, root, names)
     out = Dict{String,Symbol}()
@@ -489,7 +493,7 @@ function _exec_poll_there(l::ExecLauncher, root, names)
                      "done < $(_shq(f)); fi; printf '%s\\t%s\\n' $(_shq(String(name))) \$n")
     end
     ok, txt = _there(l, join(lines, "\n"))
-    ok || return out
+    ok || return _unreachable(names)
     for line in eachsplit(String(txt), '\n'; keepempty = false)
         parts = split(line, '\t'); length(parts) == 2 || continue
         alive = something(tryparse(Int, strip(parts[2])), 0)
@@ -871,7 +875,7 @@ region_stage(host::AbstractString, root::AbstractString) =
 function poll(l::RegionLauncher, root::AbstractString, names)
     out = Dict{String,Symbol}(String(n) => :unknown for n in names)
     isempty(out) && return out
-    q = try; read_queue(l.runner, l.host, l.root); catch; return out; end
+    q = try; read_queue(l.runner, l.host, l.root); catch; return _unreachable(names); end
     lock(_STAGES_LOCK) do; _STAGES[(l.host, l.root)] = q.stage; end
     for n in keys(out); out[n] = queue_state(q, n); end
     return out
@@ -1095,7 +1099,7 @@ function poll(l::SlurmLauncher, root::AbstractString, names)
     # :unknown at once, and the next poll brought them all back, so the grid flashed in blocks.
     for part in Iterators.partition(ns, _POLL_NAMES)
         ok, txt = (_ssh(l, "squeue -h -u \"\$USER\" -o '%j|%T|%i|%r|%S|%N|%M|%L' --name=$(join(part, ','))"))
-        ok || continue
+        ok || (foreach(n -> out[n] = :unreachable, part); continue)
         for line in split(txt, '\n'; keepempty = false)
             # `|`-separated as asked for; a bare `name STATE` from an older or stand-in squeue still reads.
             parts = occursin('|', line) ? split(strip(line), '|') : split(strip(line))
@@ -1147,10 +1151,13 @@ function cancel!(l::SlurmLauncher, root::AbstractString, names)
     ns = String.(collect(names))
     isempty(ns) && return 0
     before = poll(l, root, ns)
-    live = [n for n in ns if get(before, n, :unknown) in (:pending, :running)]
+    # A name the scheduler did not answer for may still be running: cancel it too.
+    live = [n for n in ns if get(before, n, :unknown) in (:pending, :running, :unreachable)]
     isempty(live) && return 0
     (_ssh(l, join(("scancel -u \"\$USER\" --name=$(n)" for n in live), "; ")))
     after = poll(l, root, live)
+    any(n -> get(after, n, :unknown) === :unreachable, live) &&
+        error("cancel: the scheduler on $(l.host) did not answer, so whether the jobs stopped is not known")
     return count(n -> !(get(after, n, :unknown) in (:pending, :running)), live)
 end
 
@@ -1577,9 +1584,10 @@ end
 # whatever order the server holds them, and `resources_used` lands before `job_state`.
 const _PBS_POLL = raw"""
 set -f
-ids=$(qselect -u "$USER" 2>/dev/null)
+ids=$(qselect -u "$USER" 2>/dev/null) || exit 1
 [ -n "$ids" ] || exit 0
-qstat -f $ids 2>/dev/null | awk '
+full=$(qstat -f $ids 2>/dev/null) || exit 1
+printf '%s\n' "$full" | awk '
   function out() { if (n != "") print n " " s; n = ""; s = "" }
   /^Job Id:/                    { out() }
   /^[ \t]*Job_Name = /          { n = substr($0, index($0, "= ") + 2); sub(/[ \t\r]+$/, "", n) }
@@ -1598,7 +1606,7 @@ function poll(l::PbsLauncher, root::AbstractString, names)
     isempty(ns) && return Dict{String,Symbol}()
     out = Dict{String,Symbol}(n => :unknown for n in ns)
     ok, txt = (_ssh(l, _PBS_POLL))
-    ok || return out
+    ok || return _unreachable(ns)
     for line in split(txt, '\n'; keepempty = false)
         parts = split(strip(line))
         length(parts) >= 2 || continue
@@ -1622,10 +1630,13 @@ end
 function cancel!(l::PbsLauncher, root::AbstractString, names)
     ns = String.(collect(names))
     isempty(ns) && return 0
-    ok, out = (_ssh(l, join(("ids=\$(qselect -N $(n) -u \"\$USER\" 2>/dev/null); " *
+    ok, out = (_ssh(l, join(("ids=\$(qselect -N $(n) -u \"\$USER\" 2>/dev/null) || { echo UNREACHABLE; ids=; }; " *
                              "[ -n \"\$ids\" ] && qdel \$ids >/dev/null 2>&1 && echo CANCELLED"
                              for n in ns), "\n")))
-    return count(==("CANCELLED"), strip.(split(out, '\n'; keepempty = false)))
+    replies = strip.(split(out, '\n'; keepempty = false))
+    (ok && !("UNREACHABLE" in replies)) ||
+        error("cancel: the scheduler on $(l.host) did not answer, so whether the jobs stopped is not known")
+    return count(==("CANCELLED"), replies)
 end
 
 # Only after the job ENDS: PBS spools output on the execution node and copies it back at exit, where
