@@ -147,7 +147,10 @@
     frame.appendChild(img);
     const exp = document.createElement('button');
     exp.className = 'izbtn izexp'; exp.type = 'button'; exp.title = 'Open full size'; exp.textContent = '⤢';
-    exp.addEventListener('click', e => { e.stopPropagation(); open(img.currentSrc || img.src, img.alt); });
+    exp.addEventListener('click', e => {
+      e.stopPropagation();
+      open(img.currentSrc || img.src, img.alt, img.hasAttribute('data-vector') || undefined);
+    });
     const lvl = document.createElement('span');
     lvl.className = 'izbtn izpct';
     frame.append(exp, lvl);
@@ -162,11 +165,14 @@
   let view = null, vz = null;
   function close() {
     if (!view) return;
+    view._cleanup && view._cleanup();
     const back = view._back;
     view.remove(); view = null; vz = null;
     back && back.focus && back.focus({ preventScroll: true });
   }
-  function open(src, alt) {
+  // `vector` (default: an SVG data URL) fits the image to the window, scaling up as well as down;
+  // a raster opens at its natural size, capped to the window.
+  function open(src, alt, vector = /^data:image\/svg\+xml/.test(src)) {
     close();
     view = document.createElement('div');
     view.className = 'izview';
@@ -185,6 +191,16 @@
     const lvl = view.querySelector('.izlvl');
     img.alt = alt || '';
     img.src = src;
+    if (vector) {
+      const fit = () => {
+        const w = img.naturalWidth, h = img.naturalHeight;
+        if (!w || !h) return;
+        img.style.width = Math.floor(w * Math.min(innerWidth * 0.96 / w, innerHeight * 0.9 / h)) + 'px';
+      };
+      img.complete ? fit() : img.addEventListener('load', fit, { once: true });
+      window.addEventListener('resize', fit);
+      view._cleanup = () => window.removeEventListener('resize', fit);
+    }
     document.body.appendChild(view);
     vz = Zoom(frame, img, s => { lvl.textContent = pct(s); }, false);
     // The view is always active: a wheel anywhere on it zooms the image.
