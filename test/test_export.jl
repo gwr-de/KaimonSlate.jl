@@ -490,6 +490,22 @@ end
     @test haskey(NS._embedded_asset_files(rep.cells, root), "figures/logo.png")
 end
 
+@testset "a markdown file in the project renders for the Files tab" begin
+    root = mktempdir(); mkpath(joinpath(root, "docs", "img"))
+    write(joinpath(root, "docs", "img", "x.png"), UInt8[0x89, 0x50, 0x4e, 0x47])
+    write(joinpath(root, "docs", "guide.md"), "# Guide\n\n![x](img/x.png)\n\nSee \$a^2\$ and [the readme](../README.md).\n")
+    rep = _RE.parse_report("#%% code id=a\nx = 1\n"); rep.meta["assetbase"] = root
+    nb = NS.LiveNotebook("mdf", joinpath(root, "nb.jl"), rep, _RE.InProcessKernel(), 1, String[], String[],
+        ReentrantLock(), Channel{String}[], ReentrantLock(), "", false, Dict{String,String}())
+    code, html = NS._md_file_html(nb, "docs/guide.md")
+    @test code == 200 && occursin("<h1", html)
+    # An image path is relative to the file's own folder, as it is wherever else the file is read.
+    @test occursin("src=\"/n/mdf/asset/docs/img/x.png\"", html)
+    @test occursin("../README.md", html)                      # a link is left for the page to follow
+    @test NS._md_file_html(nb, "docs/missing.md")[1] == 404
+    @test NS._md_file_html(nb, "../../etc/passwd")[1] == 400
+end
+
 # A dropped clip lands in a markdown cell as `<video src="/n/<id>/asset/…">`. A standalone page has no
 # server to serve it from and a media element can't seek a `data:` URL — so the bytes must leave the body
 # for the blob registry. A published page keeps its sibling file, which HTTP can range-request.

@@ -1951,6 +1951,13 @@ function _make_router(h::Hub)
         _json(Dict("path" => rel, "kind" => "text", "content" => String(bytes), "bytes" => sz,
                    "mtime" => mtime(ap)))
     end))
+    # A markdown file rendered the way a markdown cell is, for the Files tab's preview. Its relative image
+    # and media paths resolve against the folder the file sits in, as they do wherever else it is read.
+    HTTP.register!(router, "GET", "/api/{id}/file-md", req -> _withnb(h, req, nb -> begin
+        code, body = _md_file_html(nb, String(get(HTTP.queryparams(HTTP.URI(req.target)), "path", "")))
+        code == 200 || return HTTP.Response(code, body)
+        HTTP.Response(200, ["Content-Type" => "text/html; charset=utf-8", "Cache-Control" => "no-store"], body)
+    end))
     HTTP.register!(router, "POST", "/api/{id}/file", req -> _withnb(h, req, nb -> begin
         body = try; JSON.parse(String(req.body)); catch; Dict{String,Any}(); end
         rel = String(get(body, "path", "")); content = String(get(body, "content", ""))
@@ -3055,6 +3062,19 @@ function _forget_notebook_state!(id::AbstractString)
     lock(_WD_LOCK) do; delete!(_NB_HEALTH, id); delete!(_LAST_RUNNING, id); end
     delete!(_AGENT_TURN, id)
     return nothing
+end
+
+# A project markdown file as HTML, `(status, body)`. Rendered like a markdown cell, with relative image and
+# media paths resolved against the folder the file sits in.
+function _md_file_html(nb::LiveNotebook, rel::AbstractString)
+    ap = _safe_proj_path(_proj_root(nb), rel)
+    isempty(ap) && return (400, "bad or out-of-project path")
+    isfile(ap) || return (404, "no such file")
+    filesize(ap) > _TREE_TEXT_MAX && return (413, "file too large to preview")
+    bytes = read(ap)
+    isvalid(String, bytes) || return (415, "not a text file (invalid UTF-8)")
+    dir = dirname(replace(String(rel), '\\' => '/'))
+    return (200, markdown_html(_local_media(String(bytes), nb.id, _proj_root(nb); dir = dir)))
 end
 
 "Remove a notebook from the hub: drain its SSE connections and drop it."

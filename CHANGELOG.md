@@ -12,6 +12,12 @@ were written when they went out. They are marked.
 
 ## [Unreleased]
 
+### Added
+
+- The Files panel shows a markdown file rendered, the way a markdown cell is, with **✎ Source** to
+  edit it. Images resolve from the file's own folder, and a link to another project file opens it in
+  the panel.
+
 ### Fixed
 
 - In an exported page, a figure's `@replay` marks on one control move together or not at all. The
