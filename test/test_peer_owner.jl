@@ -44,6 +44,29 @@ using .PeerOwner
         @test PeerOwner.reply_uid(hdr(PeerOwner.SOCK_DIAG_BY_FAMILY, 16)) === nothing   # truncated
     end
 
+    # The fallback when sock_diag is unavailable (no tcp_diag module, and loading it disabled).
+    # /proc prints each address word in host byte order, so these literals are little-endian forms.
+    if ENDIAN_BOM == 0x04030201
+        @testset "/proc/net/tcp parsing" begin
+            @test PeerOwner.proc_addr("0100007F:223D") == (UInt8[0x7f, 0, 0, 1], 8765)
+            @test PeerOwner.proc_addr("0000000000000000FFFF00000100007F:223D") ==
+                  (PeerOwner.v4mapped((0x7f, 0, 0, 1)), 8765)
+            lines = [
+                "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode",
+                "   0: 0100007F:223D 00000000:0000 0A 00000000:00000000 00:00000000 00000000 116015        0 1 1",
+                "   1: 0100007F:93D0 0100007F:223D 01 00000000:00000000 00:00000000 00000000 98679        0 2 1",
+                "   2: 0100007F:93D1 0100007F:223D 01 00000000:00000000 00:00000000 00000000 116015       0 3 1",
+            ]
+            lo = UInt8[0x7f, 0, 0, 1]
+            @test PeerOwner.proc_owner(lines, lo, 0x93d0, lo, 8765) == 98679   # another account
+            @test PeerOwner.proc_owner(lines, lo, 0x93d1, lo, 8765) == 116015
+            @test PeerOwner.proc_owner(lines, lo, 0x93d2, lo, 8765) === nothing
+            # The listener's own line has the right local end but no remote end; it is not a peer.
+            @test PeerOwner.proc_owner(lines, lo, 8765, UInt8[0, 0, 0, 0], 0) == 116015
+            @test PeerOwner.proc_owner(lines, lo, 8765, lo, 0x93d0) === nothing
+        end
+    end
+
     if Sys.islinux()
         @testset "live lookup (Linux)" begin
             bytes(ip::IPv4) = reverse(reinterpret(UInt8, [ip.host]))
@@ -53,6 +76,10 @@ using .PeerOwner
                 pip, pport = getpeername(acc)
                 @test PeerOwner.owner_uid(bytes(pip), pport, bytes(ip"127.0.0.1"), lport) == PeerOwner.my_uid()
                 @test PeerOwner.owner_uid(bytes(pip), 1, bytes(ip"127.0.0.1"), lport) === nothing
+                # Both sources on their own: either may be the one a given machine has.
+                @test PeerOwner._proc_lookup(bytes(pip), pport, bytes(ip"127.0.0.1"), lport) == PeerOwner.my_uid()
+                d = try; PeerOwner._diag_owner(bytes(pip), pport, bytes(ip"127.0.0.1"), lport); catch; nothing; end
+                @test d === nothing || d == PeerOwner.my_uid()
             finally
                 close(cli); close(acc); close(srv)
             end

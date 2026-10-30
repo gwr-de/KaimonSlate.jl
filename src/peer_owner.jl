@@ -1,10 +1,16 @@
 # Which local account opened a loopback TCP connection.
 #
 # Loopback is no access boundary on a shared host: every account on a login node can connect to its
-# 127.0.0.1. The kernel records who owns each end of a connection, and Linux reports it through
-# `sock_diag`: one netlink request names a TCP socket by its exact address pair and the reply carries
-# the uid that created it. This is what `ss` uses. `/proc/net/tcp` holds the same answer, but reading
-# it costs tens of milliseconds on a busy node, which is too slow to pay per request.
+# 127.0.0.1. The kernel records who owns each end of a connection, and Linux reports it two ways:
+#
+#   • `sock_diag`: one netlink request names a TCP socket by its exact address pair and the reply
+#     carries the uid that created it. Microseconds. It needs the `tcp_diag` kernel module, which is
+#     not loaded on every machine, and hardened hosts disable loading it on demand.
+#   • `/proc/net/tcp` and `tcp6`: always there, but the kernel formats every socket on the machine
+#     for each read, which costs tens of milliseconds on a busy node.
+#
+# `owner_uid` uses `sock_diag` while it works and `/proc` otherwise. Callers should cache the answer
+# per connection; the owner of a connection cannot change.
 #
 # A connection that arrives through an SSH forward (`ssh -L`, VS Code's port forwarding) is opened by
 # the forwarding process, which runs as the account that logged in, so it reads as that user.
@@ -96,26 +102,84 @@ function _query(req::Vector{UInt8})::Vector{UInt8}
     end
 end
 
+# An IPv4 peer is looked up twice when needed: a dual-stack client socket connecting to an IPv4
+# address is an AF_INET6 socket holding the IPv4-mapped form.
+function _diag_owner(p::Vector{UInt8}, pport::Integer, l::Vector{UInt8}, lport::Integer)
+    if length(p) == 4 && length(l) == 4
+        uid = reply_uid(_query(diag_request(AF_INET, p, pport, l, lport)))
+        uid === nothing || return uid
+        return reply_uid(_query(diag_request(AF_INET6, v4mapped(p), pport, v4mapped(l), lport)))
+    end
+    length(p) == 4 && (p = v4mapped(p))
+    length(l) == 4 && (l = v4mapped(l))
+    return reply_uid(_query(diag_request(AF_INET6, p, pport, l, lport)))
+end
+
+"""
+    proc_addr(field) -> (bytes, port)
+
+An address as `/proc/net/tcp{,6}` prints it: each 32-bit word of the address in the kernel's own
+byte order, as 8 hex digits, then `:` and the port in hex. Read on the same machine, so reinterpreting
+each word natively recovers network-order bytes.
+"""
+function proc_addr(s::AbstractString)
+    a, p = split(s, ':')
+    bytes = UInt8[]
+    for i in 1:8:length(a)
+        append!(bytes, reinterpret(UInt8, [parse(UInt32, a[i:i+7]; base = 16)]))
+    end
+    return bytes, parse(Int, p; base = 16)
+end
+
+"""
+    proc_owner(lines, peer, peer_port, here, here_port) -> Union{UInt32,Nothing}
+
+The uid on the `/proc/net/tcp{,6}` line whose local end is `peer:peer_port` and remote end
+`here:here_port`.
+"""
+function proc_owner(lines, p::Vector{UInt8}, pport::Integer, l::Vector{UInt8}, lport::Integer)
+    tag = ":" * uppercase(string(pport; base = 16, pad = 4)) * " "   # cheap filter before parsing
+    for line in lines
+        occursin(tag, line) || continue
+        f = split(line)
+        length(f) >= 8 || continue
+        (proc_addr(f[2]) == (p, pport) && proc_addr(f[3]) == (l, lport)) || continue
+        return parse(UInt32, f[8])
+    end
+    return nothing
+end
+
+function _proc_lookup(p::Vector{UInt8}, pport::Integer, l::Vector{UInt8}, lport::Integer)
+    if length(p) == 4 && length(l) == 4
+        uid = open(io -> proc_owner(eachline(io), p, pport, l, lport), "/proc/net/tcp")
+        uid === nothing || return uid
+        p, l = v4mapped(p), v4mapped(l)
+    end
+    length(p) == 4 && (p = v4mapped(p))
+    length(l) == 4 && (l = v4mapped(l))
+    return open(io -> proc_owner(eachline(io), p, pport, l, lport), "/proc/net/tcp6")
+end
+
+# Whether sock_diag answers on this machine: unknown until it either finds a socket or misses one
+# that /proc shows. A miss means the module is absent, and every later request would only repeat it.
+const _DIAG_WORKS = Ref{Union{Nothing,Bool}}(nothing)
+
 """
     owner_uid(peer_ip, peer_port, local_ip, local_port) -> Union{UInt32,Nothing}
 
 The uid that owns the far end of a loopback TCP connection this process accepted: the socket whose
 local end is `peer_ip:peer_port` and whose remote end is `local_ip:local_port`. `nothing` when the
-kernel has no such socket. Linux only; throws if `sock_diag` itself fails.
-
-An IPv4 peer is looked up twice when needed: a dual-stack client socket connecting to an IPv4 address
-is an AF_INET6 socket holding the IPv4-mapped form.
+kernel has no such socket. Linux only.
 """
 function owner_uid(peer_ip, peer_port::Integer, local_ip, local_port::Integer)
     p = collect(UInt8, peer_ip); l = collect(UInt8, local_ip)
-    if length(p) == 4 && length(l) == 4
-        uid = reply_uid(_query(diag_request(AF_INET, p, peer_port, l, local_port)))
-        uid === nothing || return uid
-        return reply_uid(_query(diag_request(AF_INET6, v4mapped(p), peer_port, v4mapped(l), local_port)))
+    if _DIAG_WORKS[] !== false
+        uid = try; _diag_owner(p, peer_port, l, local_port); catch; nothing; end
+        uid === nothing || (_DIAG_WORKS[] = true; return uid)
     end
-    length(p) == 4 && (p = v4mapped(p))
-    length(l) == 4 && (l = v4mapped(l))
-    return reply_uid(_query(diag_request(AF_INET6, p, peer_port, l, local_port)))
+    uid = _proc_lookup(p, peer_port, l, local_port)
+    uid === nothing || _DIAG_WORKS[] === true || (_DIAG_WORKS[] = false)
+    return uid
 end
 
 "This process's real uid."

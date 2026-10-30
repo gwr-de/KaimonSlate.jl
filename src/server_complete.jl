@@ -3529,6 +3529,12 @@ _other_users_allowed() = lowercase(strip(get(ENV, "KAIMONSLATE_ALLOW_OTHER_USERS
 
 const _PEER_CHECK_FAILED = Threads.Atomic{Bool}(false)   # log a broken lookup once, not per request
 
+# The answer per connection: its owner cannot change, a browser sends a page's requests over a few
+# kept-alive connections, and the lookup can cost tens of milliseconds (see peer_owner.jl). Keyed by
+# HTTP's per-connection server record, weakly, so an entry goes with its connection.
+const _PEER_SEEN = WeakKeyDict{Any,Bool}()
+const _PEER_SEEN_LOCK = ReentrantLock()
+
 _addr_bytes(a) = collect(UInt8, a.ip)
 
 """
@@ -3547,10 +3553,14 @@ function _peer_is_owner(stream)::Bool
     try
         # The far end's socket is named by both addresses. HTTP has no public accessor for this
         # connection's own address, so it is read from the tracked transport.
-        conn = stream.tracked.conn
-        here = HTTP.TCP.local_addr(conn)
+        tracked = stream.tracked
+        known = lock(() -> get(_PEER_SEEN, tracked, nothing), _PEER_SEEN_LOCK)
+        known === nothing || return known
+        here = HTTP.TCP.local_addr(tracked.conn)
         uid = PeerOwner.owner_uid(_addr_bytes(peer), peer.port, _addr_bytes(here), here.port)
-        return uid !== nothing && uid == PeerOwner.my_uid()
+        ok = uid !== nothing && uid == PeerOwner.my_uid()
+        lock(() -> (_PEER_SEEN[tracked] = ok), _PEER_SEEN_LOCK)
+        return ok
     catch e
         if !_PEER_CHECK_FAILED[]
             _PEER_CHECK_FAILED[] = true
