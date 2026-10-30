@@ -66,20 +66,39 @@ agent at specific cells without it reading everything.
 
 ## Models and permissions
 
-Today the in-browser agent runs on **Claude** (via the `claude` CLI) or a **locally-configured
-model** (Ollama); support for more agents through **ACP** (the Agent Client Protocol) is planned.
+The in-browser agent runs on **Claude** (via the `claude` CLI), installed **ACP agents**
+(the Agent Client Protocol), or a **locally-configured model** (Ollama or vmlx).
 
 In **☰ → ⚙ Settings**:
 
 - **Agent model** — Sonnet (default), Opus, Haiku, any locally-served model found on your **Ollama**
-  or **vmlx** server (both listed automatically), or **Custom…**, which sends an exact model id
-  straight through (`ollama:llama3.1`, say). See [Running the Hub](hub.md#Environment-variables).
-- **Agent permissions** — `lab` (default: slate/ex/edit tools), `auto` (model
-  self-governs), `default` (edits only), or `bypass` (no checks; trusted only).
+  or **vmlx** server (both listed automatically), installed ACP agents, or **Custom…**, which sends
+  an exact model id straight through (`ollama:llama3.1`, say). See [Running the Hub](hub.md#Environment-variables).
+- **Agent permissions** — `notebook` (default: Kaimon's notebook tools), `lab`
+  (also permits files and shell), `auto` (model self-governs), `default` (edits only),
+  or `bypass` (no checks; trusted only).
 
 Both bind when the agent spawns, so changing either reaps the running agent (the transcript
 is kept) and the next message respawns on the new setting. A note appears in the chat; if a
 turn is in flight you're asked to confirm before it's interrupted.
+
+### Codex through ACP
+
+With a Kaimon build that supports `acp:codex`, install the maintained adapter:
+
+```sh
+npm install -g @agentclientprotocol/codex-acp
+```
+
+When `codex-acp` is on the hub process's `PATH`, Settings lists **Codex**.
+It uses the adapter's configured model and existing Codex login, including a ChatGPT plan login.
+For an explicit model, choose **Custom…** and enter `acp:codex:<model-id>`. Codex discovery
+only checks for the executable; it does not start an agent or send an inference request.
+
+Codex also uses its own tools, configuration, and permissions. Kaimon's `notebook` and
+`specialist` presets do not fully restrict those native tools; Kaimon reports that limitation
+when the agent starts. Inherited MCP connections can also bypass the agent's tool policy,
+including the recursion guard; this is tracked in [Kaimon issue #1](https://github.com/gwr-de/Kaimon.jl/issues/1).
 
 ## Stopping
 
