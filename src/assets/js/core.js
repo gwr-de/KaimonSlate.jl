@@ -1487,6 +1487,9 @@ function typeset(el) {
         { left: '$', right: '$', display: false },
         { left: '\\(', right: '\\)', display: false },
       ],
+      // Already-typeset math keeps its TeX source in a hidden MathML <annotation>; a `$…$`
+      // inside that source (e.g. math within \text{}) must not be typeset a second time.
+      ignoredClasses: ['katex'],
       throwOnError: false,
     });
   } catch (e) {}
