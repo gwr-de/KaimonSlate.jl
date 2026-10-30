@@ -33,6 +33,7 @@ import ..SshAuth                              # ssh prompts a cluster asks for, 
 
 include("history.jl")   # module SlateHistory — durable content-addressed time machine
 include("parsched.jl")  # ParCell / par_blockers / run_scheduled — the parallel dataflow scheduler
+include("peer_owner.jl")  # module PeerOwner — which local account opened a loopback connection
 
 export serve_notebook, start_server, stop_server, LiveNotebook
 export export_app, app_defaults          # deploy a notebook as an application (server_app.jl / server_export.jl)

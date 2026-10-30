@@ -3513,6 +3513,54 @@ function _request_allowed(h::Hub, msg)::Bool
     return true
 end
 
+# ── Other accounts on the same machine ────────────────────────────────────────
+# The Host/Origin checks above stop a web page from driving the hub; they do nothing about another
+# account on a shared machine (a cluster login node), which can open 127.0.0.1 directly and send any
+# headers it likes. On Linux the kernel says who owns the far end of a loopback connection (see
+# peer_owner.jl), so a loopback request is served only when that is the account running the hub.
+# SSH forwards and VS Code's port forwarding connect as the logged-in user and pass.
+#
+# Elsewhere the check is skipped: macOS and Windows have no equivalent lookup, and are rarely shared
+# between accounts. A non-loopback peer is not a local account; the bind address governs those. An
+# app-mode hub is public by design and is not checked. `KAIMONSLATE_ALLOW_OTHER_USERS=1` turns the
+# check off.
+
+_other_users_allowed() = lowercase(strip(get(ENV, "KAIMONSLATE_ALLOW_OTHER_USERS", ""))) in ("1", "true", "yes", "on")
+
+const _PEER_CHECK_FAILED = Threads.Atomic{Bool}(false)   # log a broken lookup once, not per request
+
+_addr_bytes(a) = collect(UInt8, a.ip)
+
+"""
+    _peer_is_owner(stream) -> Bool
+
+Whether the account at the far end of this request's connection is the one running the hub. True
+for non-loopback peers and off Linux; false when the owner cannot be established, since a check that
+cannot answer must not let the request through.
+"""
+function _peer_is_owner(stream)::Bool
+    Sys.islinux() || return true
+    _other_users_allowed() && return true
+    peer = HTTP.peeraddr(stream)
+    peer === nothing && return false
+    PeerOwner.is_loopback(_addr_bytes(peer)) || return true
+    try
+        # The far end's socket is named by both addresses. HTTP has no public accessor for this
+        # connection's own address, so it is read from the tracked transport.
+        conn = stream.tracked.conn
+        here = HTTP.TCP.local_addr(conn)
+        uid = PeerOwner.owner_uid(_addr_bytes(peer), peer.port, _addr_bytes(here), here.port)
+        return uid !== nothing && uid == PeerOwner.my_uid()
+    catch e
+        if !_PEER_CHECK_FAILED[]
+            _PEER_CHECK_FAILED[] = true
+            @error "Kaimon Slate: cannot tell which account opened a loopback connection, so the hub " *
+                   "refuses them. Set KAIMONSLATE_ALLOW_OTHER_USERS=1 to serve every local account." exception = (e, catch_backtrace())
+        end
+        return false
+    end
+end
+
 """
     start_hub(; host="127.0.0.1", port=8765) -> Hub
 
@@ -4273,7 +4321,9 @@ shuts it down. This is the layer the `slate` app itself runs on — reach for it
 Slate in your own script rather than opening a single notebook with [`serve_notebook`](@ref).
 
 `host` defaults to loopback, so the hub is reachable only from this machine; bind `"0.0.0.0"` to
-serve a network. **There is no authentication at any bind address** — whatever can reach the port can
+serve a network. On Linux a loopback connection is served only when it comes from the account
+running the hub (see `_peer_is_owner`), which keeps other users of a shared machine out. **There is
+no authentication for network peers** — on a non-loopback bind, whatever can reach the port can
 drive every notebook on it.
 
 `app = true` serves in application mode: prose, results, figures and live controls, with the
@@ -4361,7 +4411,16 @@ function start_hub(; host = "127.0.0.1", port = 8765, app::Bool = false,
         end
     end)
     server = HTTP.listen!(host, port) do stream::HTTP.Stream
-        # Reject cross-origin / rebinding requests before ANY handler (router or SSE) runs.
+        # Reject another account's connection, and cross-origin / rebinding requests, before ANY
+        # handler (router, SSE, WebSocket) runs. An app is served to whoever visits; its own
+        # lockdown below is what protects it.
+        if !h.app && !_peer_is_owner(stream)
+            HTTP.setstatus(stream, 403)
+            HTTP.setheader(stream, "Content-Type" => "text/plain; charset=utf-8")
+            HTTP.startwrite(stream)
+            write(stream, "This Slate hub belongs to another account on this machine.\n")
+            return
+        end
         if !_request_allowed(h, stream.message)
             HTTP.setstatus(stream, 403); HTTP.startwrite(stream); return
         end
