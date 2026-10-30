@@ -1458,8 +1458,8 @@ function _fillTable(wrap, spec, st, pageRows, total, baseCount, pageIdx) {
 
 // Typeset any LaTeX ($…$ / $$…$$ / \(…\) / \[…\]) inside `el` with KaTeX. Safe to
 // call before KaTeX has loaded (no-op) and re-call (auto-render skips done spans).
-// CodeMirror source lives in <pre>/<textarea>, both in KaTeX's default ignore list,
-// so editor `$` is never touched.
+// A code cell's unmounted placeholder is a <pre> (in KaTeX's default ignore list); a mounted
+// CodeMirror editor is skipped by class below, so editor `$` is never touched.
 function typeset(el) {
   if (!el) return;
   // Output `text/latex` blocks render in DISPLAY mode so they match markdown
@@ -1487,9 +1487,11 @@ function typeset(el) {
         { left: '$', right: '$', display: false },
         { left: '\\(', right: '\\)', display: false },
       ],
-      // Already-typeset math keeps its TeX source in a hidden MathML <annotation>; a `$…$`
-      // inside that source (e.g. math within \text{}) must not be typeset a second time.
-      ignoredClasses: ['katex'],
+      // `text/latex` blocks are typeset whole above, and already-typeset math keeps its TeX source
+      // in a hidden MathML <annotation>. A `$…$` inside either (math within \text{}) is part of
+      // the surrounding formula, not a formula of its own. A mounted CodeMirror editor is
+      // contenteditable DOM: typesetting inside it is read by the editor as an edit to the source.
+      ignoredClasses: ['katex', 'latex', 'cm-editor'],
       throwOnError: false,
     });
   } catch (e) {}
