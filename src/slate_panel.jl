@@ -32,9 +32,26 @@ mutable struct PanelState
     busy::Bool          # a refresh is in flight
 end
 
+# Kaimon up to 2.10.4 looks up the panel's own extension with extension sessions filtered out, so
+# `ctx.eval` answers "extension session not found" to every call. Until a release passes
+# `include_extensions = true` there, make the same lookup with the filter off. Remove once the
+# minimum Kaimon has the fix.
+function _eval(ctx, code::AbstractString)
+    r = ctx.eval(String(code))
+    occursin("session not found", string(get(r, :stderr, ""))) || return r
+    K = parentmodule(typeof(ctx))
+    conn = try
+        K.get_connection_by_key(ctx.conn_mgr, ctx.session_key; include_extensions = true)
+    catch
+        nothing
+    end
+    conn === nothing && return r
+    return K.eval_remote(conn, String(code))
+end
+
 # `value_repr` of `code` evaluated in the extension, or an error carrying what went wrong.
 function _ask(ctx, code::AbstractString)::String
-    r = ctx.eval(code)
+    r = _eval(ctx, code)
     err = strip(String(something(get(r, :stderr, ""), "")))
     ex = get(r, :exception, nothing)
     (ex === nothing || ex == "") || error(string(ex))
