@@ -28,6 +28,7 @@ include(joinpath(@__DIR__, "expanduser_fix.jl"))
 
 
 import JSON
+import SHA     # the hub's fallback ports, fixed per account
 import Random  # the embedded Kaimon host's API key, from the OS random source
 import TOML    # the specialist roles defined outside the code (`<config>/specialists.toml`)
 
@@ -279,14 +280,34 @@ end
 # from the env in `__init__` (RUNTIME) — a top-level `const` reading ENV would be frozen at precompile.
 #
 # That port is a PREFERENCE. On a shared machine another account may already hold it, so the hub takes
-# the first free port at or above it and records where it went (`_hub_record_path`); any other process
-# that wants this hub — the `slate` TUI, the Kaimon panel — finds it through `_base()`.
+# the first free one of `_port_candidates` and records where it went (`_hub_record_path`); any other
+# process that wants this hub — the `slate` TUI, the Kaimon panel — finds it through `_base()`.
 const _PORT = Ref(8765)
 const _HUB = Ref{Union{Hub,Nothing}}(nothing)
 const _LOCK = ReentrantLock()
 const _LIVE_PORT = Ref(0)      # where THIS process's hub listens; 0 ⇒ no hub here
 const _LIVE_PREF = Ref(0)      # the preference it was started for, whose record it owns
-const _PORT_SPAN = 100         # how far past the preference to look for a free port
+const _PORT_SPAN = 100         # how many ports to try, the preference included
+const _PORT_RANGE = 20000:32767   # fallbacks: above the worker ports, below Linux's ephemeral range
+
+"""
+    _port_candidates(pref; user) -> Vector{Int}
+
+The ports the hub tries, in order: the preference, then a sequence in `_PORT_RANGE` fixed by the
+account and the preference. One account lands on the same fallback port each time it starts on a
+machine, so a browser tab or a port forward stays valid; different accounts spread over the range.
+Derived with SHA-256 so the sequence does not change with the Julia version.
+"""
+function _port_candidates(pref::Integer; user::AbstractString = ReportEngine._slate_user_tag())
+    out = Int[pref]
+    i = 0
+    while length(out) < _PORT_SPAN
+        d = SHA.sha256("$user|$pref|$i"); i += 1
+        p = first(_PORT_RANGE) + Int(mod(reinterpret(UInt32, d[1:4])[1], length(_PORT_RANGE)))
+        p in out || push!(out, p)
+    end
+    return out
+end
 
 _base() = "http://127.0.0.1:$(_hub_port())"
 
@@ -330,11 +351,11 @@ function _clear_hub_record!(pref::Integer)
     return nothing
 end
 
-# Start the hub on the first free port at or above the preference. The probe and the bind can race
-# with another process; losing that race fails loudly inside `start_hub`, which is the right outcome.
+# Start the hub on the first free candidate port. The probe and the bind can race with another
+# process; losing that race fails loudly inside `start_hub`, which is the right outcome.
 function _start_hub_on_free_port()
     pref = _PORT[]
-    for p in pref:min(pref + _PORT_SPAN - 1, 65535)
+    for p in _port_candidates(pref)
         ReportEngine._port_free(p) || continue
         h = start_hub(; port = p)
         _LIVE_PORT[] = p; _LIVE_PREF[] = pref
@@ -346,7 +367,8 @@ function _start_hub_on_free_port()
         end
         return h
     end
-    error("KaimonSlate: no free port for the hub in $(pref)–$(pref + _PORT_SPAN - 1)")
+    error("KaimonSlate: no free port for the hub: tried $pref and $(_PORT_SPAN - 1) others in " *
+          "$(first(_PORT_RANGE))–$(last(_PORT_RANGE))")
 end
 
 "Stop this process's hub, if it has one, and withdraw its port record."

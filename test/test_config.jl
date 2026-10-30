@@ -127,7 +127,17 @@ const KS = KaimonSlate
             KS._clear_hub_record!(8765)
             @test !isfile(KS._hub_record_path(8765))
 
-            # Live: hold a port, prefer it, and the hub moves past it and says where.
+            # Fallbacks are fixed per account and preference, and spread over the range rather than
+            # queuing behind the preference.
+            c = KS._port_candidates(8765; user = "alice")
+            @test first(c) == 8765
+            @test length(c) == KS._PORT_SPAN && allunique(c)
+            @test all(p -> p in KS._PORT_RANGE, c[2:end])
+            @test KS._port_candidates(8765; user = "alice") == c          # stable across restarts
+            @test KS._port_candidates(8765; user = "bob")[2:end] != c[2:end]
+            @test KS._port_candidates(9100; user = "alice")[2:end] != c[2:end]
+
+            # Live: hold a port, prefer it, and the hub moves to a fallback and says where.
             S = KS.NotebookServer.Sockets
             held = S.listen(S.localhost, 0)
             pref = Int(S.getsockname(held)[2])
@@ -136,7 +146,7 @@ const KS = KaimonSlate
                 KS._PORT[] = pref
                 KS._HUB[] = KS._start_hub_on_free_port()
                 live = KS._LIVE_PORT[]
-                @test live > pref
+                @test live != pref && live in KS._port_candidates(pref)
                 @test KS._read_hub_record(pref) == live
                 @test KS._base() == "http://127.0.0.1:$live"
                 # Answered for our own connection — on Linux this is the kernel's account check.
