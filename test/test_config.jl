@@ -116,9 +116,10 @@ const KS = KaimonSlate
             @test KS._base() == "http://127.0.0.1:8770"
             @test KS._read_hub_record(9100) === nothing                  # another install's preference
 
-            # A record left by a hub that is gone is ignored, not followed to a dead port.
+            # A record left by a hub that is gone is ignored, not followed to a dead port. (Windows
+            # has no cheap pid probe here; a stale record there is overwritten by the next hub.)
             write(KS._hub_record_path(9100), JSON.json(Dict("port" => 9105, "pid" => typemax(Int32))))
-            @test KS._read_hub_record(9100) === nothing
+            Sys.iswindows() || @test KS._read_hub_record(9100) === nothing
 
             # Withdrawing touches only our own record: a later hub may have replaced it.
             KS._clear_hub_record!(9100)

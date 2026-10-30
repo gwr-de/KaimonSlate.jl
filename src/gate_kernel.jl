@@ -364,8 +364,12 @@ end
 # The server key is resolved the way KaimonGate's `serve` resolves it in the worker, which inherits
 # this process's environment and home. Resolving it before the spawn also creates the key file on a
 # first run, so the two processes cannot each generate a different one.
+#
+# Not on Windows: machines shared between accounts are not the case there, and a local worker that
+# fails its CURVE handshake would leave every notebook unable to run.
 "`(client, server)` CURVE public keys for a locally spawned worker, or `nothing` if either is unavailable."
 function _local_curve_keys()
+    Sys.iswindows() && return nothing
     try
         G = getfield(_kaimon(), :KaimonGate)
         c = String(G._load_or_create_client_keypair()[1])
