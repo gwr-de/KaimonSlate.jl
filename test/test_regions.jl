@@ -82,6 +82,19 @@ end
         @test Meta.parseall(s) isa Expr
     end
 
+    @testset "a locally spawned worker allow-lists the hub too" begin
+        # Loopback is open to every account on a shared machine (a login node), so the local boot
+        # line carries the same CURVE allow-list as a remote one.
+        call(kw) = Meta.parse("SlateWorker.start(; host = \"127.0.0.1\", port = 1, stream_port = 2$kw)")
+        ex = call(RE._curve_start_kwargs("CLIENTPUB"))
+        kws = Dict(a.args[1] => a.args[2] for a in ex.args[2].args)
+        @test kws[:curve] == true
+        @test occursin("CLIENTPUB", string(kws[:allowed_clients]))
+        # No keys (no Kaimon to make them) ⇒ the plain call, which the hub then dials plainly too.
+        @test RE._curve_start_kwargs("") == ""
+        @test call("") isa Expr
+    end
+
     # The activity monitor joins two views of an off-machine worker — the per-host ssh roster and the
     # hub's own kernels — and that join is what makes a notebook run on a plain ssh host visible at all
     # (nothing else names that host). Pure JS, so it's asserted from node; skips when node is absent.

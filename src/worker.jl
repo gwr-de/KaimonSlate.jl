@@ -3487,9 +3487,10 @@ function start(; host::String = "127.0.0.1", port::Int, stream_port::Int,
         # a cell's "Replacing docs" warnings are dropped.
         Base.global_logger(_worker_logger(_LogTee(stderr)))
     catch e; @warn "slate: timestamp logger install failed" exception = e; end
-    # `curve`/`allowed_clients` are set for a REMOTE worker (host="0.0.0.0", :direct transport): the
-    # hub pins THIS gate's CURVE server key (fetched over SSH) and the gate allow-lists the hub's client
-    # key — proper mutual auth. Local + :ssh_tunnel workers leave them off (loopback / SSH-encrypted).
+    # `curve`/`allowed_clients` are set for every worker a hub spawns, local or remote: the hub dials
+    # with THIS gate's CURVE server key and the gate allow-lists the hub's client key — mutual auth.
+    # Loopback alone is no boundary on a shared machine. Only a worker started by hand (attached, not
+    # spawned) runs without them.
     # A cluster prompt raised in here has to reach the hub's dialog; nothing in this process has one.
     try; _install_sshop_delegate!(); catch e; @warn "slate: cluster delegate install failed" exception = e; end
     # DEFERRED (~5s): Revise/src-watcher setup is heavy compilation; running it now would contend for

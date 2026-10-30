@@ -356,6 +356,32 @@ function _clear_stale_pin!(port::Integer)
     end
     return nothing
 end
+# Loopback is no access boundary on a shared machine: any account on a cluster login node can open a
+# worker's port and send it code. So a worker this hub spawns serves CURVE and allow-lists only the
+# hub's client key, as a remote worker does (`_remote_worker_script`). An attached pre-running worker
+# (`k.remote`) is dialed as it is: it was not started with our key.
+#
+# The server key is resolved the way KaimonGate's `serve` resolves it in the worker, which inherits
+# this process's environment and home. Resolving it before the spawn also creates the key file on a
+# first run, so the two processes cannot each generate a different one.
+"`(client, server)` CURVE public keys for a locally spawned worker, or `nothing` if either is unavailable."
+function _local_curve_keys()
+    try
+        G = getfield(_kaimon(), :KaimonGate)
+        c = String(G._load_or_create_client_keypair()[1])
+        s = String(G._resolve_server_keypair(nothing)[1])
+        (isempty(c) || isempty(s)) && return nothing
+        return (client = c, server = s)
+    catch e
+        _rlog("gate: no CURVE keys for a local worker; it will serve without them: $(sprint(showerror, e))")
+        return nothing
+    end
+end
+
+"The `SlateWorker.start` keywords that make a spawned worker serve CURVE for `client` alone (\"\" ⇒ none)."
+_curve_start_kwargs(client::AbstractString) =
+    isempty(client) ? "" : ", curve = true, allowed_clients = String[raw\"$client\"]"
+
 "True when running inside the Kaimon extension (gate client available)."
 gate_available() = isdefined(Main, :Kaimon) &&
     isdefined(_kaimon(), :ConnectionManager) && isdefined(_kaimon(), :connect_tcp!)
@@ -890,7 +916,7 @@ _hub_owner_line() = "SlateWorker.HUB_OWNER[] = $(repr(worker_owner_tag()))"
 # Worker boot: put KaimonGate and the slate-owned infra env on LOAD_PATH, load the SlateWorker
 # package, and serve its tools over TCP. Pinned to the notebook's project.
 function _worker_script(port::Int, stream_port::Int, parent::AbstractString = "",
-                        nbdir::AbstractString = "")
+                        nbdir::AbstractString = ""; curve_client::AbstractString = "")
     # Put ONLY KaimonGate (the ZMQ bridge) on the worker's LOAD_PATH — from its own
     # minimal project (ZMQ/Serialization/…, no HTTP), NOT Kaimon's full env. Kaimon's
     # Manifest pins the custom HTTP 2.0 (Reseau); prepending it would shadow a notebook
@@ -917,7 +943,7 @@ function _worker_script(port::Int, stream_port::Int, parent::AbstractString = ""
     SlateWorker.PARENT_PROJECT[] = $(repr(String(parent)))
     SlateWorker.NOTEBOOK_DIR[] = $(repr(String(nbdir)))
     $(_hub_owner_line())
-    SlateWorker.start(; host = "127.0.0.1", port = $port, stream_port = $stream_port)
+    SlateWorker.start(; host = "127.0.0.1", port = $port, stream_port = $stream_port$(_curve_start_kwargs(curve_client)))
     """
 end
 
@@ -1023,7 +1049,10 @@ function _spawn_worker!(k::GateKernel)
     # entries (a raw string interpolated into a backtick would land as ONE mangled argument). Must
     # precede `-e` — Julia stops parsing its own flags there.
     extra_args = Base.shell_split(effective_worker_extra_flags(k.extra_flags))
-    cmd = `$(Base.julia_cmd()) --project=$(k.project) --startup-file=no --threads=$jthreads $extra_args -e $(_worker_script(port, stream_port, k.parent, k.nbdir))`
+    ck = _local_curve_keys()
+    script = _worker_script(port, stream_port, k.parent, k.nbdir;
+                            curve_client = ck === nothing ? "" : ck.client)
+    cmd = `$(Base.julia_cmd()) --project=$(k.project) --startup-file=no --threads=$jthreads $extra_args -e $script`
     cmd = addenv(cmd, "OPENBLAS_NUM_THREADS" => blas, "OMP_NUM_THREADS" => blas,
                  # Never inherit the hub's load path — see `_DEFAULT_LOAD_PATH`.
                  "JULIA_LOAD_PATH" => _DEFAULT_LOAD_PATH,
@@ -1179,6 +1208,10 @@ end
 function _connect!(k::GateKernel)
     K = _kaimon()
     mgr = _manager()
+    # A worker we spawned serves CURVE when the keys were available at its spawn (`_spawn_worker!`);
+    # they are files, so the same lookup gives the same answer here. "" dials without CURVE.
+    ck = k.remote ? nothing : _local_curve_keys()
+    server_key = ck === nothing ? "" : ck.server
     t0 = time()
     deadline = t0 + _connect_deadline_local()   # worker Julia startup + KaimonGate load is slow
     last = ""
@@ -1197,7 +1230,7 @@ function _connect!(k::GateKernel)
         try
             k.conn = K.connect_tcp!(mgr, "127.0.0.1", k.port;
                                     name = "slate-$(k.port)", stream_port = k.stream_port,
-                                    label = k.label)
+                                    server_key = server_key, label = k.label)
             attempts > 1 && _rlog("gate connect: reached worker on port $(k.port) after $attempts " *
                                   "attempts ($(round(time() - t0; digits = 1))s)")
             return k
