@@ -8,7 +8,8 @@
 #
 # Panel protocol (see Kaimon docs): init(ctx)→state, update!(state,ctx), view(state,area,buf),
 # handle_key!(state,evt)::Bool, cleanup!(state,ctx). `ctx.eval(code)` runs code in the extension
-# process and returns (; stdout, stderr, value_repr).
+# process and returns (; stdout, stderr, value_repr). It reports a failure in `stderr` rather than
+# throwing — the extension still starting, or restarted under a session this panel no longer names.
 
 using Tachikoma
 
@@ -17,61 +18,90 @@ using Tachikoma
 # vary the compute count. `auto` lets Julia pick (≈ all cores).
 const _OPTIONS = ["1,2", "2,2", "4,2", "8,2", "auto,2"]
 
+const _REFRESH_S = 2.0   # how often the hub URL and thread setting are re-read while the panel is open
+
 mutable struct PanelState
     list::Tachikoma.SelectableList
     ctx::Any
     current::String     # spec currently applied in the extension ("" → the adaptive default, min(cores,8),2)
     ncpu::Int
-    url::String         # where the extension's hub is serving ("" if it could not be read)
+    url::String         # where the extension's hub is serving
+    reach::String       # why the extension could not be asked ("" when it answered)
     status::String
+    last::Float64       # when the last refresh started
+    busy::Bool          # a refresh is in flight
 end
 
-# Read "(worker_threads(), CPU_THREADS)" out of the extension process via ctx.eval.
-function _read_current(ctx)
-    cur, ncpu = "", 0
-    try
-        r = ctx.eval("(KaimonSlate.worker_threads(), Sys.CPU_THREADS)")
-        m = match(r"\(\s*\"([^\"]*)\"\s*,\s*(\d+)", String(r.value_repr))
-        m !== nothing && (cur = String(m.captures[1]); ncpu = parse(Int, m.captures[2]))
-    catch e
-        @warn "slate_panel: failed to read worker thread state" exception = (e, catch_backtrace())
-    end
-    return (cur, ncpu)
+# `value_repr` of `code` evaluated in the extension, or an error carrying what went wrong.
+function _ask(ctx, code::AbstractString)::String
+    r = ctx.eval(code)
+    err = strip(String(something(get(r, :stderr, ""), "")))
+    ex = get(r, :exception, nothing)
+    (ex === nothing || ex == "") || error(string(ex))
+    startswith(err, "Error") && error(err)
+    return String(something(get(r, :value_repr, ""), ""))
 end
 
-# The hub's address, from the extension process. `value_repr` is the `repr` of a String.
-function _read_url(ctx)
-    try
-        r = ctx.eval("KaimonSlate._base()")
-        m = match(r"^\"(.*)\"$", strip(String(r.value_repr)))
-        return m === nothing ? "" : String(m.captures[1])
-    catch e
-        @warn "slate_panel: failed to read the hub URL" exception = (e, catch_backtrace())
-        return ""
-    end
+# Read the hub URL, thread setting and CPU count in one round trip. `nothing` fields mean unknown.
+function _read(ctx)
+    v = _ask(ctx, "(KaimonSlate._base(), KaimonSlate.worker_threads(), Sys.CPU_THREADS)")
+    m = match(r"^\(\s*\"([^\"]*)\"\s*,\s*\"([^\"]*)\"\s*,\s*(\d+)\s*\)$", strip(v))
+    m === nothing && error("unexpected reply: $(first(v, 120))")
+    return (url = String(m.captures[1]), cur = String(m.captures[2]), ncpu = parse(Int, m.captures[3]))
 end
 
 _items(eff) = [Tachikoma.ListItem(o == eff ? "$o   ● current" : o, Tachikoma.tstyle(:text))
                for o in _OPTIONS]
 
-function init(ctx)
-    cur, ncpu = _read_current(ctx)
-    eff = isempty(cur) ? "1,1" : cur
-    sel = something(findfirst(==(eff), _OPTIONS), 1)
-    list = Tachikoma.SelectableList(_items(eff); selected = sel, focused = true)
-    PanelState(list, ctx, eff, ncpu, _read_url(ctx),
-               "↑/↓ choose · Enter apply (respawns workers) · Esc close")
+_effective(cur) = isempty(cur) ? "1,1" : cur
+
+function _apply_read!(state, r)
+    state.url = r.url; state.ncpu = r.ncpu; state.reach = ""
+    eff = _effective(r.cur)
+    if eff != state.current
+        state.current = eff
+        state.list.items = _items(eff)
+    end
+    return state
 end
 
-update!(state, ctx) = nothing
+# Off the render loop: `ctx.eval` blocks until the extension answers.
+function _refresh!(state)
+    state.busy && return
+    state.busy = true; state.last = time()
+    errormonitor(@async try
+        _apply_read!(state, _read(state.ctx))
+    catch e
+        state.reach = sprint(showerror, e)
+    finally
+        state.busy = false
+    end)
+    return
+end
+
+function init(ctx)
+    list = Tachikoma.SelectableList(_items("1,1"); selected = 1, focused = true)
+    state = PanelState(list, ctx, "1,1", 0, "", "", "↑/↓ choose · Enter apply (respawns workers) · Esc close",
+                       0.0, false)
+    try
+        _apply_read!(state, _read(ctx))
+        state.list.selected = something(findfirst(==(state.current), _OPTIONS), 1)
+    catch e
+        state.reach = sprint(showerror, e)
+    end
+    return state
+end
+
+update!(state, ctx) = (time() - state.last > _REFRESH_S && _refresh!(state); nothing)
 
 function view(state, area::Tachikoma.Rect, buf)
     hh = min(7, area.height)
     hdr = Tachikoma.Rect(area.x, area.y, area.width, hh)
+    hub = !isempty(state.reach) ? "extension not reachable — $(first(state.reach, 80)) (reopen the panel after a restart)" :
+          isempty(state.url) ? "starting…" : state.url
     p = Tachikoma.Paragraph(Tachikoma.Span[
         Tachikoma.Span("Hub  ", Tachikoma.tstyle(:title, bold = true)),
-        Tachikoma.Span(isempty(state.url) ? "not running\n\n" : state.url * "\n\n",
-                       Tachikoma.tstyle(:accent, bold = true)),
+        Tachikoma.Span(hub * "\n\n", Tachikoma.tstyle(isempty(state.reach) ? :accent : :warning, bold = true)),
         Tachikoma.Span("Worker Julia threads\n", Tachikoma.tstyle(:title, bold = true)),
         Tachikoma.Span("applied: ", Tachikoma.tstyle(:text_dim)),
         Tachikoma.Span(state.current, Tachikoma.tstyle(:accent, bold = true)),
@@ -91,12 +121,15 @@ function handle_key!(state, evt::Tachikoma.KeyEvent)::Bool
     if evt.key == :enter
         spec = _OPTIONS[state.list.selected]
         try
-            state.ctx.eval("KaimonSlate.set_worker_threads!(\"$spec\")")
-            state.current = spec
-            state.list.items = _items(spec)
-            state.status = "✓ applied $spec — workers respawned. (re-run cells to use the new threads)"
+            _ask(state.ctx, "KaimonSlate.set_worker_threads!(\"$spec\")")
+            # Read it back: the panel reports what the extension now holds, not what was asked for.
+            r = _read(state.ctx)
+            _apply_read!(state, r)
+            state.status = _effective(r.cur) == spec ?
+                "✓ applied and saved $spec — workers respawned (re-run cells to use the new threads)" :
+                "⚠ asked for $spec but the extension reports $(_effective(r.cur))"
         catch e
-            state.status = "⚠ failed to apply: $(sprint(showerror, e))"
+            state.status = "⚠ not applied: $(first(sprint(showerror, e), 160))"
         end
         return true
     end
