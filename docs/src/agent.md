@@ -84,7 +84,8 @@ turn is in flight you're asked to confirm before it's interrupted.
 
 ### Codex through ACP
 
-With a Kaimon build that supports `acp:codex`, install the maintained adapter:
+Use a Kaimon build that supports `acp:codex` and includes the MCP isolation fix for
+[Kaimon issue #1](https://github.com/gwr-de/Kaimon.jl/issues/1). Install the maintained adapter:
 
 ```sh
 npm install -g @agentclientprotocol/codex-acp
@@ -95,10 +96,14 @@ It uses the adapter's configured model and existing Codex login, including a Cha
 For an explicit model, choose **Custom…** and enter `acp:codex:<model-id>`. Codex discovery
 only checks for the executable; it does not start an agent or send an inference request.
 
-Codex also uses its own tools, configuration, and permissions. Kaimon's `notebook` and
-`specialist` presets do not fully restrict those native tools; Kaimon reports that limitation
-when the agent starts. Inherited MCP connections can also bypass the agent's tool policy,
-including the recursion guard; this is tracked in [Kaimon issue #1](https://github.com/gwr-de/Kaimon.jl/issues/1).
+Kaimon disables inherited MCP connections for its Codex agents and supplies a connection tagged
+with the owning agent's identity. Calls through that connection are subject to tool policy,
+including the recursion guard and workspace path checks. These overrides apply only to the
+agent process; the existing Codex login and global configuration are preserved.
+
+Codex's native file and shell tools still follow its own approval and sandbox settings.
+Kaimon's `notebook` and `specialist` presets do not fully restrict those native tools;
+Kaimon reports that limitation when the agent starts.
 
 ## Stopping
 
