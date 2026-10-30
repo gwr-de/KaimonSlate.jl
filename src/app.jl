@@ -349,8 +349,7 @@ function _restart_hub!(m::SlateModel)
                     paths = lock(h.lock) do
                         [abspath(nb.path) for nb in values(h.notebooks)]
                     end
-                    try; stop_hub(h); catch; end
-                    _HUB[] = nothing
+                    _drop_hub!()
                 end
             end
             h2 = _hub()
@@ -1062,8 +1061,8 @@ function _app_main(args::Vector{String})::Int
         try
             _own_hub!()
         catch e
-            println(stderr, "slate: could not start the hub on port $(_PORT[]): ", sprint(showerror, e))
-            println(stderr, "Is another service using the port? Set KAIMONSLATE_PORT to move it.")
+            println(stderr, "slate: could not start the hub: ", sprint(showerror, e))
+            println(stderr, "Set KAIMONSLATE_PORT (or --port) to start the search for a free port elsewhere.")
             return 1
         end
     end

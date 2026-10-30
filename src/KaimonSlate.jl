@@ -28,6 +28,7 @@ include(joinpath(@__DIR__, "expanduser_fix.jl"))
 
 
 import JSON
+import Random  # the embedded Kaimon host's API key, from the OS random source
 import TOML    # the specialist roles defined outside the code (`<config>/specialists.toml`)
 
 # In dependency order; each depends on nothing but what precedes it. SlateHome is first because
@@ -276,16 +277,93 @@ end
 # Port is configurable via the KAIMONSLATE_PORT env var (default 8765) so a
 # config UI / launcher can pin it; the hub auto-starts at extension init. Held in a `Ref` and set
 # from the env in `__init__` (RUNTIME) — a top-level `const` reading ENV would be frozen at precompile.
+#
+# That port is a PREFERENCE. On a shared machine another account may already hold it, so the hub takes
+# the first free port at or above it and records where it went (`_hub_record_path`); any other process
+# that wants this hub — the `slate` TUI, the Kaimon panel — finds it through `_base()`.
 const _PORT = Ref(8765)
 const _HUB = Ref{Union{Hub,Nothing}}(nothing)
 const _LOCK = ReentrantLock()
+const _LIVE_PORT = Ref(0)      # where THIS process's hub listens; 0 ⇒ no hub here
+const _LIVE_PREF = Ref(0)      # the preference it was started for, whose record it owns
+const _PORT_SPAN = 100         # how far past the preference to look for a free port
 
-_base() = "http://127.0.0.1:$(_PORT[])"
+_base() = "http://127.0.0.1:$(_hub_port())"
+
+"The port of the hub for this process's preferred port: our own, else a live recorded one, else the preference."
+function _hub_port()::Int
+    _LIVE_PORT[] > 0 && return _LIVE_PORT[]
+    r = _read_hub_record(_PORT[])
+    return r === nothing ? _PORT[] : r
+end
+
+# Per host, because the cache home is often on a filesystem many machines share (a cluster's login
+# nodes) while a hub listens on one of them. Per preferred port, because two Slate installs side by
+# side are told apart by their configured ports.
+_hub_record_path(pref::Integer) = joinpath(SlateHome.cache_home(), "hubs", "$(gethostname())-$(pref).json")
+
+function _write_hub_record!(pref::Integer, port::Integer)
+    f = _hub_record_path(pref)
+    mkpath(dirname(f))
+    write(f, JSON.json(Dict("port" => port, "pid" => getpid(), "started" => round(Int, time()))))
+    return f
+end
+
+_pid_alive(pid) = pid isa Integer && pid > 0 &&
+                  (Sys.isunix() ? ccall(:kill, Cint, (Cint, Cint), pid, 0) == 0 : true)
+
+"The port recorded for preference `pref` by a hub that is still running, or `nothing`."
+function _read_hub_record(pref::Integer)::Union{Int,Nothing}
+    f = _hub_record_path(pref)
+    isfile(f) || return nothing
+    d = try; JSON.parsefile(f); catch; return nothing; end
+    port = get(d, "port", 0)
+    (port isa Integer && 0 < port < 65536 && _pid_alive(get(d, "pid", 0))) || return nothing
+    return Int(port)
+end
+
+# Only our own record: a later hub for the same preference may have replaced it.
+function _clear_hub_record!(pref::Integer)
+    f = _hub_record_path(pref)
+    d = try; JSON.parsefile(f); catch; return nothing; end
+    get(d, "pid", 0) == getpid() && rm(f; force = true)
+    return nothing
+end
+
+# Start the hub on the first free port at or above the preference. The probe and the bind can race
+# with another process; losing that race fails loudly inside `start_hub`, which is the right outcome.
+function _start_hub_on_free_port()
+    pref = _PORT[]
+    for p in pref:min(pref + _PORT_SPAN - 1, 65535)
+        ReportEngine._port_free(p) || continue
+        h = start_hub(; port = p)
+        _LIVE_PORT[] = p; _LIVE_PREF[] = pref
+        p == pref || @info "KaimonSlate: port $pref is in use; the hub is on $p instead" url = "http://127.0.0.1:$p"
+        try
+            _write_hub_record!(pref, p)
+        catch e
+            @warn "KaimonSlate: could not record the hub's port; other processes will look for it on $pref" exception = e
+        end
+        return h
+    end
+    error("KaimonSlate: no free port for the hub in $(pref)–$(pref + _PORT_SPAN - 1)")
+end
+
+"Stop this process's hub, if it has one, and withdraw its port record."
+function _drop_hub!()
+    h = _HUB[]
+    h === nothing && return nothing
+    try; stop_hub(h); catch; end
+    _HUB[] = nothing
+    try; _clear_hub_record!(_LIVE_PREF[]); catch; end
+    _LIVE_PORT[] = 0
+    return nothing
+end
 
 # The running hub (started lazily on first open).
 function _hub()
     lock(_LOCK) do
-        _HUB[] === nothing && (_HUB[] = start_hub(; port = _PORT[]))
+        _HUB[] === nothing && (_HUB[] = _start_hub_on_free_port())
         # (Re)register the remote bring-up → browser-banner sink HERE too, not only in `start_hub`: this
         # runs on every hub access, so a Revise reload of the server picks it up WITHOUT a full restart
         # (start_hub only runs once, at boot). The closure reads `_HUB[]` at call time → always the live hub.
@@ -4171,7 +4249,7 @@ Stop every running notebook server before the extension subprocess exits.
 """
 function on_shutdown()
     lock(_LOCK) do
-        _HUB[] === nothing || (try; stop_hub(_HUB[]); catch; end; _HUB[] = nothing)
+        _drop_hub!()
     end
     @info "KaimonSlate shut down"
 end

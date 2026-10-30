@@ -97,6 +97,64 @@ const KS = KaimonSlate
         end
     end
 
+    # The configured port is a preference: a hub whose port is held moves to a free one and records
+    # where it went, and every other process finds it through that record.
+    @testset "hub port record" begin
+        oldc = get(ENV, "KAIMONSLATE_CACHE_HOME", nothing)
+        ENV["KAIMONSLATE_CACHE_HOME"] = mktempdir()
+        oldpref, oldlive = KS._PORT[], KS._LIVE_PORT[]
+        try
+            KS._LIVE_PORT[] = 0
+            @test occursin(gethostname(), KS._hub_record_path(8765))    # per host: homes are often shared
+            @test KS._read_hub_record(8765) === nothing
+            KS._PORT[] = 8765
+            @test KS._hub_port() == 8765                                 # no record → the preference
+
+            KS._write_hub_record!(8765, 8770)
+            @test KS._read_hub_record(8765) == 8770
+            @test KS._hub_port() == 8770
+            @test KS._base() == "http://127.0.0.1:8770"
+            @test KS._read_hub_record(9100) === nothing                  # another install's preference
+
+            # A record left by a hub that is gone is ignored, not followed to a dead port.
+            write(KS._hub_record_path(9100), JSON.json(Dict("port" => 9105, "pid" => typemax(Int32))))
+            @test KS._read_hub_record(9100) === nothing
+
+            # Withdrawing touches only our own record: a later hub may have replaced it.
+            KS._clear_hub_record!(9100)
+            @test isfile(KS._hub_record_path(9100))
+            KS._clear_hub_record!(8765)
+            @test !isfile(KS._hub_record_path(8765))
+
+            # Live: hold a port, prefer it, and the hub moves past it and says where.
+            S = KS.NotebookServer.Sockets
+            held = S.listen(S.localhost, 0)
+            pref = Int(S.getsockname(held)[2])
+            oldhub = KS._HUB[]
+            try
+                KS._PORT[] = pref
+                KS._HUB[] = KS._start_hub_on_free_port()
+                live = KS._LIVE_PORT[]
+                @test live > pref
+                @test KS._read_hub_record(pref) == live
+                @test KS._base() == "http://127.0.0.1:$live"
+                # Answered for our own connection — on Linux this is the kernel's account check.
+                r = KS.NotebookServer.HTTP.get(KS._base() * "/api/version"; retry = false, status_exception = false)
+                @test r.status == 200
+                KS._drop_hub!()
+                @test KS._LIVE_PORT[] == 0
+                @test !isfile(KS._hub_record_path(pref))
+            finally
+                close(held)
+                KS._HUB[] === nothing || KS._drop_hub!()
+                KS._HUB[] = oldhub
+            end
+        finally
+            KS._PORT[], KS._LIVE_PORT[] = oldpref, oldlive
+            oldc === nothing ? delete!(ENV, "KAIMONSLATE_CACHE_HOME") : (ENV["KAIMONSLATE_CACHE_HOME"] = oldc)
+        end
+    end
+
     # `--port` arg validation — only the early-return paths (help + bad input); a valid port would
     # fall through to the interactive TUI, which needs a real terminal.
     @testset "--port arg validation" begin
@@ -166,16 +224,24 @@ end
             @test vars["KAIMON_HEADLESS_SYNC_INTERVAL"] == "0"
         end
 
-        @testset "the config is lax, loopback, and key-free" begin
-            # Kaimon's own first-run path writes :strict with a generated API key, which would put a
-            # token between the host, the extension it spawns, and any CLI agent attaching.
+        @testset "the config is strict, loopback, and keeps its key" begin
+            # Loopback is open to every account on a shared machine, and the MCP port runs code.
             f = KaimonSlate._write_kaimon_config!(2828)
             cfg = JSON.parsefile(f)
-            @test cfg["mode"] == "lax"
-            @test isempty(cfg["api_keys"])
+            @test cfg["mode"] == "strict"
+            @test length(cfg["api_keys"]) == 1
+            key = cfg["api_keys"][1]
+            @test occursin(r"^kaimon_[0-9a-f]{40}$", key)              # Kaimon's own key format
             @test cfg["allowed_ips"] == ["127.0.0.1", "::1"]
             @test cfg["port"] == 2828
             @test cfg["created_at"] isa Integer      # Int64 field; a float is the hand-written-config trap
+            Sys.isunix() && @test filemode(f) & 0o077 == 0                # nobody else can read the key
+            # A restart rewrites the file but not the key: an agent configured against it keeps working.
+            @test JSON.parsefile(KaimonSlate._write_kaimon_config!(2829))["api_keys"] == [key]
+            # A malformed key on disk is replaced rather than carried forward.
+            write(f, JSON.json(Dict("api_keys" => ["nope"])))
+            fresh = JSON.parsefile(KaimonSlate._write_kaimon_config!(2828))["api_keys"][1]
+            @test fresh != "nope" && occursin(r"^kaimon_[0-9a-f]{40}$", fresh)
         end
     end
 end

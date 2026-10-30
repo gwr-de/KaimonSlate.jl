@@ -1,4 +1,5 @@
 # Kaimon extension TUI panel for KaimonSlate (rendered in the Extensions tab — press `u`).
+# Shows where the hub is serving: its port is only a preference, so it may have moved to a free one.
 # Lets you set the worker Julia-thread count, which governs parallel cell execution:
 #   • 1 compute thread  → independent cells overlap only at yield points (I/O / sleep / async).
 #   • N compute threads → independent cells run on real OS threads (multi-core CPU parallelism).
@@ -21,6 +22,7 @@ mutable struct PanelState
     ctx::Any
     current::String     # spec currently applied in the extension ("" → the adaptive default, min(cores,8),2)
     ncpu::Int
+    url::String         # where the extension's hub is serving ("" if it could not be read)
     status::String
 end
 
@@ -37,6 +39,18 @@ function _read_current(ctx)
     return (cur, ncpu)
 end
 
+# The hub's address, from the extension process. `value_repr` is the `repr` of a String.
+function _read_url(ctx)
+    try
+        r = ctx.eval("KaimonSlate._base()")
+        m = match(r"^\"(.*)\"$", strip(String(r.value_repr)))
+        return m === nothing ? "" : String(m.captures[1])
+    catch e
+        @warn "slate_panel: failed to read the hub URL" exception = (e, catch_backtrace())
+        return ""
+    end
+end
+
 _items(eff) = [Tachikoma.ListItem(o == eff ? "$o   ● current" : o, Tachikoma.tstyle(:text))
                for o in _OPTIONS]
 
@@ -45,16 +59,19 @@ function init(ctx)
     eff = isempty(cur) ? "1,1" : cur
     sel = something(findfirst(==(eff), _OPTIONS), 1)
     list = Tachikoma.SelectableList(_items(eff); selected = sel, focused = true)
-    PanelState(list, ctx, eff, ncpu,
+    PanelState(list, ctx, eff, ncpu, _read_url(ctx),
                "↑/↓ choose · Enter apply (respawns workers) · Esc close")
 end
 
 update!(state, ctx) = nothing
 
 function view(state, area::Tachikoma.Rect, buf)
-    hh = min(5, area.height)
+    hh = min(7, area.height)
     hdr = Tachikoma.Rect(area.x, area.y, area.width, hh)
     p = Tachikoma.Paragraph(Tachikoma.Span[
+        Tachikoma.Span("Hub  ", Tachikoma.tstyle(:title, bold = true)),
+        Tachikoma.Span(isempty(state.url) ? "not running\n\n" : state.url * "\n\n",
+                       Tachikoma.tstyle(:accent, bold = true)),
         Tachikoma.Span("Worker Julia threads\n", Tachikoma.tstyle(:title, bold = true)),
         Tachikoma.Span("applied: ", Tachikoma.tstyle(:text_dim)),
         Tachikoma.Span(state.current, Tachikoma.tstyle(:accent, bold = true)),

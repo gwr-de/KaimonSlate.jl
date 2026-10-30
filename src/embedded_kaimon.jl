@@ -124,11 +124,14 @@ end
 """
     _write_kaimon_config!(port) -> String
 
-Write the embedded host's `config.json` (lax, loopback, no API key) and return its path.
+Write the embedded host's `config.json` (strict, loopback, one API key) and return its path.
 
-Written rather than left to Kaimon's own first-run path, which produces `:strict` with a generated
-API key — that would put a token between this host, the Slate extension it spawns, and any CLI
-agent attaching to it, for a single-user local host where there is nothing to authenticate against.
+Strict because loopback is no boundary on a shared machine: any account on a cluster login node can
+reach the host's MCP port, and that port runs code. The agents the host spawns are handed the key by
+Kaimon itself; an agent configured by hand reads it from this file. The key is kept across restarts
+so such a configuration goes on working.
+
+Written rather than left to Kaimon's own first-run path, which would stop to ask.
 
 `created_at` is an `Int64` field. Kaimon rounds on read, but write an integer anyway.
 """
@@ -136,29 +139,45 @@ function _write_kaimon_config!(port::Integer)
     dir = joinpath(_embedded_config_home(), "kaimon")   # Kaimon appends "kaimon" under XDG_CONFIG_HOME
     mkpath(dir)
     file = joinpath(dir, "config.json")
+    key = _embedded_api_key(file)
     cfg = Dict{String,Any}(
-        "mode" => "lax",
-        "api_keys" => String[],
+        "mode" => "strict",
+        "api_keys" => [key],
         "allowed_ips" => ["127.0.0.1", "::1"],
         "port" => Int(port),
         "created_at" => round(Int, time()),
         "editor" => "vscode",
         "qdrant_prefix" => "slate-embedded",
     )
-    write(file, JSON.json(cfg, 2))
-    Sys.isunix() && (try; chmod(file, 0o600); catch; end)
+    # Created private, not narrowed after the write: the key must never sit in a readable file.
+    tmp = file * ".tmp"
+    open(tmp, "w") do io
+        Sys.isunix() && chmod(tmp, 0o600)
+        write(io, JSON.json(cfg, 2))
+    end
+    mv(tmp, file; force = true)
     return file
 end
 
-# Is something already serving on the port the embedded extension would bind? A plain TCP connect:
-# this asks "is anyone there", which is the question that matters, and does not need the responder
-# to be a Slate hub (whatever it is, we must not fight it for the port).
-#
-# Uses ReportEngine's existing probe rather than a local `Sockets` call: `Sockets` is not imported
-# into this module, so a direct call throws `UndefVarError` — and with the guard's own `catch` that
-# read as "port is free", which is the failure mode a guard must never have. It answered false while
-# a live hub was sitting on the port, and starting anyway took that hub down.
-_hub_port_taken() = !ReportEngine._port_free(_PORT[])
+# The key already in the host's config, else a new one in Kaimon's format (`kaimon_` + 40 hex, from
+# the OS random source).
+function _embedded_api_key(file::AbstractString)::String
+    old = try; JSON.parsefile(file); catch; nothing; end
+    if old isa AbstractDict
+        ks = get(old, "api_keys", nothing)
+        if ks isa AbstractVector && !isempty(ks)
+            k = string(first(ks))
+            occursin(r"^kaimon_[0-9a-f]{40}$", k) && return k
+        end
+    end
+    return "kaimon_" * bytes2hex(rand(Random.RandomDevice(), UInt8, 20))
+end
+
+# Is a hub of ours already serving the preference the embedded extension would start from? The
+# extension's hub moves to a free port when its preference is held, so something else on that port —
+# another account's hub on a shared machine — is no clash. A second hub of our own for the same
+# preference still is: the two would compete for one record, and the TUI would attach to either.
+_hub_port_taken() = _hub_running()
 
 # Where Kaimon comes from: a local checkout when `SLATE_KAIMON_PATH` names one (same override the
 # exported-app runner honours), else the registry.
