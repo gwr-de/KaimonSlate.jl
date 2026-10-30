@@ -1704,7 +1704,9 @@ function create_tools(GateTool::Type)
         # is the normal case for this tool, and the fallback is quiet: the PDF still builds and
         # those cells come out as plain text. Count them first so the answer can say so, rather
         # than leaving the caller to notice that a grid they expected is missing.
-        htmlcells = count(c -> NotebookServer._has_html_output(c), nb.report.cells)
+        # HTML outputs that carry a markdown form are typeset, so they need no tab
+        htmlcells = count(c -> NotebookServer._has_html_output(c) &&
+                               NotebookServer._output_chunk(c.output, "text/markdown") === nothing, nb.report.cells)
         notab = htmlcells > 0 && lock(nb.llock) do; isempty(nb.listeners); end
         # Deck defaults: code hidden unless the caller explicitly opts in.
         slides = layout == "slides"

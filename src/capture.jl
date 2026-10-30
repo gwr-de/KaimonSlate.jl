@@ -160,6 +160,7 @@ function _rich_scan!(chunks::Vector{Tuple{String,Vector{UInt8}}}, x)
             m == "text/html" && (bytes = _fix_at_refs(bytes))
             push!(chunks, (m, bytes))
             startswith(m, "image/") && _capture_export_vector!(chunks, x)
+            m in ("text/html", "text/latex") && _capture_export_markdown!(chunks, x)
             return true
         end
     end
@@ -241,6 +242,23 @@ function _capture_export_vector!(chunks::Vector{Tuple{String,Vector{UInt8}}}, x)
     try
         bytes = Base.invokelatest(_mime_bytes, MIME(_EXPORT_VEC_MIME), x)
         isempty(bytes) || push!(chunks, (_EXPORT_VEC_MIME, bytes))
+    catch
+    end
+    return
+end
+
+# A value shown as HTML or LaTeX that can also show itself as markdown (a table of formulas, a
+# derivation with notes) is captured in that form too. Typst can't typeset HTML, and LaTeX built
+# for KaTeX can lean on commands mitex lacks; markdown with `$…$` math goes through cmarker and
+# mitex like a markdown cell, so it prints as text and formulas rather than a screenshot. Like
+# the vector PDF above, the chunk is export-only: `_render_chunks` ignores `text/markdown`.
+const _EXPORT_MD_MIME = "text/markdown"
+function _capture_export_markdown!(chunks::Vector{Tuple{String,Vector{UInt8}}}, x)
+    any(c -> c[1] == _EXPORT_MD_MIME, chunks) && return
+    try
+        Base.invokelatest(showable, MIME(_EXPORT_MD_MIME), x) || return
+        bytes = Base.invokelatest(_mime_bytes, MIME(_EXPORT_MD_MIME), x)
+        isempty(bytes) || push!(chunks, (_EXPORT_MD_MIME, bytes))
     catch
     end
     return

@@ -1758,6 +1758,39 @@ end
     @test occursin(raw"$E = mc^2$", NS._md_for_typst(c))
 end
 
+# ── PDF export: math and markdown outputs typeset natively ──────────────────────────────────────────
+# A `text/latex` output, or the markdown form of an HTML output, prints as text and formulas rather
+# than a screenshot. LaTeX written for KaTeX loses the layout commands mitex lacks.
+@testset "typst export typesets math outputs" begin
+    p = NS._portable_tex
+    @test p(raw"\begin{bmatrix}\rule[-1.4em]{0pt}{3.3em}\dfrac{a}{b} \\ \rule[-1.4em]{0pt}{3.3em}c\end{bmatrix}") ==
+          raw"\begin{bmatrix}\dfrac{a}{b} \\ c\end{bmatrix}"
+    @test p(raw"\left[\hspace{-5pt}\begin{array}{r}1\end{array}\hspace{-5pt}\right]") == raw"\left[\begin{array}{r}1\end{array}\right]"
+    @test p(raw"\hphantom{\begin{matrix}x \\ y\end{matrix}}\mathllap{x} &= 1") == raw"{x} &= 1"
+    @test p(raw"a \\[8pt] b") == raw"a \\ b"
+    @test p(raw"a \\ \\[-0.9em] b") == raw"a \\ b"               # an emptied spacer row collapses
+    @test p(raw"a \\ \dfrac{1}{2}") == raw"a \\ \dfrac{1}{2}"     # a row break before a command stays put
+    @test NS._strip_math_delims(raw"$$x^2$$") == "x^2" && NS._strip_math_delims(raw"$θ$") == "θ"
+
+    # Typst is asked before the export commits to native math: an unknown command falls back.
+    @test NS._typst_typesets(:tex, raw"\begin{bmatrix}\dfrac{a}{b} & 1\end{bmatrix}")
+    @test !NS._typst_typesets(:tex, raw"\mathllap{x}")
+    @test NS._typst_typesets(:md, "| code | result |\n|:--|:--|\n| `x` | \$\$x^2\$\$ |\n")
+end
+
+# A value shown as HTML that can also show itself as markdown carries that form, export-only.
+struct _MdCard end
+Base.show(io::IO, ::MIME"text/html", ::_MdCard) = print(io, "<b>card</b>")
+Base.show(io::IO, ::MIME"text/markdown", ::_MdCard) = print(io, "**card**")
+@testset "an HTML output keeps its markdown form for export" begin
+    chunks = Tuple{String, Vector{UInt8}}[]
+    @test _RE._capture_rich!(chunks, _MdCard())
+    @test first.(chunks) == ["text/html", "text/markdown"]
+    @test String(chunks[2][2]) == "**card**"
+    # the browser renders the HTML and ignores the markdown
+    @test KaimonSlate.ReportRender._render_chunks([(mime = m, data = copy(d)) for (m, d) in chunks]) == "<div class=\"disp html\"><b>card</b></div>"
+end
+
 # The SCREEN half of the same story. KaTeX is configured for the bracket spellings, but CommonMark
 # reads `\(` / `\[` as escaped punctuation and drops the backslash, so by the time KaTeX ran there
 # was no delimiter left and the maths rendered as literal text. They have to be stashed like `$…$`.
