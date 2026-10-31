@@ -341,8 +341,8 @@ end
 # A value shown as HTML or LaTeX that can also show itself as markdown (a table of formulas, a
 # derivation with notes) is captured in that form too. Typst can't typeset HTML, and LaTeX built
 # for KaTeX can lean on commands mitex lacks; markdown with `$…$` math goes through cmarker and
-# mitex like a markdown cell, so it prints as text and formulas rather than a screenshot. Like
-# the vector PDF above, the chunk is export-only: `_render_chunks` ignores `text/markdown`.
+# mitex like a markdown cell, so it prints as text and formulas rather than a screenshot. The chunk
+# follows the HTML or LaTeX it restates, which is how `_render_chunks` knows to leave it out.
 const _EXPORT_MD_MIME = "text/markdown"
 function _capture_export_markdown!(chunks::Vector{Tuple{String,Vector{UInt8}}}, x)
     any(c -> c[1] == _EXPORT_MD_MIME, chunks) && return
