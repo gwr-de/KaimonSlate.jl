@@ -119,13 +119,19 @@
       const [px, py] = local(e);
       zoomAt(CLOSE, px, py);
     });
-    // Focus moving elsewhere on the page ends the look: the frame no longer takes the wheel, so a
-    // zoom left behind could only be undone by clicking back in. Leaving the window is not that:
-    // the frame gets focus back on return, and the zoom is still wanted. Checked after the event,
-    // when `activeElement` and `hasFocus` say where focus went.
-    if (gated) frame.addEventListener('focusout', () => setTimeout(() => {
-      if (s > 1 && document.hasFocus() && !frame.contains(document.activeElement)) reset();
-    }, 0));
+    // Moving on from the figure ends the look: its ring and its zoom go. A press elsewhere is not
+    // always a focus change — the notebook's own handlers can keep focus where it was — so a press
+    // outside counts as leaving (see the listener below), and so does focus moving on by keyboard.
+    // Switching to another window is not leaving: the figure has focus again on return.
+    if (gated) {
+      frame._izLeave = () => {
+        reset();
+        if (frame.contains(document.activeElement)) document.activeElement.blur();
+      };
+      frame.addEventListener('focusout', () => setTimeout(() => {
+        if (s > 1 && document.hasFocus() && !frame.contains(document.activeElement)) reset();
+      }, 0));
+    }
     // A resize changes the fitted size the offsets are measured against.
     if (window.ResizeObserver) new ResizeObserver(() => s > 1 && apply()).observe(frame);
     return { zoomIn: () => center(STEP), zoomOut: () => center(1 / STEP), reset,
@@ -163,6 +169,15 @@
   document.addEventListener('pointerover', e => {
     const img = e.target && e.target.closest ? e.target.closest('.disp.img img') : null;
     img && wire(img);
+  }, true);
+  // A press outside an active or zoomed figure leaves it. Capture phase, so a handler that stops the
+  // event further down cannot keep the figure active. The full-window view is not "outside".
+  document.addEventListener('pointerdown', e => {
+    const t = e.target;
+    if (t && t.closest && t.closest('.izview')) return;
+    for (const f of document.querySelectorAll('.izframe.izzoomed, .izframe:focus-within')) {
+      if (f._izLeave && !f.contains(t)) f._izLeave();
+    }
   }, true);
 
   // ── Full-window view ──
