@@ -1094,13 +1094,7 @@ function _make_router(h::Hub)
     end)
     # ── Answering an ssh prompt ──────────────────────────────────────────────────────────────
     # Hub-level, not per notebook: a connection belongs to a HOST, and one prompt may be what
-    # several notebooks are waiting on. `id` came from the `sshauth:` push that raised the dialog.
-    # What is waiting to be answered. Notebook pages are PUSHED their prompts over the page socket;
-    # the home page has no such socket, so the sign-in panel there watches this while its request
-    # is in flight.
-    HTTP.register!(router, "GET", "/api/sshauth", _ -> _json(Dict("pending" =>
-        [Dict("id" => p.id, "host" => p.host, "prompt" => p.prompt, "secret" => !p.echo)
-         for p in SshAuth.pending()])))
+    # several notebooks are waiting on. `id` is the prompt's, from its `sshauth/<id>` fact.
     HTTP.register!(router, "POST", "/api/sshauth", req -> begin
         b = try; JSON.parse(String(req.body)); catch; nothing; end
         b isa AbstractDict || return _json(Dict("ok" => false, "error" => "bad request"))
@@ -4112,14 +4106,10 @@ function _install_worker_push!(h)
 end
 
 # ── ssh wants an answer ──────────────────────────────────────────────────────────────────────
-# A cluster that refuses keys asks for a password and a second factor. The ssh client hands each
-# prompt to a helper (`SshAuth`), which parks it in a file and waits; this is what notices and puts
-# it on screen. Polling, because the producer is a `/bin/sh` script with no way to signal us — and
-# a prompt is a human-scale event, so 300 ms is not a compromise.
-#
-# Broadcast to EVERY open notebook rather than one: the connection belongs to a host, not to a
-# notebook, and answering once clears it for all of them.
-const _SSHAUTH_SEEN = Set{String}()
+# A cluster that refuses keys asks for a password and a second factor. The ssh session hands each
+# prompt to `SshAuth`, which parks it until a page answers. Waiting prompts are facts
+# (`sshauth/<id>`), so every page — the home page and each notebook, including one opened after the
+# prompt was raised — shows the dialog, and answering it anywhere clears it everywhere.
 
 # What each host's login asks for, kept between runs. Learning it again costs a login that fails on
 # purpose, and a cluster that issues its second factor with the prompt rather than on the answer
@@ -4175,32 +4165,7 @@ function _install_sshauth_watch!(h)
         for nb in nbs; try; facts_changed!(); catch; end; end   # pills leave "disconnected" at once
         return nothing
     end
-    errormonitor(@async while true
-        try
-            live = Set{String}()
-            for p in SshAuth.pending()
-                push!(live, p.id)
-                p.id in _SSHAUTH_SEEN && continue
-                push!(_SSHAUTH_SEEN, p.id)
-                msg = "sshauth:" * JSON.json(Dict("id" => p.id, "host" => p.host,
-                                                  "prompt" => p.prompt,
-                                                  "secret" => !p.echo))
-                for nb in lock(h.lock) do; collect(values(h.notebooks)); end
-                    try; _broadcast(nb, msg); catch; end
-                end
-            end
-            # A prompt that is gone — answered here, cancelled, or timed out — takes its dialog with
-            # it. Without this the page keeps showing one nothing is waiting on.
-            for id in setdiff(_SSHAUTH_SEEN, live)
-                for nb in lock(h.lock) do; collect(values(h.notebooks)); end
-                    try; _broadcast(nb, "sshauth-done:" * id); catch; end
-                end
-            end
-            intersect!(_SSHAUTH_SEEN, live)
-        catch
-        end
-        sleep(0.3)
-    end)
+    SshAuth.set_on_change!(facts_changed!)
     return nothing
 end
 

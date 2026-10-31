@@ -18,7 +18,8 @@
 # consequence, because no event says what its consequences are.
 #
 # Keys are `worker/<notebook>/<side>` (side "" is the notebook's main worker), `session/<host>`,
-# `region/<name>` and `parked/<host>/<label>/<port>`.
+# `region/<name>`, `parked/<host>/<label>/<port>` and `sshauth/<id>` (a login prompt waiting for an
+# answer — a fact rather than a one-off push, so a page that opens mid-login is shown it too).
 
 const _FACTS = Dict{String,Any}()
 const _FACTS_REV = Ref(0)
@@ -155,6 +156,10 @@ function _facts_compute(h)
     end
     for (host, uses) in (try; _session_hosts(nothing); catch; Dict{String,Vector{String}}(); end)
         out["session/" * host] = _session_fact(host, uses, nbs)
+    end
+    for p in SshAuth.pending()
+        out["sshauth/" * p.id] = Dict{String,Any}("id" => p.id, "host" => p.host, "prompt" => p.prompt,
+                                                  "secret" => !p.echo, "at" => p.at)
     end
     return out
 end
