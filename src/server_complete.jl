@@ -3494,16 +3494,24 @@ function _hostonly(hp::AbstractString)
     return s
 end
 
-# Allow the request iff its Host is loopback/allowlisted AND its Origin (when present)
-# resolves to an allowlisted host. Returns false to reject with 403.
-function _request_allowed(h::Hub, msg)::Bool
-    allowed = _allowed_hosts(h)
+# Allow the request iff its Host is loopback/allowlisted, its Origin (when present) resolves to an
+# allowlisted host, and the browser does not say another site sent it. Returns false to reject with 403.
+_request_allowed(h::Hub, msg) = _request_allowed(_allowed_hosts(h), msg)
+function _request_allowed(allowed::AbstractSet{String}, msg)::Bool
     host = _hostonly(HTTP.header(msg, "Host", ""))
     (isempty(host) || host in allowed) || return false
     origin = strip(HTTP.header(msg, "Origin", ""))
     if !isempty(origin) && origin != "null"
         ohost = try; _hostonly(HTTP.URI(origin).host); catch; ""; end
         (ohost in allowed) || return false
+    end
+    # A browser marks every request with where it came from, including the ones that carry no
+    # Origin: a GET from an <img>, a <script> or a link. So a page elsewhere cannot reach a route by
+    # avoiding the Origin check. Another site may still link here: following a link is a GET that
+    # shows a page.
+    if lowercase(strip(HTTP.header(msg, "Sec-Fetch-Site", ""))) == "cross-site"
+        (msg.method == "GET" && lowercase(strip(HTTP.header(msg, "Sec-Fetch-Mode", ""))) == "navigate") ||
+            return false
     end
     return true
 end

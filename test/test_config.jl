@@ -340,3 +340,21 @@ end
         @test KS._orphaned_by(999_999) == true   # parent gone (the Windows dangling-PID case)
     end
 end
+
+# Which browser requests the hub serves. Host and Origin stop rebinding and cross-site fetches;
+# Sec-Fetch-Site stops what carries no Origin (an <img>, a <script>), while a link from another site
+# still opens the page.
+@testset "cross-site requests are refused, a link in is not" begin
+    NS = KS.NotebookServer
+    HTTP = NS.HTTP
+    ok = Set(["127.0.0.1", "localhost", "::1"])
+    req(method, hdrs...) = HTTP.Request(method, "/api/facts", ["Host" => "localhost:8765", hdrs...])
+    @test NS._request_allowed(ok, req("GET"))                                          # curl, no browser headers
+    @test NS._request_allowed(ok, req("GET", "Sec-Fetch-Site" => "same-origin"))
+    @test NS._request_allowed(ok, req("GET", "Sec-Fetch-Site" => "none", "Sec-Fetch-Mode" => "navigate"))
+    @test NS._request_allowed(ok, req("GET", "Sec-Fetch-Site" => "cross-site", "Sec-Fetch-Mode" => "navigate"))
+    @test !NS._request_allowed(ok, req("GET", "Sec-Fetch-Site" => "cross-site", "Sec-Fetch-Mode" => "no-cors"))
+    @test !NS._request_allowed(ok, req("POST", "Sec-Fetch-Site" => "cross-site", "Sec-Fetch-Mode" => "navigate"))
+    @test !NS._request_allowed(ok, req("GET", "Origin" => "https://evil.example"))
+    @test !NS._request_allowed(ok, HTTP.Request("GET", "/", ["Host" => "evil.example"]))   # rebinding
+end
