@@ -2160,7 +2160,7 @@ function _make_router(h::Hub)
         all = lock(nb.lock) do; get(nb.report.meta, "jobopts", Dict{String,Dict{String,String}}()); end
         _json(Dict("ok" => true, "options" => isempty(cid) ? all : get(all, cid, Dict{String,String}())))
     end))
-    HTTP.register!(router, "GET", "/api/{id}/state", req -> _withnb(h, req, nb -> (sync_from_file!(nb); _json(state_json(nb)))))
+    HTTP.register!(router, "GET", "/api/{id}/state", req -> _withnb(h, req, nb -> (sync_from_file!(nb); _refresh_extensions_for_page!(nb); _json(state_json(nb)))))
     # A worker's log tail + status for the topbar worker/region status popup. `?side=` selects the
     # worker (""=main, else a region); local reads the log file, remote ssh-tails it. Polled while open.
     HTTP.register!(router, "POST", "/api/{id}/worker-log-io", req -> _withnb(h, req, nb -> begin
@@ -2902,6 +2902,13 @@ function _make_router(h::Hub)
         # that would clobber an edit made elsewhere (an external editor, a `git checkout`) meanwhile.
         _json(Dict("path" => rel, "kind" => "text", "content" => String(bytes), "bytes" => sz,
                    "mtime" => mtime(ap)))
+    end))
+    # A markdown file rendered the way a markdown cell is, for the Files tab's preview. Its relative image
+    # and media paths resolve against the folder the file sits in, as they do wherever else it is read.
+    HTTP.register!(router, "GET", "/api/{id}/file-md", req -> _withnb(h, req, nb -> begin
+        code, body = _md_file_html(nb, String(get(HTTP.queryparams(HTTP.URI(req.target)), "path", "")))
+        code == 200 || return HTTP.Response(code, body)
+        HTTP.Response(200, ["Content-Type" => "text/html; charset=utf-8", "Cache-Control" => "no-store"], body)
     end))
     HTTP.register!(router, "POST", "/api/{id}/file", req -> _withnb(h, req, nb -> begin
         body = try; JSON.parse(String(req.body)); catch; Dict{String,Any}(); end
@@ -4548,6 +4555,19 @@ function _fetch_overflow!(h::Hub, id::AbstractString, name::AbstractString)
     try; write(local_path, bytes); catch; return nothing; end
     _outfile_put!(id, name, local_path)
     return local_path
+end
+
+# A project markdown file as HTML, `(status, body)`. Rendered like a markdown cell, with relative image and
+# media paths resolved against the folder the file sits in.
+function _md_file_html(nb::LiveNotebook, rel::AbstractString)
+    ap = _safe_proj_path(_proj_root(nb), rel)
+    isempty(ap) && return (400, "bad or out-of-project path")
+    isfile(ap) || return (404, "no such file")
+    filesize(ap) > _TREE_TEXT_MAX && return (413, "file too large to preview")
+    bytes = read(ap)
+    isvalid(String, bytes) || return (415, "not a text file (invalid UTF-8)")
+    dir = dirname(replace(String(rel), '\\' => '/'))
+    return (200, markdown_html(_local_media(String(bytes), nb.id, _proj_root(nb); dir = dir)))
 end
 
 "Remove a notebook from the hub: drain its SSE connections and drop it."

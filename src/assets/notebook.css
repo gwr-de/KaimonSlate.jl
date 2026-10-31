@@ -921,6 +921,9 @@ body.resizing { cursor:col-resize; user-select:none; }
 .filepreview img { max-width:100%; max-height:70vh; border-radius:6px;
   background:repeating-conic-gradient(#2a2a2a 0% 25%, #333 0% 50%) 50%/20px 20px; }
 .filepreview audio, .filepreview video { max-width:100%; }
+/* a markdown file, rendered: the reading column a markdown cell has, not a centred media card */
+.filepreview .fpmd { align-self:stretch; width:100%; max-width:900px; margin:0 auto; box-sizing:border-box; }
+.filepreview .fpmd img { max-height:none; background:none; }
 .filepreview video { max-height:70vh; border-radius:6px; }
 .filepreview .fpmeta { color:var(--dim); font-size:.78rem; text-align:center; line-height:1.6; }
 .filepreview .fpcard { border:1px solid var(--border); border-radius:8px; padding:22px 26px;

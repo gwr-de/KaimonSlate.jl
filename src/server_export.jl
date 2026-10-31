@@ -967,13 +967,16 @@ const _LOCAL_MD_IMG_RE  = r"(!\[[^\]]*\]\(\s*)([^)\s]+)"
 const _LOCAL_TAG_SRC_RE = r"(<(?:img|video|audio|source)\b[^>]*?\bsrc=)([\"'])([^\"']+)\2"i
 _is_relative_ref(u::AbstractString) =
     !isempty(u) && !startswith(u, "/") && !startswith(u, "#") && !occursin(r"^[A-Za-z][A-Za-z0-9+.-]*:", u)
-function _local_media(src::AbstractString, nbid::AbstractString, assetbase::AbstractString)
+# `dir`: the project folder relative paths are written from ("" = the project root, as for a notebook's
+# markdown); a markdown FILE's links are relative to the folder it sits in.
+function _local_media(src::AbstractString, nbid::AbstractString, assetbase::AbstractString; dir::AbstractString = "")
     s = String(src)
     (isempty(nbid) || isempty(assetbase)) && return s
     (occursin("![", s) || occursin(r"<(?:img|video|audio|source)\b"i, s)) || return s
     route(u) = begin
         _is_relative_ref(u) || return nothing
         rel = HTTP.URIs.unescapeuri(startswith(u, "./") ? u[3:end] : u)
+        isempty(dir) || (rel = replace(normpath(joinpath(dir, rel)), '\\' => '/'))
         _asset_abspath(assetbase, rel) === nothing && return nothing
         "/n/" * nbid * "/asset/" * join((HTTP.URIs.escapeuri(x) for x in split(rel, '/')), "/")
     end

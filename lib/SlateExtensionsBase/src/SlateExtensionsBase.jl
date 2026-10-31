@@ -65,7 +65,7 @@ export PaletteCommand, to_palette_command, auto_palette_command, register_palett
 # Output
 export WebPage, register_widget_js
 # Auto-registered front-end (no boot cell)
-export register_widget!, register_component!, provide_frontend!, @pkg_asset,
+export register_widget!, register_component!, provide_frontend!, @pkg_asset, PkgAsset,
        provide_served_asset!, served_asset, slate_live_render, on_live_reset, run_live_resets,
 on_worker_reset, run_worker_resets,
        required_assets, ensure_widget_assets!, ensure_module_frontend!, ensure_module_frontends!,

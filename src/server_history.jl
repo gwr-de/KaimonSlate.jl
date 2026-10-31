@@ -620,7 +620,9 @@ function _externalize_blobs(nbid::AbstractString, html::AbstractString)
         length(bytes) <= _PREVIEW_MAX_ASSET && _blob_put_durable!(key, mime, bytes)
         dim = _png_dims(bytes)
         sz = dim === nothing ? "" : string(" width=\"", dim[1], "\" height=\"", dim[2], "\"")
-        string("<img", pre, "src=\"/api/", nbid, "/blob/", h, "\"", sz, post, ">")
+        # The blob URL hides the type; the full-window view scales vector images up to fit.
+        vec = mime == "image/svg+xml" ? " data-vector" : ""
+        string("<img", pre, "src=\"/api/", nbid, "/blob/", h, "\"", sz, vec, post, ">")
     end)
 end
 

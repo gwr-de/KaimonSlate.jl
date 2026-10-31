@@ -520,6 +520,22 @@ end
     @test haskey(NS._embedded_asset_files(rep.cells, root), "figures/logo.png")
 end
 
+@testset "a markdown file in the project renders for the Files tab" begin
+    root = mktempdir(); mkpath(joinpath(root, "docs", "img"))
+    write(joinpath(root, "docs", "img", "x.png"), UInt8[0x89, 0x50, 0x4e, 0x47])
+    write(joinpath(root, "docs", "guide.md"), "# Guide\n\n![x](img/x.png)\n\nSee \$a^2\$ and [the readme](../README.md).\n")
+    rep = _RE.parse_report("#%% code id=a\nx = 1\n"); rep.meta["assetbase"] = root
+    nb = NS.LiveNotebook("mdf", joinpath(root, "nb.jl"), rep, _RE.InProcessKernel(), 1, String[], String[],
+        ReentrantLock(), Channel{String}[], ReentrantLock(), "", false, Dict{String,String}())
+    code, html = NS._md_file_html(nb, "docs/guide.md")
+    @test code == 200 && occursin("<h1", html)
+    # An image path is relative to the file's own folder, as it is wherever else the file is read.
+    @test occursin("src=\"/n/mdf/asset/docs/img/x.png\"", html)
+    @test occursin("../README.md", html)                      # a link is left for the page to follow
+    @test NS._md_file_html(nb, "docs/missing.md")[1] == 404
+    @test NS._md_file_html(nb, "../../etc/passwd")[1] == 400
+end
+
 # A dropped clip lands in a markdown cell as `<video src="/n/<id>/asset/…">`. A standalone page has no
 # server to serve it from and a media element can't seek a `data:` URL — so the bytes must leave the body
 # for the blob registry. A published page keeps its sibling file, which HTTP can range-request.
@@ -1770,6 +1786,39 @@ end
     # Reached through the real entry point, not just the helper.
     c = _RE.Cell("m", _RE.MARKDOWN, raw"energy \(E = mc^2\) here")
     @test occursin(raw"$E = mc^2$", NS._md_for_typst(c))
+end
+
+# ── PDF export: math and markdown outputs typeset natively ──────────────────────────────────────────
+# A `text/latex` output, or the markdown form of an HTML output, prints as text and formulas rather
+# than a screenshot. LaTeX written for KaTeX loses the layout commands mitex lacks.
+@testset "typst export typesets math outputs" begin
+    p = NS._portable_tex
+    @test p(raw"\begin{bmatrix}\rule[-1.4em]{0pt}{3.3em}\dfrac{a}{b} \\ \rule[-1.4em]{0pt}{3.3em}c\end{bmatrix}") ==
+          raw"\begin{bmatrix}\dfrac{a}{b} \\ c\end{bmatrix}"
+    @test p(raw"\left[\hspace{-5pt}\begin{array}{r}1\end{array}\hspace{-5pt}\right]") == raw"\left[\begin{array}{r}1\end{array}\right]"
+    @test p(raw"\hphantom{\begin{matrix}x \\ y\end{matrix}}\mathllap{x} &= 1") == raw"{x} &= 1"
+    @test p(raw"a \\[8pt] b") == raw"a \\ b"
+    @test p(raw"a \\ \\[-0.9em] b") == raw"a \\ b"               # an emptied spacer row collapses
+    @test p(raw"a \\ \dfrac{1}{2}") == raw"a \\ \dfrac{1}{2}"     # a row break before a command stays put
+    @test NS._strip_math_delims(raw"$$x^2$$") == "x^2" && NS._strip_math_delims(raw"$θ$") == "θ"
+
+    # Typst is asked before the export commits to native math: an unknown command falls back.
+    @test NS._typst_typesets(:tex, raw"\begin{bmatrix}\dfrac{a}{b} & 1\end{bmatrix}")
+    @test !NS._typst_typesets(:tex, raw"\mathllap{x}")
+    @test NS._typst_typesets(:md, "| code | result |\n|:--|:--|\n| `x` | \$\$x^2\$\$ |\n")
+end
+
+# A value shown as HTML that can also show itself as markdown carries that form, export-only.
+struct _MdCard end
+Base.show(io::IO, ::MIME"text/html", ::_MdCard) = print(io, "<b>card</b>")
+Base.show(io::IO, ::MIME"text/markdown", ::_MdCard) = print(io, "**card**")
+@testset "an HTML output keeps its markdown form for export" begin
+    chunks = Tuple{String, Vector{UInt8}}[]
+    @test _RE._capture_rich!(chunks, _MdCard())
+    @test first.(chunks) == ["text/html", "text/markdown"]
+    @test String(chunks[2][2]) == "**card**"
+    # the browser renders the HTML and ignores the markdown
+    @test KaimonSlate.ReportRender._render_chunks([(mime = m, data = copy(d)) for (m, d) in chunks]) == "<div class=\"disp html\"><b>card</b></div>"
 end
 
 # The SCREEN half of the same story. KaTeX is configured for the bracket spellings, but CommonMark

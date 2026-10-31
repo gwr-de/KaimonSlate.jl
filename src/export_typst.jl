@@ -68,7 +68,8 @@ end
 # cell, silent, and different run to run. Returns how many pictures arrived.
 function _warm_html_rasters!(nb::LiveNotebook; theme::AbstractString = "")
     ids = lock(nb.lock) do
-        [c.id for c in nb.report.cells if _has_html_output(c) && !_has_server_raster(nb, c.id)]
+        [c.id for c in nb.report.cells if _has_html_output(c) && !_has_server_raster(nb, c.id) &&
+                                          _output_chunk(c.output, "text/markdown") === nothing]   # typeset instead
     end
     isempty(ids) && return 0
     return try; request_live_inspect_many(nb, ids; theme = theme); catch; 0; end
@@ -253,6 +254,19 @@ function _typst_preamble(title::AbstractString; style::AbstractString = "article
     $(donumber ? "#set heading(numbering: (..n) => { let m = n.pos(); if m.len() <= 1 { none } else { numbering(\"1.1\", ..m.slice(1)) } })" : "")
     #let PRE = "$pre "
     #let mathfn = (s, block: false) => if block { mitex(PRE + s) } else { mi(PRE + s) }
+    // Room between the rows of matrices and of multi-line display math: fractions and roots are
+    // tall, and LaTeX's own spacing tricks for them (struts, row gaps) don't survive mitex.
+    #show math.mat: set math.mat(row-gap: 0.6em)
+    #show math.equation.where(block: true): set par(leading: 1.1em)
+    // A display formula wider than its column is scaled down to fit (on screen it scrolls; on a
+    // page it would run into the margin). In a table cell, math sits at the start of the cell.
+    #show math.equation.where(block: true): it => layout(size => {
+      let w = measure(it).width
+      if w > size.width { scale(size.width / w * 100%, reflow: true, it) } else { it }
+    })
+    #show table.cell: it => { show math.equation.where(block: true): set align(left); it }
+    // Markdown tables take the theme's thin rule colour rather than cmarker's heavy black lines.
+    #set table(stroke: 0.5pt + $(p.rule), inset: (x: 7pt, y: 5pt))
     // Author-embedded markdown images stage into the doc root; resolve them relative to THIS file
     // (not cmarker's package dir, where its built-in image() looks) — passed to cmarker as scope.image.
     // `media.json` carries any `{width=…}` block the author wrote (see `_stage_typst_md_media`), as
@@ -325,6 +339,19 @@ function _typst_preamble_slides(title::AbstractString; theme::AbstractString = "
     #set heading(numbering: none)
     #let PRE = "$pre "
     #let mathfn = (s, block: false) => if block { mitex(PRE + s) } else { mi(PRE + s) }
+    // Room between the rows of matrices and of multi-line display math: fractions and roots are
+    // tall, and LaTeX's own spacing tricks for them (struts, row gaps) don't survive mitex.
+    #show math.mat: set math.mat(row-gap: 0.6em)
+    #show math.equation.where(block: true): set par(leading: 1.1em)
+    // A display formula wider than its column is scaled down to fit (on screen it scrolls; on a
+    // page it would run into the margin). In a table cell, math sits at the start of the cell.
+    #show math.equation.where(block: true): it => layout(size => {
+      let w = measure(it).width
+      if w > size.width { scale(size.width / w * 100%, reflow: true, it) } else { it }
+    })
+    #show table.cell: it => { show math.equation.where(block: true): set align(left); it }
+    // Markdown tables take the theme's thin rule colour rather than cmarker's heavy black lines.
+    #set table(stroke: 0.5pt + $(p.rule), inset: (x: 7pt, y: 5pt))
     // Author-embedded markdown images stage into the doc root; resolve them relative to THIS file
     // (not cmarker's package dir, where its built-in image() looks) — passed to cmarker as scope.image.
     // `media.json` carries any `{width=…}` block the author wrote (see `_stage_typst_md_media`), as
@@ -801,6 +828,105 @@ function _warm_makie_figs!(nb::LiveNotebook; theme::AbstractString, raster::Bool
     return nothing
 end
 
+# ── Math and markdown outputs, typeset natively ─────────────────────────────────────────────────────
+# A `text/latex` output, or the export-only `text/markdown` form of an HTML/LaTeX output (see
+# `_capture_export_markdown!`), prints as real text and formulas through mitex/cmarker instead of a
+# screenshot of the page.
+
+# TeX with its `$`/`$$` delimiters stripped (`chop`, not byte slicing: `$θ$` ends in a multibyte char).
+function _strip_math_delims(t::AbstractString)
+    t = strip(t)
+    startswith(t, "\$\$") && endswith(t, "\$\$") && length(t) >= 4 && return chop(t; head = 2, tail = 2)
+    startswith(t, "\$") && endswith(t, "\$") && length(t) >= 2 && return chop(t; head = 1, tail = 1)
+    return String(t)
+end
+
+# LaTeX written for KaTeX may use layout commands mitex doesn't know: struts (`\rule`), phantom
+# widths, overlaps (`\mathllap`), negative `\hspace`, and row gaps (`\\[len]`, which mitex prints as
+# text). They only adjust spacing, so they are dropped; the preamble's math rules space rows instead.
+function _portable_tex(s::AbstractString)
+    s = replace(String(s), r"\\rule(\[[^\]]*\])?\{[^}]*\}\{[^}]*\}" => "")
+    s = _drop_braced(s, "\\hphantom")
+    s = replace(s, "\\mathllap{" => "{", "\\mathrlap{" => "{")
+    s = replace(s, r"\\hspace\{-[^}]*\}" => "")
+    s = replace(s, r"\\\\\[[^\]]*\]" => "\\\\")
+    # rows left empty by a dropped strut: a run of row breaks becomes one. (No backslashes just
+    # before the closing quote: a raw string halves those.)
+    return replace(s, r"(?:\\\\\s*){2,}" => "\\\\ ")
+end
+
+# `s` with every `cmd{…}` removed, the braces matched (they nest: `\hphantom{\begin{matrix}…}`).
+function _drop_braced(s::String, cmd::String)
+    while (r = findfirst(cmd * "{", s)) !== nothing
+        depth, i = 0, last(r)
+        while i <= lastindex(s)
+            s[i] == '{' && (depth += 1)
+            s[i] == '}' && (depth -= 1; depth == 0 && break)
+            i = nextind(s, i)
+        end
+        s = s[1:prevind(s, first(r))] * s[nextind(s, min(i, lastindex(s))):end]
+    end
+    return s
+end
+
+# Whether Typst can typeset this math (`:tex`) or markdown (`:md`) through the export's own mitex and
+# cmarker. A single unsupported command fails the whole compile, so each piece is tried alone first and
+# one that fails falls back to the picture path. Cached by content: re-exports pay nothing.
+const _TYPST_OK = Dict{UInt64, Bool}()
+const _TYPST_OK_LOCK = ReentrantLock()
+function _typst_typesets(kind::Symbol, content::AbstractString)
+    key = hash((kind, content))
+    cached = lock(() -> get(_TYPST_OK, key, nothing), _TYPST_OK_LOCK)
+    cached === nothing || return cached
+    ok = mktempdir() do dir
+        pre = _typ_str(strip(replace(_MITEX_SHIMS, r"\s+" => " ")))
+        write(joinpath(dir, "piece." * String(kind)), content)
+        body = kind === :md ? "#cmarker.render(read(\"piece.md\"), math: mathfn, scope: (image: (src, alt: none) => []))" :
+                              "#mathfn(read(\"piece.tex\"), block: true)"
+        write(joinpath(dir, "check.typ"), """
+            #import "@preview/cmarker:$(_CMARKER_VER)"
+            #import "@preview/mitex:$(_MITEX_VER)": mitex, mi
+            #let PRE = "$pre "
+            #let mathfn = (s, block: false) => if block { mitex(PRE + s) } else { mi(PRE + s) }
+            $body
+            """)
+        try
+            _typst_compile(joinpath(dir, "check.typ"), joinpath(dir, "check.pdf")); true
+        catch
+            false
+        end
+    end
+    lock(() -> (_TYPST_OK[key] = ok), _TYPST_OK_LOCK)
+    return ok
+end
+
+_output_chunk(o, mime) = (i = findfirst(ch -> ch.mime == mime, o.display); i === nothing ? nothing : String(copy(o.display[i].data)))
+_has_figure_bytes(o) = any(ch -> ch.mime in ("application/pdf", "image/svg+xml", "image/png"), o.display)
+
+# Emit an output's markdown or math form natively; false if it has neither, or Typst can't set it.
+function _emit_typeset_output!(io::IO, dir::AbstractString, base::AbstractString, o)
+    _has_figure_bytes(o) && return false
+    md = _output_chunk(o, "text/markdown")
+    if md !== nothing
+        src = _normalize_math_delims(_portable_tex(md))
+        if _typst_typesets(:md, src)
+            write(joinpath(dir, base * ".md"), src)
+            print(io, "#cmarker.render(read(\"", base, ".md\"), math: mathfn, scope: (image: mdimage))\n")
+            return true
+        end
+    end
+    tex = _output_chunk(o, "text/latex")
+    if tex !== nothing
+        src = _portable_tex(_strip_math_delims(tex))
+        if _typst_typesets(:tex, src)
+            write(joinpath(dir, base * ".tex"), src)
+            print(io, "#align(center, mathfn(read(\"", base, ".tex\"), block: true))\n")
+            return true
+        end
+    end
+    return false
+end
+
 # True if the cell's output includes an HTML chunk (a custom card Typst can't render) — either a
 # hand-rolled `text/html` show method or `slate_render`'s `html_fragment` escape hatch. Both are
 # arbitrary DOM with no figure bytes behind them, so both want the same html2canvas rescue; matching
@@ -846,6 +972,13 @@ function _emit_output!(io::IO, dir::AbstractString, base::AbstractString, nb::Li
     if texts && isempty(o.display) && !isempty(o.value_repr)
         write(joinpath(dir, base * ".val"), plain(o.value_repr))
         print(io, "#valblock(read(\"", base, ".val\"))\n")
+    end
+    # Math, and HTML with a markdown form, print as text and formulas — ahead of any page snapshot.
+    if _emit_typeset_output!(io, dir, base, o)
+        for spec in _table_specs(c)
+            print(io, _typst_table(spec; theme = theme))
+        end
+        return
     end
     fig = _figure_for_export(nb, c; theme = _chart_theme(charttheme, theme), override = override,
                              compfigs = compfigs)   # vector (pdf/svg) preferred, else raster png
