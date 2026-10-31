@@ -1847,8 +1847,9 @@ function _make_router(h::Hub)
         # answer them. Off the request task would mean answering a dialog whose result nothing reads.
         ok = try; ReportEngine.Sweep.connect!(host; interactive = true)
         catch e; return _json(Dict("ok" => false, "error" => first(sprint(showerror, e), 200))); end
+        why = ok ? "" : ReportEngine.Sweep.last_connect_failure(host)
         _json(Dict("ok" => ok, "connected" => ReportEngine.Sweep.connected(host),
-                   "error" => ok ? "" : "could not authenticate to $host"))
+                   "error" => ok ? "" : isempty(why) ? "could not authenticate to $host" : why))
     end)
 
     # What scheduler(s) a host has, so the region form knows whether to ask for a walltime and a
