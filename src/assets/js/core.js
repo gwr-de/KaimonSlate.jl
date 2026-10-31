@@ -1521,14 +1521,39 @@ window.hydrateSoon = (key, fn) => { _hydQ.set(key, fn); if (!_hydPumping) { _hyd
 window.hydrateNow = key => { const fn = _hydQ.get(key); if (fn) { _hydQ.delete(key); try { fn(); } catch (_) {} return true; } return false; };
 // Typeset KaTeX off the critical path (text paints first; math fills in a tick later).
 window.typesetSoon = (el, key) => { if (el) window.hydrateSoon('ts:' + (key || ''), () => typeset(el)); };
-// Typeset NOW when the element is in/near the viewport — so the math's height settles BEFORE paint
-// and the cell doesn't jump (layout shift) when KaTeX renders. Off-screen elements defer to idle:
-// their later typeset can't cause a *visible* shift, and they're done by the time you scroll there.
+// Work after an output swap — typesetting its math, clamping a tall text block — runs in one
+// pass per frame for every output swapped in that frame, in phases: read which outputs are near the
+// viewport (one layout), typeset those (the rest when idle), then clamp, measuring every block
+// together. Done per output as each swap lands, it forced a layout of the whole page per output,
+// and a run of many cells (a worker restart re-runs the notebook) blocked the page for seconds.
+// The pass runs before the next paint, so math near the viewport settles before it is seen.
+const _afterSwap = new Map();     // element → { typeset: key | undefined, clamp: bool }
+let _afterSwapPending = false;
+function _scheduleAfterSwap() {
+  if (_afterSwapPending) return;
+  _afterSwapPending = true;
+  if (document.hidden) setTimeout(_runAfterSwap, 50);   // a hidden tab gets no animation frames
+  else requestAnimationFrame(_runAfterSwap);
+}
+function _runAfterSwap() {
+  _afterSwapPending = false;
+  const items = [..._afterSwap].filter(([el]) => el.isConnected);
+  _afterSwap.clear();
+  if (window._heightObserver) items.forEach(([el]) => { if (!el.__slateObserved) { window._heightObserver.observe(el); el.__slateObserved = true; } });
+  const h = window.innerHeight || 800;
+  const near = items.map(([el]) => { const r = el.getBoundingClientRect(); return r.top < h + 300 && r.bottom > -300; });
+  items.forEach(([el, w], i) => {
+    if (w.typeset === undefined) return;
+    if (near[i]) { try { typeset(el); } catch (_) {} } else window.typesetSoon(el, w.typeset);
+  });
+  const roots = items.filter(([, w]) => w.clamp).map(([el]) => el);
+  if (roots.length) _clampNow(roots);
+}
+// Typeset `el` in the next pass: now if it is in or near the viewport, else when idle.
 window.typesetVisible = (el, key) => {
   if (!el) return;
-  const r = el.getBoundingClientRect();
-  if (r.top < (window.innerHeight || 800) + 300 && r.bottom > -300) typeset(el);
-  else window.typesetSoon(el, key);
+  _afterSwap.set(el, { ...(_afterSwap.get(el) || {}), typeset: key || '' });
+  _scheduleAfterSwap();
 };
 // Jupyter-style scrolled output: a tall TEXT block (stdout / value repr / warnings) is clamped to a
 // max height with an in-place scroll + an Expand/Collapse toggle, so a big-but-not-massive result
@@ -1536,13 +1561,18 @@ window.typesetVisible = (el, key) => {
 // per render — measures at natural height, (re)adds or removes the toggle as the content changes.
 window._clampOutputs = (root) => {
   if (!root) return;
+  _afterSwap.set(root, { ...(_afterSwap.get(root) || {}), clamp: true });
+  _scheduleAfterSwap();
+};
+function _clampNow(roots) {
   const MAX = 480;   // px — ~30em; matches the .clamped CSS
-  root.querySelectorAll('.out, .val, .warn').forEach(b => {
-    b.classList.remove('clamped');                       // measure at natural height
-    const over = b.scrollHeight > MAX + 16;
+  const blocks = roots.flatMap(root => [...root.querySelectorAll('.out, .val, .warn')]);
+  blocks.forEach(b => b.classList.remove('clamped'));            // measure at natural height…
+  const over = blocks.map(b => b.scrollHeight > MAX + 16);        // …all in one layout
+  blocks.forEach((b, i) => {
     let btn = b.nextElementSibling;
     const hasBtn = btn && btn.classList && btn.classList.contains('outexpand');
-    if (over) {
+    if (over[i]) {
       if (!b.classList.contains('expanded')) b.classList.add('clamped');
       if (!hasBtn) {
         btn = document.createElement('button');
@@ -1563,7 +1593,12 @@ window._clampOutputs = (root) => {
       }
     } else if (hasBtn) { btn.remove(); b.classList.remove('expanded'); }
   });
-};
+}
+// The last laid-out height of each output, recorded as layout happens anyway, so a swap can hold
+// the old height without forcing a layout to read it.
+window._heightObserver = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(entries => {
+  for (const e of entries) e.target.__slateHeight = e.borderBoxSize && e.borderBoxSize[0] ? e.borderBoxSize[0].blockSize : e.contentRect.height;
+});
 // Synchronously typeset every cell currently in/near the viewport — call right AFTER a programmatic
 // scroll (e.g. position restore), before paint, so deferred math doesn't render late and shift.
 window.typesetInView = () => {
@@ -1576,7 +1611,14 @@ window.typesetInView = () => {
 
 // KaTeX may finish loading after the first render; typeset everything once it's in (off the
 // critical path — a big notebook's math would otherwise be one long task on the load event).
-window.addEventListener('load', () => window.typesetSoon(document.getElementById('nb'), '__all__'));
+// Each cell is its own idle task, so a big notebook's math never becomes one long task; its outputs
+// are observed for their heights (`_heightObserver`) from the start.
+window.addEventListener('load', () => {
+  document.querySelectorAll('#nb .cell .md, #nb .cell .output').forEach((el, i) => {
+    window.typesetSoon(el, 'load:' + i);
+    if (window._heightObserver && !el.__slateObserved) { window._heightObserver.observe(el); el.__slateObserved = true; }
+  });
+});
 // Align the agent drawer's top with the first content cell (as positioned when scrolled
 // to the top), so the drawer never covers the menu bar and lines up with the notebook.
 // Measured off the real first cell — robust to topbar height, page padding, cell margins,
@@ -1595,6 +1637,14 @@ function syncAgentTop() {
 window.addEventListener('load', syncAgentTop);
 window.addEventListener('resize', syncAgentTop);
 syncAgentTop();
+// Every render of the notebook asks for this, and reading the layout right after a render forces the
+// browser to lay out the whole page; requests within a frame are answered once, in the frame.
+let _agentTopPending = false;
+window.syncAgentTopSoon = () => {
+  if (_agentTopPending) return;
+  _agentTopPending = true;
+  requestAnimationFrame(() => { _agentTopPending = false; syncAgentTop(); });
+};
 
 // Julia indexes source by UTF-8 *byte* offset (REPLCompletions), but CodeMirror
 // works in UTF-16 char positions. Convert both ways so completion stays correct
