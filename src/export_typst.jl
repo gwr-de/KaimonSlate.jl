@@ -779,13 +779,20 @@ _is_native_figure(c::Cell) = c.output !== nothing &&
 # caller takes `nb.lock` (each round-trip re-evaluates a cell and can be slow), mirroring
 # `_warm_chart_svgs!`. Best-effort: a cell whose re-render fails/times out falls back to its baked
 # bytes in `_figure_for_export`. A non-gate (in-process) kernel has no worker to re-render on → skip.
+# The worker a cell runs on, if it is running: the notebook's own, or its region's. An export only
+# asks a worker that is already up; it does not start one.
+_running_kernel(nb::LiveNotebook, region::AbstractString) =
+    isempty(region) ? lock(() -> nb.kernel, nb.lock) :
+    lock(() -> get(_REGION_KERNELS, (nb.id, String(region)), nothing), _REGION_LOCK)
+
 function _warm_makie_figs!(nb::LiveNotebook; theme::AbstractString, raster::Bool = false, progress = nothing)
-    k = lock(nb.lock) do; nb.kernel; end
-    k isa ReportEngine.GateKernel || return nothing
     targets = lock(nb.lock) do
-        [(c.id, c.source) for c in nb.report.cells if _is_native_figure(c)]
+        [(c.id, c.source, _cell_region(c)) for c in nb.report.cells if _is_native_figure(c)]
     end
-    for (cid, src) in targets
+    for (cid, src, region) in targets
+        # A region cell re-runs where it ran: its data and packages are on the region's worker.
+        k = _running_kernel(nb, region)
+        k isa ReportEngine.GateKernel || continue
         progress === nothing || (try; progress(cid); catch; end)
         res = try; ReportEngine.rerender_fig(k, nb.report, src, theme; cellid = cid, raster = raster); catch; nothing; end
         res === nothing && continue
