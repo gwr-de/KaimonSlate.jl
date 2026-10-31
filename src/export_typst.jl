@@ -90,8 +90,7 @@ function _warm_vector_figs!(nb::LiveNotebook, figs::_CompFigs; progress = nothin
         [(c.id, _cell_region(c)) for c in nb.report.cells if c.kind == CODE && _raster_only(c)]
     end
     for (cid, region) in targets
-        k = isempty(region) ? lock(() -> nb.kernel, nb.lock) :
-            lock(() -> get(_REGION_KERNELS, (nb.id, region), nothing), _REGION_LOCK)
+        k = _running_kernel(nb, region)
         k === nothing && continue
         progress === nothing || (try; progress(cid); catch; end)
         bytes = try; ReportEngine.export_vector(k, cid); catch; nothing; end
