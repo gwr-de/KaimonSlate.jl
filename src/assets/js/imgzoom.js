@@ -119,6 +119,13 @@
       const [px, py] = local(e);
       zoomAt(CLOSE, px, py);
     });
+    // Focus moving elsewhere on the page ends the look: the frame no longer takes the wheel, so a
+    // zoom left behind could only be undone by clicking back in. Leaving the window is not that:
+    // the frame gets focus back on return, and the zoom is still wanted. Checked after the event,
+    // when `activeElement` and `hasFocus` say where focus went.
+    if (gated) frame.addEventListener('focusout', () => setTimeout(() => {
+      if (s > 1 && document.hasFocus() && !frame.contains(document.activeElement)) reset();
+    }, 0));
     // A resize changes the fitted size the offsets are measured against.
     if (window.ResizeObserver) new ResizeObserver(() => s > 1 && apply()).observe(frame);
     return { zoomIn: () => center(STEP), zoomOut: () => center(1 / STEP), reset,
