@@ -2811,6 +2811,9 @@ body:not(.zen) #nb .cell.slide-start::before { content: 'slide'; position: absol
 .nbfind-q.bad { border-color:var(--red); }
 .nbfind-count { min-width:74px; color:var(--dim); font-variant-numeric:tabular-nums; }
 .nbfind-count.bad { color:var(--red); }
+/* Matches in rendered markdown (search.js `paintRendered`), in the editor's match colours. */
+::highlight(slate-find) { background-color:rgba(255,215,0,.22); }
+::highlight(slate-find-cur) { background-color:rgba(255,215,0,.5); }
 /* The three query-mode switches (case / whole word / regex) and the two steppers share a look;
    only the switches latch, which `.on` shows. */
 .nbfind button { background:none; border:1px solid transparent; border-radius:5px; color:var(--dim);
@@ -2819,6 +2822,10 @@ body:not(.zen) #nb .cell.slide-start::before { content: 'slide'; position: absol
 .nbfind-opt { font-family:'Cascadia Code','Fira Code',monospace; }
 .nbfind-opt[data-opt="word"] { text-decoration:underline; }
 .nbfind-opt.on { color:var(--accent); border-color:var(--accent); background:var(--ovl); }
+/* What is searched: the rendered text (¶) or the source (</>). Lit when on source. */
+.nbfind-scope { min-width:30px; font-family:'Cascadia Code','Fira Code',monospace; }
+.nbfind-scope.on { color:var(--accent); border-color:var(--accent); background:var(--ovl); }
+.nbfind-scope:disabled { opacity:.5; cursor:default; }
 .nbfind-x { margin-left:2px; }
 
 /* a NamedTuple value: its fields as a wrap of small cards, name above value (record_display.jl) */
