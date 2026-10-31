@@ -74,6 +74,31 @@ function _warm_html_rasters!(nb::LiveNotebook; theme::AbstractString = "")
     return try; request_live_inspect_many(nb, ids; theme = theme); catch; 0; end
 end
 
+# A native figure's PDF, asked of the worker that ran the cell when the export starts, since a cell
+# run no longer renders one (capture.jl `figure_vector`). Kept with the component figures under
+# `_VECTOR_SLOT`, a slot no component uses. Only cells with nothing but a raster are asked; a cell
+# whose figure the worker no longer holds keeps that raster.
+const _VECTOR_SLOT = -1
+
+_raster_only(c::Cell) = c.output !== nothing &&
+    any(ch -> ch.mime == "image/png", c.output.display) &&
+    !any(ch -> ch.mime in ("application/pdf", "image/svg+xml"), c.output.display)
+
+function _warm_vector_figs!(nb::LiveNotebook, figs::_CompFigs; progress = nothing)
+    targets = lock(nb.lock) do
+        [(c.id, _cell_region(c)) for c in nb.report.cells if c.kind == CODE && _raster_only(c)]
+    end
+    for (cid, region) in targets
+        k = isempty(region) ? lock(() -> nb.kernel, nb.lock) :
+            lock(() -> get(_REGION_KERNELS, (nb.id, region), nothing), _REGION_LOCK)
+        k === nothing && continue
+        progress === nothing || (try; progress(cid); catch; end)
+        bytes = try; ReportEngine.export_vector(k, cid); catch; nothing; end
+        bytes === nothing || (figs[(cid, _VECTOR_SLOT)] = (bytes, "pdf"))
+    end
+    return figs
+end
+
 function _warm_component_figs!(nb::LiveNotebook; theme::AbstractString = "midnight", progress = nothing)
     targets = lock(nb.lock) do
         [(c.id, s) for c in nb.report.cells for (s, _) in _component_slots(c)]
@@ -692,10 +717,15 @@ function _figure_for_export(nb::LiveNotebook, c::Cell; theme::AbstractString = "
     end
     o = c.output
     if o !== nothing
-        for (mime, ext) in (("application/pdf", "pdf"), ("image/svg+xml", "svg"), ("image/png", "png"))
+        for (mime, ext) in (("application/pdf", "pdf"), ("image/svg+xml", "svg"))
             for ch in o.display
                 ch.mime == mime && return (copy(ch.data), ext)
             end
+        end
+        vec = get(compfigs, (c.id, _VECTOR_SLOT), nothing)   # the figure's PDF, rendered for this export
+        vec === nothing || return (copy(vec[1]), vec[2])
+        for ch in o.display
+            ch.mime == "image/png" && return (copy(ch.data), "png")
         end
     end
     comp = get(compfigs, (c.id, 0), nothing)         # a returned `slate_render` component, captured from the open tab
@@ -1452,6 +1482,7 @@ function _build_typst_project(nb::LiveNotebook; include_source::Bool = true,
     override && _warm_makie_figs!(nb; theme = ct, progress = cid -> _export_progress(nb, cid))
     _warm_html_rasters!(nb; theme = ct)   # one round-trip, under the EXPORT's palette (see above)
     compfigs = _warm_component_figs!(nb; theme = ct, progress = cid -> _export_progress(nb, cid))
+    _warm_vector_figs!(nb, compfigs; progress = cid -> _export_progress(nb, cid))
     lock(nb.lock) do
         dir = mktempdir()
         mediasz = Dict{String,Any}()   # staged image => its `{width=…}` block, written out as media.json
@@ -1581,6 +1612,7 @@ function _build_slides_project(nb::LiveNotebook; theme::AbstractString = "dark",
     override && _warm_makie_figs!(nb; theme = ct, progress = cid -> _export_progress(nb, cid))
     _warm_html_rasters!(nb; theme = ct)   # one round-trip, under the EXPORT's palette (see above)
     compfigs = _warm_component_figs!(nb; theme = ct, progress = cid -> _export_progress(nb, cid))
+    _warm_vector_figs!(nb, compfigs; progress = cid -> _export_progress(nb, cid))
     lock(nb.lock) do
         dir = mktempdir()
         mediasz = Dict{String,Any}()   # staged image => its `{width=…}` block, written out as media.json

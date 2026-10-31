@@ -654,3 +654,29 @@ end
     ReportEngine.ensure_notebook_file!(p)
     @test occursin("id=keep", read(p, String))
 end
+
+# A figure's PDF is rendered when an export asks for it, not on every run: a large plot's vector
+# form can take far longer than the plot. The run keeps the figure, and `figure_vector` renders it.
+module FigVec
+struct Fig; n::Int; end
+const PDF_RENDERS = Ref(0)
+Base.showable(::MIME"image/png", ::Fig) = true
+Base.show(io::IO, ::MIME"image/png", f::Fig) = write(io, "png$(f.n)")
+Base.show(io::IO, ::MIME"application/pdf", f::Fig) = (PDF_RENDERS[] += 1; write(io, "pdf$(f.n)"))
+end
+
+@testset "a figure's PDF is rendered on request, from the figure the cell showed" begin
+    m = Module(:FigVecCell)
+    Core.eval(m, :(const FigVec = $FigVec))
+    FigVec.PDF_RENDERS[] = 0
+    r = run_capture(m, "FigVec.Fig(1)", "cell:figv")
+    @test any(ch -> ch[1] == "image/png", r.mime)
+    @test !any(ch -> ch[1] == "application/pdf", r.mime)
+    @test FigVec.PDF_RENDERS[] == 0                                   # the run rendered no PDF
+    @test String(ReportEngine.figure_vector("figv")) == "pdf1"
+    run_capture(m, "FigVec.Fig(2)", "cell:figv")                       # a re-run's figure replaces it
+    @test String(ReportEngine.figure_vector("figv")) == "pdf2"
+    run_capture(m, "1 + 1", "cell:figv")                               # and a run with none clears it
+    @test ReportEngine.figure_vector("figv") === nothing
+    @test ReportEngine.figure_vector("never-ran") === nothing
+end

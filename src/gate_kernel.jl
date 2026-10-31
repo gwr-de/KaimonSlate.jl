@@ -1680,6 +1680,21 @@ end
 # capability, so fall back to the already-rendered figure bytes (no override for the in-process kernel).
 rerender_fig(::Kernel, ::Report, ::AbstractString, ::AbstractString; cellid::AbstractString = "export", raster::Bool = false) = nothing
 
+# The PDF of the figure a cell last showed, rendered on request (capture.jl `figure_vector`) for a
+# vector export. `nothing` when the worker holds no figure for the cell or the round-trip fails; the
+# export then uses the cell's raster.
+function export_vector(k::GateKernel, cellid::AbstractString)
+    res = try
+        _tool(k, "__slate_figure_vector", Dict{String,Any}("cell" => String(cellid)); timeout = _eval_timeout())
+    catch
+        return nothing
+    end
+    (res !== nothing && hasproperty(res, :ok) && res.ok === true && hasproperty(res, :b64)) || return nothing
+    return try; Vector{UInt8}(Base64.base64decode(String(res.b64))); catch; nothing; end
+end
+# An in-process kernel captured the figure in this process.
+export_vector(::Kernel, cellid::AbstractString) = figure_vector(cellid)
+
 # Fetch a byte asset an extension registered on the WORKER via `provide_served_asset!` (keyed by content
 # hash), so the hub can serve it at a stable URL. Returns `(mime, bytes)` or `nothing`. The hub caches by
 # hash after the first fetch (content-addressed → immutable), so this round-trips at most once per asset.

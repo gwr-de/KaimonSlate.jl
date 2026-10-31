@@ -1807,12 +1807,24 @@ function __slate_rerender_fig(; source::String = "", theme::String = "", raster:
     thm = try; slate_theme(theme = theme); catch; return (; ok = false); end
     wire = nothing
     themed = () -> (wire = run_capture(_NS[], source, filename; capture = DemuxCapture()))
+    # The re-run shows a themed copy; the figure kept for the cell stays the one its own run showed.
+    cid = replace(filename, r"^cell:" => "")
+    held = _figure_held(cid)
+    themedfig = nothing
     try
         Base.invokelatest(Mk.with_theme, themed, thm)
+        themedfig = _figure_held(cid)
     catch
         return (; ok = false)
+    finally
+        _figure_restore!(cid, held)
     end
     wire === nothing && return (; ok = false)
+    # A run captures the raster only; the vector form is rendered here from the themed figure.
+    if !raster && themedfig !== nothing
+        pdf = try; _vector_bytes(themedfig); catch; UInt8[]; end
+        isempty(pdf) || return (; ok = true, ext = "pdf", b64 = Base64.base64encode(pdf))
+    end
     # PDF export wants VECTOR (pdf/svg); HTML can't embed pdf, so `raster` prefers svg/png instead.
     prefs = raster ? (("image/svg+xml", "svg"), ("image/png", "png")) :
                      (("application/pdf", "pdf"), ("image/svg+xml", "svg"), ("image/png", "png"))
@@ -2755,6 +2767,12 @@ when the cell's value is no longer held (the cache is bounded) or the path names
 """
 __slate_matrix_render(; cell::String = "", field::String = "") = record_matrix_render(cell, field)
 
+"The PDF of the figure `cell` last showed, rendered now (`figure_vector`): `(; ok, b64)`."
+function __slate_figure_vector(; cell::String = "")
+    bytes = figure_vector(cell)
+    return bytes === nothing ? (; ok = false) : (; ok = true, b64 = Base64.base64encode(bytes))
+end
+
 function tools()
     return KaimonGate.GateTool[
         KaimonGate.GateTool("__slate_cluster_status", __slate_cluster_status),
@@ -2762,6 +2780,7 @@ function tools()
         KaimonGate.GateTool("__slate_matrix_render", __slate_matrix_render),
         KaimonGate.GateTool("__slate_eval", __slate_eval),
         KaimonGate.GateTool("__slate_rerender_fig", __slate_rerender_fig),
+        KaimonGate.GateTool("__slate_figure_vector", __slate_figure_vector),
         KaimonGate.GateTool("__slate_running", __slate_running),
         KaimonGate.GateTool("__slate_run_chunks", __slate_run_chunks),
         KaimonGate.GateTool("__slate_chunk_status", __slate_chunk_status),
