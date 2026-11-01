@@ -1882,6 +1882,9 @@ Base.show(io::IO, ::MIME"text/markdown", ::_MdRendered) = print(io, "**card**")
     chunks = Tuple{String, Vector{UInt8}}[]
     @test _RE._capture_rich!(chunks, _MdRendered())
     @test first.(chunks) == ["application/vnd.kaimonslate.html+html", "text/markdown"]
+    # On screen the markdown is left out, as it is after HTML.
+    html = KaimonSlate.ReportRender._render_chunks([(mime = m, data = copy(d)) for (m, d) in chunks])
+    @test !occursin("**card**", html) && !occursin("<strong>card</strong>", html)
 end
 
 # The SCREEN half of the same story. KaTeX is configured for the bracket spellings, but CommonMark
