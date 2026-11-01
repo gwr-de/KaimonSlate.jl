@@ -471,15 +471,26 @@ end
 
 _authed(s::Session) = ccall((:libssh2_userauth_authenticated, LIB), Cint, (Ptr{Cvoid},), s.ptr) == 1
 
+"""
+The public halves to offer with the private key `priv`, in order: its certificate `<priv>-cert.pub`
+(OpenSSH's naming, which short-lived keys from a site's certificate authority follow), then
+`<priv>.pub`. `nothing` lets libssh2 derive the public key from `priv`.
+"""
+function _pubkey_candidates(priv::AbstractString)
+    pubs = Union{String,Nothing}[p for p in (priv * "-cert.pub", priv * ".pub") if isfile(p)]
+    return isempty(pubs) ? Union{String,Nothing}[nothing] : pubs
+end
+
 function _try_pubkey(s::Session)
     for priv in s.ep.identities
         isfile(priv) || continue
-        pub = priv * ".pub"
-        rc = _again(s, () -> ccall((:libssh2_userauth_publickey_fromfile_ex, LIB), Cint,
-                                   (Ptr{Cvoid}, Cstring, Cuint, Cstring, Cstring, Cstring),
-                                   s.ptr, s.ep.user, sizeof(s.ep.user),
-                                   isfile(pub) ? pub : C_NULL, priv, ""))
-        rc == 0 && return true
+        for pub in _pubkey_candidates(priv)
+            rc = _again(s, () -> ccall((:libssh2_userauth_publickey_fromfile_ex, LIB), Cint,
+                                       (Ptr{Cvoid}, Cstring, Cuint, Cstring, Cstring, Cstring),
+                                       s.ptr, s.ep.user, sizeof(s.ep.user),
+                                       something(pub, C_NULL), priv, ""))
+            rc == 0 && return true
+        end
     end
     return false
 end

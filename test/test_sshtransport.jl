@@ -124,6 +124,18 @@ end
     end
 end
 
+@testset "a key's certificate is offered before its plain public key" begin
+    mktempdir() do d
+        priv = joinpath(d, "id")
+        write(priv, "")
+        @test T._pubkey_candidates(priv) == [nothing]
+        write(priv * ".pub", "")
+        @test T._pubkey_candidates(priv) == [priv * ".pub"]
+        write(priv * "-cert.pub", "")
+        @test T._pubkey_candidates(priv) == [priv * "-cert.pub", priv * ".pub"]
+    end
+end
+
 @testset "a server refusing channels with none of ours open ends the session" begin
     # A server that counts sessions this side has already let go refuses every command from then on, while
     # the forwards on the connection keep working. A minute of that, with no channel of ours open, ends the
