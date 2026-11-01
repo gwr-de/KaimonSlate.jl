@@ -804,16 +804,14 @@ function _make_router(h::Hub)
                           side = get(q, "side", "")))
     end)
     HTTP.register!(router, "GET", "/assets/notebook.css", _ -> _asset(read(_CSS_ASSET, String), "text/css; charset=utf-8"))
-    # Vendored third-party assets (offline cache, pinned in vendor.json). Greedy `**` so
-    # nested paths work (CodeMirror modes/addons, KaTeX fonts). First hit fetches+caches.
+    # Vendored third-party assets (server_vendor.jl). Greedy `**` so nested paths work (KaTeX fonts).
     HTTP.register!(router, "GET", "/assets/vendor/**", req -> begin
         rel = replace(HTTP.URI(req.target).path, r"^/assets/vendor/" => "")
         parts = split(rel, '/'; limit = 2)
         (length(parts) == 2 && !isempty(parts[2])) || return HTTP.Response(404)
-        f = _vendor_file(String(parts[1]), String(parts[2]))
-        f === nothing && return HTTP.Response(404, "vendor asset unavailable (offline & uncached?)")
-        HTTP.Response(200, ["Content-Type" => _vendor_ctype(parts[2]),
-                            "Cache-Control" => "public, max-age=31536000, immutable"], read(f))
+        # `<pkg>@<version>` (see `_vendor_versioned`) or a bare `<pkg>`; either serves the pinned version
+        pkg, ver = occursin('@', parts[1]) ? split(parts[1], '@'; limit = 2) : (parts[1], "")
+        _vendor_response(req, String(pkg), String(ver), String(parts[2]))
     end)
     HTTP.register!(router, "GET", "/assets/js/{file}", req -> begin
         f = HTTP.getparam(req, "file")
@@ -2963,6 +2961,8 @@ function start_hub(; host = "127.0.0.1", port = 8765, app::Bool = false,
     # hydrating banner, not just remote.log — the provisioner narrates each line through this sink hook.
     try; ReportEngine._BRINGUP_SINK[] = line -> _bringup_broadcast(h, line); catch; end
     _install_worker_push!(h)   # worker telemetry + log → per-page WebSocket push (no browser polling)
+    # Every vendored file of the pinned versions, fetched and checked in the background (server_vendor.jl)
+    Threads.@spawn try; _vendor_warm!(); catch e; @debug "vendor warm failed" exception = e; end
     handle = HTTP.streamhandler(_make_router(h))
     server = HTTP.listen!(host, port) do stream::HTTP.Stream
         # Reject cross-origin / rebinding requests before ANY handler (router or SSE) runs.
