@@ -8,6 +8,7 @@ using Random: Xoshiro                        # deterministic incompressible byte
 import JSON                                  # hand the @replay control fixture to node
 const ReportEngine = KaimonSlate.ReportEngine
 const NS = KaimonSlate.NotebookServer
+const HTTP = NS.HTTP                         # vendor responses are HTTP.Responses
 
 # A minimal manifest doc entry.
 _doc(slug, date; series = nothing) = begin
@@ -16,6 +17,58 @@ _doc(slug, date; series = nothing) = begin
     d
 end
 _pos(needle, hay) = first(findfirst(needle, hay))
+
+@testset "vendor URLs carry the pinned version" begin
+    kv, sv, cv = NS._vendor_version("katex"), NS._vendor_version("signals"), NS._vendor_version("signals-core")
+    @test !isempty(kv) && NS._vendor_version("no-such-package") == ""
+    page = """<script src="/assets/vendor/katex/katex.min.js"></script>
+              "@preact/signals": "/assets/vendor/signals/dist/signals.module.js",
+              "@preact/signals-core": "/assets/vendor/signals-core/dist/signals-core.module.js" """
+    out = NS._vendor_versioned(page)
+    @test occursin("/assets/vendor/katex@$kv/katex.min.js", out)
+    # a package whose name starts another's is rewritten on its own
+    @test occursin("/assets/vendor/signals@$sv/dist/", out) && occursin("/assets/vendor/signals-core@$cv/dist/", out)
+    @test NS._vendor_versioned("<p>no vendor assets</p>") == "<p>no vendor assets</p>"
+end
+
+@testset "the vendor lock matches vendor.json" begin
+    man, lk = NS._vendor_manifest(), NS._vendor_lockfile()
+    pkgs = NS._vendor_packages(man)
+    @test !isempty(pkgs) && sort(collect(keys(lk))) == pkgs     # regenerate with update_vendor_lock()
+    for pkg in pkgs
+        @test lk[pkg]["version"] == NS._vendor_version(pkg, man)
+        globs = NS._vendor_glob.(man[pkg]["files"])
+        for (sub, sri) in lk[pkg]["files"]
+            @test any(g -> occursin(g, sub), globs) && startswith(sri, "sha384-")
+        end
+    end
+    @test NS._vendor_locked_sri("katex", "no-such-file.js") === nothing
+    @test NS._vendor_locked_sri("katex", "katex.min.js", "0.0.1") === nothing     # another version
+end
+
+@testset "vendor globs" begin
+    g = NS._vendor_glob
+    @test occursin(g("fonts/*.woff2"), "fonts/KaTeX_Main-Regular.woff2")
+    @test !occursin(g("fonts/*.woff2"), "fonts/sub/x.woff2") && !occursin(g("fonts/*.woff2"), "fonts/x.woff")
+    @test occursin(g("dist/preact.module.js*"), "dist/preact.module.js.map")
+    @test occursin(g("**/*.js"), "a/b/c.js") && !occursin(g("katex.min.js"), "katexXmin.js")
+end
+
+@testset "vendor responses" begin
+    # needs the file cached or the network; skipped otherwise, like the export test below
+    if NS._vendor_file("katex", "katex.min.js") !== nothing
+        ver = NS._vendor_version("katex")
+        r = NS._vendor_response(HTTP.Request("GET", "/"), "katex", ver, "katex.min.js")
+        @test r.status == 200 && occursin("immutable", HTTP.header(r, "Cache-Control"))
+        etag = HTTP.header(r, "ETag")
+        @test startswith(etag, "\"sha384-")
+        r = NS._vendor_response(HTTP.Request("GET", "/"), "katex", "", "katex.min.js")   # a bare path
+        @test HTTP.header(r, "Cache-Control") == "no-cache"
+        r = NS._vendor_response(HTTP.Request("GET", "/", ["If-None-Match" => etag]), "katex", "", "katex.min.js")
+        @test r.status == 304 && isempty(r.body)
+    end
+    @test NS._vendor_response(HTTP.Request("GET", "/"), "katex", "", "not-in-the-lock.js").status == 404
+end
 
 @testset "web-cell export importmap (Preact/htm/signals)" begin
     ui = NS._slate_ui_imports()
@@ -1819,6 +1872,16 @@ Base.show(io::IO, ::MIME"text/markdown", ::_MdCard) = print(io, "**card**")
     @test String(chunks[2][2]) == "**card**"
     # the browser renders the HTML and ignores the markdown
     @test KaimonSlate.ReportRender._render_chunks([(mime = m, data = copy(d)) for (m, d) in chunks]) == "<div class=\"disp html\"><b>card</b></div>"
+end
+
+# The same for a value an extension renders (`slate_render`): the export prints its markdown form.
+struct _MdRendered end
+NS.SlateExtensionsBase.slate_render(::_MdRendered) = NS.SlateExtensionsBase.html_fragment("<b>card</b>")
+Base.show(io::IO, ::MIME"text/markdown", ::_MdRendered) = print(io, "**card**")
+@testset "a slate_render output keeps its markdown form for export" begin
+    chunks = Tuple{String, Vector{UInt8}}[]
+    @test _RE._capture_rich!(chunks, _MdRendered())
+    @test first.(chunks) == ["application/vnd.kaimonslate.html+html", "text/markdown"]
 end
 
 # The SCREEN half of the same story. KaTeX is configured for the bracket spellings, but CommonMark

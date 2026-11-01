@@ -16,6 +16,7 @@ using HTTP, JSON, FileWatching, CodecZlib, CodecZstd
 import Base64
 import Serialization                          # a worker's cluster-operation results, back over the gate
 import Sockets                                # claim the hub's port before HTTP's accept loop does
+import SHA                                    # vendored assets: the hashes their lock records
 import SlateExtensionsBase                    # the dtype table the page's decoders are generated from
 import Dates                                  # publish dates for the multi-doc site manifest
 import Logging                                # standalone serve: route hub log detail to a file
@@ -6037,6 +6038,7 @@ include("echarts_docs.jl")     # curated ECharts option reference, mapped to the
 include("server_export.jl")
 include("publish_targets.jl")  # PublishTarget adapters (github-pages, generic-upload) + multi-target fan-out
 include("publish_zenodo.jl")   # Zenodo archival target — versioned citable DOI
+include("server_vendor.jl")    # third-party front-end assets: pinned, hash-checked, cached
 include("server_hub.jl")
 # After server_hub.jl: its signatures dispatch on `Hub`, which is defined there.
 include("server_app.jl")       # app mode (served-as-an-application posture) + the /status page

@@ -2163,7 +2163,10 @@ function _swapOutput(out, html, live, after) {
     // Measure the height before `_carryMounted` runs. It moves each kept figure out of `out` and
     // into the stage, so a later measure gets the height without the figure. A hold at that height
     // lets the page get shorter until the figure is back, and scroll anchoring then moves the view.
-    out.style.minHeight = out.offsetHeight + 'px';
+    // The height recorded at the last layout (`_heightObserver`); reading `offsetHeight` here
+    // would force a layout of the whole page for every output swapped.
+    if (window._heightObserver && !out.__slateObserved) { window._heightObserver.observe(out); out.__slateObserved = true; }
+    out.style.minHeight = (out.__slateHeight !== undefined ? out.__slateHeight : out.offsetHeight) + 'px';
     const applyUpdates = _carryMounted(out, stage);
     out.__slateHoldSeq = seq;   // the hold belongs to the swap that committed last
     out.replaceChildren(...Array.from(stage.childNodes));

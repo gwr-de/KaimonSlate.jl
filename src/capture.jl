@@ -181,8 +181,8 @@ function _rich_scan!(chunks::Vector{Tuple{String,Vector{UInt8}}}, x)
             bytes = Base.invokelatest(_mime_bytes, MIME(m), x)
             m == "text/html" && (bytes = _fix_at_refs(bytes))
             push!(chunks, (m, bytes))
-            startswith(m, "image/") && _figure_remember!(get(task_local_storage(), :slate_cell, ""), x)
-            m in ("text/html", "text/latex") && _capture_export_markdown!(chunks, x)
+            startswith(m, "image/") ? _figure_remember!(get(task_local_storage(), :slate_cell, ""), x) :
+                                      _capture_export_markdown!(chunks, x)
             return true
         end
     end
@@ -338,11 +338,12 @@ function figure_vector(cellid::AbstractString)
     return isempty(bytes) ? nothing : bytes
 end
 
-# A value shown as HTML or LaTeX that can also show itself as markdown (a table of formulas, a
-# derivation with notes) is captured in that form too. Typst can't typeset HTML, and LaTeX built
-# for KaTeX can lean on commands mitex lacks; markdown with `$…$` math goes through cmarker and
-# mitex like a markdown cell, so it prints as text and formulas rather than a screenshot. The chunk
-# follows the HTML or LaTeX it restates, which is how `_render_chunks` knows to leave it out.
+# A value shown as HTML, LaTeX or a Slate display MIME (`slate_render`) that can also show itself as
+# markdown (a table of formulas, a derivation with notes) is captured in that form too. Typst can't
+# typeset HTML, and LaTeX built for KaTeX can lean on commands mitex lacks; markdown with `$…$` math
+# goes through cmarker and mitex like a markdown cell, so it prints as text and formulas rather than
+# a screenshot. The chunk follows the form it restates, which is how `_render_chunks` knows to leave
+# it out.
 const _EXPORT_MD_MIME = "text/markdown"
 function _capture_export_markdown!(chunks::Vector{Tuple{String,Vector{UInt8}}}, x)
     any(c -> c[1] == _EXPORT_MD_MIME, chunks) && return

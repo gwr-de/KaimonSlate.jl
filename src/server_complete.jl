@@ -1114,16 +1114,14 @@ function _make_router(h::Hub)
     HTTP.register!(router, "GET", "/assets/ansi.css",
                    _ -> _asset(read(_ANSI_CSS_ASSET, String), "text/css; charset=utf-8"))
     HTTP.register!(router, "GET", "/assets/shared.css", _ -> _asset(read(_SHARED_CSS, String), "text/css; charset=utf-8"))
-    # Vendored third-party assets (offline cache, pinned in vendor.json). Greedy `**` so
-    # nested paths work (CodeMirror modes/addons, KaTeX fonts). First hit fetches+caches.
+    # Vendored third-party assets (server_vendor.jl). Greedy `**` so nested paths work (KaTeX fonts).
     HTTP.register!(router, "GET", "/assets/vendor/**", req -> begin
         rel = replace(HTTP.URI(req.target).path, r"^/assets/vendor/" => "")
         parts = split(rel, '/'; limit = 2)
         (length(parts) == 2 && !isempty(parts[2])) || return HTTP.Response(404)
-        f = _vendor_file(String(parts[1]), String(parts[2]))
-        f === nothing && return HTTP.Response(404, "vendor asset unavailable (offline & uncached?)")
-        HTTP.Response(200, ["Content-Type" => _vendor_ctype(parts[2]),
-                            "Cache-Control" => "public, max-age=31536000, immutable"], read(f))
+        # `<pkg>@<version>` (see `_vendor_versioned`) or a bare `<pkg>`; either serves the pinned version
+        pkg, ver = occursin('@', parts[1]) ? split(parts[1], '@'; limit = 2) : (parts[1], "")
+        _vendor_response(req, String(pkg), String(ver), String(parts[2]))
     end)
     HTTP.register!(router, "GET", "/assets/js/{file}", req -> begin
         f = HTTP.getparam(req, "file")
@@ -4377,6 +4375,8 @@ function start_hub(; host = "127.0.0.1", port = 8765, app::Bool = false,
     # A forked env behind its project is re-resolved before a worker starts in it (see `_refresh_fork_env!`).
     ReportEngine.FORK_REFRESH[] = (k, report) ->
         _refresh_fork_env!(k.envdir, k.parent, get(report.meta, "env", Dict{String,Any}[]))
+    # Every vendored file of the pinned versions, fetched and checked in the background (server_vendor.jl)
+    Threads.@spawn try; _vendor_warm!(); catch e; @debug "vendor warm failed" exception = e; end
     routed = _make_router(h)
     # Instrumentation sits on the request path permanently and costs a `Ref` read when off. Wrapping
     # the ROUTER rather than the dispatcher below on purpose: the raw-stream handlers (SSE, the
