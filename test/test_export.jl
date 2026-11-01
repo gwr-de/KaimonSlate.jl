@@ -1844,6 +1844,16 @@ Base.show(io::IO, ::MIME"text/markdown", ::_MdCard) = print(io, "**card**")
     @test KaimonSlate.ReportRender._render_chunks([(mime = m, data = copy(d)) for (m, d) in chunks]) == "<div class=\"disp html\"><b>card</b></div>"
 end
 
+# The same for a value an extension renders (`slate_render`): the export prints its markdown form.
+struct _MdRendered end
+NS.SlateExtensionsBase.slate_render(::_MdRendered) = NS.SlateExtensionsBase.html_fragment("<b>card</b>")
+Base.show(io::IO, ::MIME"text/markdown", ::_MdRendered) = print(io, "**card**")
+@testset "a slate_render output keeps its markdown form for export" begin
+    chunks = Tuple{String, Vector{UInt8}}[]
+    @test _RE._capture_rich!(chunks, _MdRendered())
+    @test first.(chunks) == ["application/vnd.kaimonslate.html+html", "text/markdown"]
+end
+
 # The SCREEN half of the same story. KaTeX is configured for the bracket spellings, but CommonMark
 # reads `\(` / `\[` as escaped punctuation and drops the backslash, so by the time KaTeX ran there
 # was no delimiter left and the maths rendered as literal text. They have to be stashed like `$…$`.
