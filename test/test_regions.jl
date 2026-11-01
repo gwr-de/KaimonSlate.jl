@@ -222,7 +222,7 @@ end
         # host is refused as "still under way".
         ST = KaimonSlate.SshTransport
         host = "openingtest.invalid"
-        ep = ST.Endpoint(host, host, 22, "nobody", String[], "")
+        ep = ST.Endpoint(host, host, 22, "nobody", String[], "", false, "")
         s = ST.Session(ep, Cint(-1), C_NULL, Channel{Any}(1), nothing, ST.Prompter(host), false, "", ST.Fwd[])
         s.owner = @async sleep(30)
         try
@@ -245,7 +245,7 @@ end
         # which is why this is indistinguishable from broken key auth from the outside.
         ST = KaimonSlate.SshTransport
         host = "sessiontest.invalid"
-        ep = ST.Endpoint(host, host, 22, "nobody", String[], "")
+        ep = ST.Endpoint(host, host, 22, "nobody", String[], "", false, "")
         s = ST.Session(ep, Cint(-1), C_NULL, Channel{Any}(1), nothing, ST.Prompter(host),
                        true, "", ST.Fwd[])
         try

@@ -40,6 +40,20 @@ struct Endpoint
     user::String
     identities::Vector{String}
     proxyjump::String
+    identities_only::Bool
+    agent::String            # the ssh-agent socket; empty for none
+end
+
+"""
+The agent socket for an `IdentityAgent` setting as `ssh -G` prints it: unset or `SSH_AUTH_SOCK` means
+the environment's, `none` means no agent, `\$VAR` names another variable, anything else is a path.
+"""
+function _agent_socket(setting::AbstractString)
+    v = String(setting)
+    (isempty(v) || v == "SSH_AUTH_SOCK") && return get(ENV, "SSH_AUTH_SOCK", "")
+    v == "none" && return ""
+    startswith(v, '$') && return get(ENV, v[2:end], "")
+    return replace(v, r"^~" => homedir())
 end
 
 function resolve(alias::AbstractString)
@@ -50,7 +64,9 @@ function resolve(alias::AbstractString)
                     something(tryparse(Int, get1("port", "22")), 22),
                     get1("user", get(ENV, "USER", "")),
                     [replace(i, r"^~" => homedir()) for i in ids],
-                    get1("proxyjump", ""))
+                    get1("proxyjump", ""),
+                    lowercase(get1("identitiesonly", "no")) == "yes",
+                    _agent_socket(get1("identityagent", "")))
 end
 
 # ── socket ───────────────────────────────────────────────────────────────────────────────────
@@ -479,6 +495,133 @@ The public halves to offer with the private key `priv`, in order: its certificat
 function _pubkey_candidates(priv::AbstractString)
     pubs = Union{String,Nothing}[p for p in (priv * "-cert.pub", priv * ".pub") if isfile(p)]
     return isempty(pubs) ? Union{String,Nothing}[nothing] : pubs
+end
+
+# ── ssh-agent ────────────────────────────────────────────────────────────────────────────────
+# `struct libssh2_agent_publickey`
+struct _AgentKey
+    magic::Cuint
+    node::Ptr{Cvoid}
+    blob::Ptr{UInt8}
+    blob_len::Csize_t
+    comment::Ptr{UInt8}
+end
+
+const _B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+function _b64decode(s::AbstractString)
+    out = UInt8[]; acc = UInt32(0); bits = 0
+    for c in s
+        c == '=' && break
+        v = findfirst(==(c), _B64)
+        v === nothing && continue
+        acc = (acc << 6) | UInt32(v - 1); bits += 6
+        bits >= 8 && (bits -= 8; push!(out, UInt8((acc >> bits) & 0xff)))
+    end
+    return out
+end
+
+"The key blobs in `priv`'s public key and certificate files, where they exist."
+function _pub_blobs(priv::AbstractString)
+    out = Vector{UInt8}[]
+    for f in (priv * ".pub", priv * "-cert.pub")
+        isfile(f) || continue
+        fs = split(strip(readline(f)))
+        length(fs) >= 2 && push!(out, _b64decode(fs[2]))
+    end
+    return out
+end
+
+"The key type a blob names, such as `ssh-ed25519` or `ssh-rsa-cert-v01@openssh.com`."
+function _blob_type(blob::AbstractVector{UInt8})
+    length(blob) < 4 && return ""
+    n = (Int(blob[1]) << 24) | (Int(blob[2]) << 16) | (Int(blob[3]) << 8) | Int(blob[4])
+    return length(blob) < 4 + n ? "" : String(blob[5:4+n])
+end
+
+# The length-prefixed fields of a key or certificate blob.
+function _blob_fields(blob::AbstractVector{UInt8})
+    out = Vector{UInt8}[]; i = 1
+    while i + 3 <= length(blob)
+        n = (Int(blob[i]) << 24) | (Int(blob[i+1]) << 16) | (Int(blob[i+2]) << 8) | Int(blob[i+3])
+        i + 3 + n > length(blob) && break
+        push!(out, blob[i:i+3+n]); i += 4 + n
+    end
+    return out
+end
+
+const _CERT_SUFFIX = "-cert-v01@openssh.com"
+# How many fields hold the public key, for each key type a certificate can carry.
+const _KEY_FIELDS = Dict("ssh-rsa" => 2, "ssh-dss" => 4, "ssh-ed25519" => 1, "ssh-ed448" => 1)
+_key_fields(t) = startswith(t, "ecdsa-sha2-") || startswith(t, "sk-ecdsa-sha2-") ? 2 + startswith(t, "sk-") :
+                 startswith(t, "sk-ssh-ed25519") ? 2 : get(_KEY_FIELDS, t, 0)
+
+"""
+The plain public key a certificate certifies, as a key blob: its type without the certificate
+suffix, then the key fields that follow the certificate's nonce. `nothing` for anything else.
+"""
+function _certified_key(blob::AbstractVector{UInt8})
+    t = _blob_type(blob)
+    endswith(t, _CERT_SUFFIX) || return nothing
+    base = t[1:end-length(_CERT_SUFFIX)]
+    n = _key_fields(base)
+    fs = _blob_fields(blob)
+    (n == 0 || length(fs) < 2 + n) && return nothing
+    name = Vector{UInt8}(base)
+    len = UInt8[(length(name) >> s) & 0xff for s in (24, 16, 8, 0)]
+    return vcat(len, name, fs[3:2+n]...)
+end
+
+"""
+The agent's keys to offer, as indices into `blobs`. Each certificate comes first, followed by the
+plain key it certifies, then every other key: a host that issues certificates often accepts nothing
+else, and each refusal counts against its limit on attempts. With `IdentitiesOnly`, only keys whose
+public key or certificate sits beside one of the host's identity files, as OpenSSH does.
+"""
+function _agent_order(blobs::Vector{Vector{UInt8}}, identities, identities_only::Bool)
+    allowed = identities_only ? Set(b for priv in identities for b in _pub_blobs(priv)) : nothing
+    ok(i) = allowed === nothing || blobs[i] in allowed
+    order = Int[]
+    for i in eachindex(blobs)
+        k = _certified_key(blobs[i])
+        k === nothing && continue
+        ok(i) && push!(order, i)
+        j = findfirst(==(k), blobs)
+        j === nothing || j in order || !ok(j) || push!(order, j)
+    end
+    append!(order, (i for i in eachindex(blobs) if ok(i) && !(i in order)))
+    return order
+end
+
+function _try_agent(s::Session)
+    sock = s.ep.agent
+    (isempty(sock) || !ispath(sock)) && return false
+    a = ccall((:libssh2_agent_init, LIB), Ptr{Cvoid}, (Ptr{Cvoid},), s.ptr)
+    a == C_NULL && return false
+    try
+        ccall((:libssh2_agent_set_identity_path, LIB), Cvoid, (Ptr{Cvoid}, Cstring), a, sock)
+        ccall((:libssh2_agent_connect, LIB), Cint, (Ptr{Cvoid},), a) == 0 || return false
+        ccall((:libssh2_agent_list_identities, LIB), Cint, (Ptr{Cvoid},), a) == 0 || return false
+        keys = Ptr{_AgentKey}[]
+        prev = Ptr{_AgentKey}(C_NULL)
+        while true
+            store = Ref{Ptr{_AgentKey}}(C_NULL)
+            ccall((:libssh2_agent_get_identity, LIB), Cint,
+                  (Ptr{Cvoid}, Ref{Ptr{_AgentKey}}, Ptr{_AgentKey}), a, store, prev) == 0 || break
+            prev = store[]
+            push!(keys, prev)
+        end
+        blobs = [(k = unsafe_load(p); copy(unsafe_wrap(Array, k.blob, k.blob_len))) for p in keys]
+        for i in _agent_order(blobs, s.ep.identities, s.ep.identities_only)
+            rc = _again(s, () -> ccall((:libssh2_agent_userauth, LIB), Cint,
+                                       (Ptr{Cvoid}, Cstring, Ptr{_AgentKey}), a, s.ep.user, keys[i]))
+            rc == 0 && return true
+        end
+        return false
+    finally
+        ccall((:libssh2_agent_disconnect, LIB), Cint, (Ptr{Cvoid},), a)
+        ccall((:libssh2_agent_free, LIB), Cvoid, (Ptr{Cvoid},), a)
+    end
 end
 
 function _try_pubkey(s::Session)
@@ -1187,7 +1330,7 @@ function _open!(s::Session, ask)
                                (Ptr{Cvoid}, Cint), s.ptr, s.fd); timeout = 30.0)
     rc != 0 && error(_handshake_msg(s, rc))
     ms = auth_methods(s)
-    if "publickey" in ms && _try_pubkey(s)
+    if "publickey" in ms && (_try_agent(s) || _try_pubkey(s))
         # nothing more to do
     elseif s.bulk
         # A bulk connection is only worth having when it costs nobody anything: no prompt, and no
