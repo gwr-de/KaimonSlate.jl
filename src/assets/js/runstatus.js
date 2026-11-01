@@ -412,14 +412,23 @@
     const box = document.getElementById('actlog'); if (!box) return;
     const icon = kind === 'run' ? '▶' : kind === 'err' ? '✗' : kind === 'done' ? '✓' : '·';
     const ts = new Date().toLocaleTimeString();
-    const atTop = box.scrollTop < 30;            // newest lands on top; keep the view pinned there
+    // Newest lands on top; a view at the top stays pinned there. Whether it is at the top is kept
+    // from scroll events: reading `scrollTop` here, after the page has changed, would force a
+    // layout of the whole page for every line (a run logs one per cell).
+    if (box.__pinned === undefined) {
+      box.__pinned = true;
+      box.addEventListener('scroll', () => { box.__pinned = box.scrollTop < 30; }, { passive: true });
+    }
     const line = document.createElement('div');
     line.className = 'actline act-' + kind;
     line.innerHTML = `<span class="actts">${ts}</span><span class="acticon">${icon}</span>` +
       `<span class="actid" data-cid="${esc(id)}" title="jump to cell">${esc(id)}</span><span class="actdetail">${esc(detail)}</span>`;
     box.insertBefore(line, box.firstChild);      // prepend → newest at top (reverse-chronological)
     while (box.children.length > 600) box.removeChild(box.lastChild);   // trim the OLDEST (bottom)
-    if (atTop) box.scrollTop = 0;
+    if (box.__pinned && !box.__pinPending) {
+      box.__pinPending = true;
+      requestAnimationFrame(() => { box.__pinPending = false; if (box.__pinned) box.scrollTop = 0; });
+    }
   }
   window.slateActivity = activity;   // so other modules can log to the same feed
 

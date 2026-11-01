@@ -119,3 +119,18 @@ const FIG_HTML = "<div class=\"some-renderer-card\"><canvas></canvas></div>"
         @test !get(plain, "preview", false) && occursin("live 2", plain["output"])
     end
 end
+
+# An export that re-runs a figure asks the worker the cell ran on: the notebook's own, or its
+# region's. It never starts one.
+@testset "an export finds the running worker of a cell's region" begin
+    nb = _mknb(SRC)
+    marker = :region_worker
+    NS._REGION_KERNELS[(nb.id, "gpu")] = marker
+    try
+        @test NS._running_kernel(nb, "") === nb.kernel
+        @test NS._running_kernel(nb, "gpu") === marker
+        @test NS._running_kernel(nb, "cpu") === nothing
+    finally
+        delete!(NS._REGION_KERNELS, (nb.id, "gpu"))
+    end
+end

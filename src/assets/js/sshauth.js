@@ -1,8 +1,8 @@
 // Answering a cluster that will not take a key.
 //
 // Plenty of production clusters refuse public keys and want a password plus a second factor — a
-// one-time code, or a push you accept on a phone. Slate cannot type either, so the ssh client asks
-// a helper, the helper parks the prompt, and the hub pushes it here as `sshauth:{...}`.
+// one-time code, or a push you accept on a phone. Slate cannot type either, so the hub parks each
+// prompt and publishes it as a fact (`sshauth/<id>`, model.js), which every page shows here.
 //
 // Whatever ssh asked is what gets shown. The dialog does not know the order or the number of
 // prompts, and must not: one cluster wants password-then-code, another sends a push and says so,
@@ -11,6 +11,9 @@
   'use strict';
 
   let el = null, current = null, waitingFor = null, waitTimer = null;
+  // Prompts answered or dismissed on this page. Their facts outlive the click by a moment, and must
+  // not bring the dialog back.
+  const handled = new Set();
 
   // One escaper for the whole app (core.js). Declared here, above every use: a `const` has a
   // temporal dead zone where the `function` it replaced was hoisted.
@@ -35,6 +38,7 @@
     const input = el.querySelector('.sshauth-input');
     const val = input ? input.value : '';
     const id = current.id, host = current.host;
+    handled.add(id);
     // Say what is happening rather than vanishing: on a 2FA cluster the NEXT prompt can take a few
     // seconds to arrive, and a dialog that disappears reads as "nothing happened".
     el.querySelector('.sshauth-body').innerHTML =
@@ -72,7 +76,7 @@
   }
 
   function cancel() {
-    if (current) send({ id: current.id, cancel: true });
+    if (current) { handled.add(current.id); send({ id: current.id, cancel: true }); }
     close();
   }
 
@@ -135,10 +139,18 @@
     (input || el.querySelector('.sshauth-ok')).focus();
   }
 
-  window.onSshAuth = show;
+  // Shown when its fact appears — including on a page opened after the prompt was raised — and
+  // closed when it goes: answered elsewhere, cancelled, or timed out. A dialog waiting on an OUTCOME
+  // stays: that is the answer being processed, not a prompt nobody is holding.
+  function fromFacts() {
+    const f = window.slateModel.getFacts();
+    const asks = Object.keys(f).filter(k => k.startsWith('sshauth/')).map(k => f[k])
+      .filter(p => !handled.has(p.id)).sort((a, b) => a.at - b.at);
+    if (current && !asks.some(p => p.id === current.id)) close();
+    if (!current && asks.length) show(asks[0]);
+  }
+  window.slateModel.subscribe(fromFacts);
+  fromFacts();
+
   window.onSshAuthResult = result;
-  // The prompt is gone — answered elsewhere, cancelled, or timed out. Close the dialog rather than
-  // leaving one on screen that nothing is waiting on. A dialog waiting on an OUTCOME stays: that is
-  // the answer being processed, not a prompt nobody is holding.
-  window.onSshAuthDone = function (id) { if (current && current.id === id) close(); };
 })();

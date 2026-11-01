@@ -590,10 +590,20 @@ end
 # The columns of a gallery of `n` figures: two for 2 or 4, three up to 9, four beyond.
 _gallery_cols(n) = n == 2 || n == 4 ? 2 : n <= 9 ? 3 : 4
 
+# The display forms a value's export-only markdown chunk can follow.
+const _RESTATED_MIMES = ("text/html", "text/latex", "application/vnd.kaimonslate.component+json",
+                         "application/vnd.kaimonslate.html+html")
+
 function _render_chunks(chunks)
     io = IOBuffer()
     grid = 0                                   # images still to place in an open gallery grid
+    prev = ""
     for ch in chunks
+        # Markdown right after a value's HTML, LaTeX or Slate display is that value's other form, kept
+        # for export (capture.jl `_capture_export_markdown!`); markdown on its own is the value's display.
+        alt = ch.mime == "text/markdown" && prev in _RESTATED_MIMES
+        prev = ch.mime
+        alt && continue
         if ch.mime == "application/vnd.kaimonslate.gallery"
             n = something(tryparse(Int, String(copy(ch.data))), 0)
             n > 0 || continue

@@ -119,6 +119,19 @@
       const [px, py] = local(e);
       zoomAt(CLOSE, px, py);
     });
+    // Moving on from the figure ends the look: its ring and its zoom go. A press elsewhere is not
+    // always a focus change — the notebook's own handlers can keep focus where it was — so a press
+    // outside counts as leaving (see the listener below), and so does focus moving on by keyboard.
+    // Switching to another window is not leaving: the figure has focus again on return.
+    if (gated) {
+      frame._izLeave = () => {
+        reset();
+        if (frame.contains(document.activeElement)) document.activeElement.blur();
+      };
+      frame.addEventListener('focusout', () => setTimeout(() => {
+        if (s > 1 && document.hasFocus() && !frame.contains(document.activeElement)) reset();
+      }, 0));
+    }
     // A resize changes the fitted size the offsets are measured against.
     if (window.ResizeObserver) new ResizeObserver(() => s > 1 && apply()).observe(frame);
     return { zoomIn: () => center(STEP), zoomOut: () => center(1 / STEP), reset,
@@ -147,7 +160,10 @@
     frame.appendChild(img);
     const exp = document.createElement('button');
     exp.className = 'izbtn izexp'; exp.type = 'button'; exp.title = 'Open full size'; exp.textContent = '⤢';
-    exp.addEventListener('click', e => { e.stopPropagation(); open(img.currentSrc || img.src, img.alt); });
+    exp.addEventListener('click', e => {
+      e.stopPropagation();
+      open(img.currentSrc || img.src, img.alt, img.hasAttribute('data-vector') || undefined);
+    });
     const lvl = document.createElement('span');
     lvl.className = 'izbtn izpct';
     frame.append(exp, lvl);
@@ -157,16 +173,28 @@
     const img = e.target && e.target.closest ? e.target.closest('.disp.img img') : null;
     img && wire(img);
   }, true);
+  // A press outside an active or zoomed figure leaves it. Capture phase, so a handler that stops the
+  // event further down cannot keep the figure active. The full-window view is not "outside".
+  document.addEventListener('pointerdown', e => {
+    const t = e.target;
+    if (t && t.closest && t.closest('.izview')) return;
+    for (const f of document.querySelectorAll('.izframe.izzoomed, .izframe:focus-within')) {
+      if (f._izLeave && !f.contains(t)) f._izLeave();
+    }
+  }, true);
 
   // ── Full-window view ──
   let view = null, vz = null;
   function close() {
     if (!view) return;
+    view._cleanup && view._cleanup();
     const back = view._back;
     view.remove(); view = null; vz = null;
     back && back.focus && back.focus({ preventScroll: true });
   }
-  function open(src, alt) {
+  // `vector` (default: an SVG data URL) fits the image to the window, scaling up as well as down;
+  // a raster opens at its natural size, capped to the window.
+  function open(src, alt, vector = /^data:image\/svg\+xml/.test(src)) {
     close();
     view = document.createElement('div');
     view.className = 'izview';
@@ -185,6 +213,16 @@
     const lvl = view.querySelector('.izlvl');
     img.alt = alt || '';
     img.src = src;
+    if (vector) {
+      const fit = () => {
+        const w = img.naturalWidth, h = img.naturalHeight;
+        if (!w || !h) return;
+        img.style.width = Math.floor(w * Math.min(innerWidth * 0.96 / w, innerHeight * 0.9 / h)) + 'px';
+      };
+      img.complete ? fit() : img.addEventListener('load', fit, { once: true });
+      window.addEventListener('resize', fit);
+      view._cleanup = () => window.removeEventListener('resize', fit);
+    }
     document.body.appendChild(view);
     vz = Zoom(frame, img, s => { lvl.textContent = pct(s); }, false);
     // The view is always active: a wheel anywhere on it zooms the image.

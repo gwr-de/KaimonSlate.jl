@@ -768,7 +768,7 @@ class MemoCell extends Component {
 function Notebook({ cells, selectedId, selSet, live, focusId, editingId, cone }) {
   useEffect(() => {
     window.renderPalette && window.renderPalette();
-    window.syncAgentTop && window.syncAgentTop();
+    window.syncAgentTopSoon && window.syncAgentTopSoon();
     window._tocOpen && window.renderTOC && window.renderTOC();   // keep the open TOC in sync with edits
   });
   const coneCount = cone ? cone.size : (cells || []).length;

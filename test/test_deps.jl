@@ -592,6 +592,21 @@ ReportEngine.module_help(::CountingKernel, ::ReportEngine.Report, ::AbstractStri
         empty!(ReportEngine._MACRO_BINDS); empty!(ReportEngine._MACRO_TRIED); empty!(ReportEngine._BIND_CACHE)
     end
 
+    @testset "a cell whose macro isn't defined yet is retried whole, not resolved in part" begin
+        empty!(ReportEngine._MACRO_BINDS); empty!(ReportEngine._MACRO_TRIED); empty!(ReportEngine._BIND_CACHE)
+        # Before its macro exists, only the cell's OTHER statement expands. That partial answer must
+        # not be cached as the cell's bindings: the macro's write would then never be recovered.
+        r = parse_report("#%% code id=m\nmacro defpart(name)\n    esc(:(\$name = 41))\nend\n" *
+                         "#%% code id=call\n@defpart part_val\nalso_val = 1\n" *
+                         "#%% code id=read\nz = part_val + 1")
+        build_dependencies!(r)
+        eval_stale!(r)
+        @test :part_val in findcell(r, "call").writes       # the macro's write, recovered post-drain
+        @test :also_val in findcell(r, "call").writes
+        @test "call" in findcell(r, "read").deps
+        empty!(ReportEngine._MACRO_BINDS); empty!(ReportEngine._MACRO_TRIED); empty!(ReportEngine._BIND_CACHE)
+    end
+
     @testset "refine_macros! restales readers that raced a recovered producer" begin
         empty!(ReportEngine._MACRO_BINDS); empty!(ReportEngine._MACRO_TRIED); empty!(ReportEngine._BIND_CACHE)
         # In a PARALLEL drain a reader can start before its (not-yet-linked) macro producer and

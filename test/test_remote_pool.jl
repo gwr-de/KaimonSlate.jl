@@ -4,6 +4,7 @@
 # workers; roster entries are hand-built Dicts shaped like `list_remote_workers` output.
 using ReTest
 import Sockets   # squat on a port to prove the allocator probes before handing one out
+import Dates     # a file time for `touch` in UTC
 import Pkg       # Pkg.TOML — read back the Project.toml the devpath script rewrites
 
 include(joinpath(@__DIR__, "..", "src", "engine.jl"))
@@ -126,7 +127,9 @@ mkworker(port; alive = true, state = "idle", region = "testreg", hub = gethostna
             end
             write(joinpath(wd, "worker-9400.stats"), "{}")                    # written just now
             write(joinpath(wd, "worker-9410.stats"), "{}")
-            touch_at(f, ago) = run(`touch -t $(Libc.strftime("%Y%m%d%H%M.%S", time() - ago)) $(joinpath(wd, f))`)
+            # In UTC: a local time is ambiguous in the hour a clock goes back, and `touch` may pick the later one.
+            touch_at(f, ago) = run(setenv(`touch -t $(Dates.format(Dates.unix2datetime(time() - ago), "yyyymmddHHMM.SS")) $(joinpath(wd, f))`,
+                                          merge(ENV, Dict("TZ" => "UTC0"))))
             touch_at("worker-9410.stats", 600); touch_at("worker-9410.log", 600)   # stopped ten minutes ago
             touch_at("worker-9420.log", 7200)                                       # stopped two hours ago
             out = read(setenv(`sh -c $(RE._workers_probe_sh())`, merge(ENV, Dict("HOME" => home)); dir = home), String)

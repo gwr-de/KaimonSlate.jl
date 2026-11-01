@@ -1807,12 +1807,24 @@ function __slate_rerender_fig(; source::String = "", theme::String = "", raster:
     thm = try; slate_theme(theme = theme); catch; return (; ok = false); end
     wire = nothing
     themed = () -> (wire = run_capture(_NS[], source, filename; capture = DemuxCapture()))
+    # The re-run shows a themed copy; the figure kept for the cell stays the one its own run showed.
+    cid = replace(filename, r"^cell:" => "")
+    held = _figure_held(cid)
+    themedfig = nothing
     try
         Base.invokelatest(Mk.with_theme, themed, thm)
+        themedfig = _figure_held(cid)
     catch
         return (; ok = false)
+    finally
+        _figure_restore!(cid, held)
     end
     wire === nothing && return (; ok = false)
+    # A run captures the raster only; the vector form is rendered here from the themed figure.
+    if !raster && themedfig !== nothing
+        pdf = try; _vector_bytes(themedfig); catch; UInt8[]; end
+        isempty(pdf) || return (; ok = true, ext = "pdf", b64 = Base64.base64encode(pdf))
+    end
     # PDF export wants VECTOR (pdf/svg); HTML can't embed pdf, so `raster` prefers svg/png instead.
     prefs = raster ? (("image/svg+xml", "svg"), ("image/png", "png")) :
                      (("application/pdf", "pdf"), ("image/svg+xml", "svg"), ("image/png", "png"))
@@ -2755,6 +2767,12 @@ when the cell's value is no longer held (the cache is bounded) or the path names
 """
 __slate_matrix_render(; cell::String = "", field::String = "") = record_matrix_render(cell, field)
 
+"The PDF of the figure `cell` last showed, rendered now (`figure_vector`): `(; ok, b64)`."
+function __slate_figure_vector(; cell::String = "")
+    bytes = figure_vector(cell)
+    return bytes === nothing ? (; ok = false) : (; ok = true, b64 = Base64.base64encode(bytes))
+end
+
 function tools()
     return KaimonGate.GateTool[
         KaimonGate.GateTool("__slate_cluster_status", __slate_cluster_status),
@@ -2762,6 +2780,7 @@ function tools()
         KaimonGate.GateTool("__slate_matrix_render", __slate_matrix_render),
         KaimonGate.GateTool("__slate_eval", __slate_eval),
         KaimonGate.GateTool("__slate_rerender_fig", __slate_rerender_fig),
+        KaimonGate.GateTool("__slate_figure_vector", __slate_figure_vector),
         KaimonGate.GateTool("__slate_running", __slate_running),
         KaimonGate.GateTool("__slate_run_chunks", __slate_run_chunks),
         KaimonGate.GateTool("__slate_chunk_status", __slate_chunk_status),
@@ -3487,9 +3506,10 @@ function start(; host::String = "127.0.0.1", port::Int, stream_port::Int,
         # a cell's "Replacing docs" warnings are dropped.
         Base.global_logger(_worker_logger(_LogTee(stderr)))
     catch e; @warn "slate: timestamp logger install failed" exception = e; end
-    # `curve`/`allowed_clients` are set for a REMOTE worker (host="0.0.0.0", :direct transport): the
-    # hub pins THIS gate's CURVE server key (fetched over SSH) and the gate allow-lists the hub's client
-    # key — proper mutual auth. Local + :ssh_tunnel workers leave them off (loopback / SSH-encrypted).
+    # `curve`/`allowed_clients` are set for every worker a hub spawns, local or remote: the hub dials
+    # with THIS gate's CURVE server key and the gate allow-lists the hub's client key — mutual auth.
+    # Loopback alone is no boundary on a shared machine. Only a worker started by hand (attached, not
+    # spawned) runs without them.
     # A cluster prompt raised in here has to reach the hub's dialog; nothing in this process has one.
     try; _install_sshop_delegate!(); catch e; @warn "slate: cluster delegate install failed" exception = e; end
     # DEFERRED (~5s): Revise/src-watcher setup is heavy compilation; running it now would contend for

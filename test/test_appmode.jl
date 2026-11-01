@@ -93,7 +93,7 @@ end
         # every one of these must stay refused however the front end is restyled.
         authoring = ["POST /api/demo/cell", "POST /api/demo/publish", "POST /api/demo/packages",
                      "GET /api/notebooks", "POST /api/open", "GET /n/demo/export.standalone.jl",
-                     "POST /api/demo/eval", "GET /api/demo/files", "POST /api/demo/save",
+                     "POST /api/demo/eval", "GET /api/demo/files", "GET /api/demo/file-md", "POST /api/demo/save",
                      "GET /api/demo/history",
                      # Exporting is authoring: it writes a folder on the server's filesystem.
                      "POST /api/demo/export-app", "GET /api/demo/memo-catalog"]

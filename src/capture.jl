@@ -142,9 +142,10 @@ function _eval_cell_source(mod::Module, source::AbstractString, filename::Abstra
     return Core.eval(mod, REPL.softscope(Expr(:toplevel, marked...)))
 end
 
-# Vector format captured *in addition* to a raster figure, for publication PDF export
-# (fonts embedded, scales crisply). The browser ignores this chunk; only the Typst
-# exporter consumes it (preferring it over the raster). See `_capture_export_vector!`.
+# A raster figure's vector form, for publication PDF export (fonts embedded, scales crisply). Only
+# the exporter wants it, and rendering it can cost far more than the figure itself — a large heatmap
+# becomes millions of vector rectangles — so it is rendered when an export asks (`figure_vector`),
+# from the figure the cell showed, not on every run.
 const _EXPORT_VEC_MIME = "application/pdf"
 
 struct _CaptureDisplay <: AbstractDisplay
@@ -180,7 +181,8 @@ function _rich_scan!(chunks::Vector{Tuple{String,Vector{UInt8}}}, x)
             bytes = Base.invokelatest(_mime_bytes, MIME(m), x)
             m == "text/html" && (bytes = _fix_at_refs(bytes))
             push!(chunks, (m, bytes))
-            startswith(m, "image/") && _capture_export_vector!(chunks, x)
+            startswith(m, "image/") ? _figure_remember!(get(task_local_storage(), :slate_cell, ""), x) :
+                                      _capture_export_markdown!(chunks, x)
             return true
         end
     end
@@ -251,17 +253,104 @@ function _capture_gallery!(chunks::Vector{Tuple{String,Vector{UInt8}}}, value)
     return true
 end
 
-# When we just captured a raster figure (image/*), also try to render it to PDF — a
-# vector form for publication export. We attempt `show(io, MIME"application/pdf", x)`
-# *directly* (not gated on `showable`): CairoMakie gates `showable` on its active output
-# `type` (png by default → `showable` is false for pdf) but its `show` method still
-# renders a PDF. Anything without a PDF method just throws and is skipped. The chunk is
-# export-only — `_render_chunks` (browser) handles image/*, html, latex and ignores it.
-function _capture_export_vector!(chunks::Vector{Tuple{String,Vector{UInt8}}}, x)
-    any(c -> c[1] == _EXPORT_VEC_MIME, chunks) && return
+# The figure each cell showed, kept so export can render its vector form on request. The first one
+# a run shows, since export takes one figure per cell. Bounded like the record cache: a figure holds
+# its data, so the oldest goes when the bound is reached, and an export that finds none uses the
+# raster the cell already has.
+const _FIGURE_KEEP = 32
+const _FIGURE_CACHE = Dict{String,Any}()
+const _FIGURE_ORDER = String[]
+const _FIGURE_LOCK = ReentrantLock()
+
+function _figure_remember!(cellid::AbstractString, x)
+    isempty(cellid) && return nothing
+    lock(_FIGURE_LOCK) do
+        id = String(cellid)
+        haskey(_FIGURE_CACHE, id) && return nothing
+        push!(_FIGURE_ORDER, id)
+        _FIGURE_CACHE[id] = x
+        while length(_FIGURE_ORDER) > _FIGURE_KEEP
+            delete!(_FIGURE_CACHE, popfirst!(_FIGURE_ORDER))
+        end
+    end
+    return nothing
+end
+
+_figure_forget!(cellid::AbstractString) = lock(_FIGURE_LOCK) do
+    id = String(cellid)
+    delete!(_FIGURE_CACHE, id)
+    filter!(!=(id), _FIGURE_ORDER)
+    return nothing
+end
+
+_figure_held(cellid::AbstractString) = lock(() -> get(_FIGURE_CACHE, String(cellid), nothing), _FIGURE_LOCK)
+
+# Put back what `_figure_held` returned, for a caller that re-ran a cell for some other purpose.
+function _figure_restore!(cellid::AbstractString, x)
+    _figure_forget!(cellid)
+    x === nothing || _figure_remember!(cellid, x)
+    return nothing
+end
+
+# A layer with this many elements goes into the PDF as an image (at twice its size) rather than as
+# vector shapes: a heatmap is one rectangle per cell, and a few million of them make a PDF of tens of
+# megabytes that takes most of a minute to write. Axes, ticks and text stay vector. A layer the cell
+# set `rasterize` on itself is left as it is.
+const _RASTERIZE_ABOVE = 20_000
+
+_latest_prop(p, k) = Base.invokelatest(getproperty, p, k)
+_plot_size(p) = maximum((a = try; Base.invokelatest(getindex, Base.invokelatest(getindex, p, i)); catch; nothing; end;
+                         a isa AbstractArray ? length(a) : 0) for i in 1:3; init = 0)
+
+function _dense_layers(x)
+    M = _loaded_makie()
+    M === nothing && return Any[]
+    sc = try; Base.invokelatest(M.get_scene, x); catch; return Any[]; end
+    plots = try; Base.invokelatest(M.collect_atomic_plots, sc); catch; return Any[]; end
+    # Unset is `false` or `0`, depending on the Makie version.
+    return Any[(p, r) for p in plots
+               for r in (try; Base.invokelatest(getindex, _latest_prop(p, :rasterize)); catch; nothing; end,)
+               if (r === false || r === 0) && _plot_size(p) > _RASTERIZE_ABOVE]
+end
+
+# The PDF of `x`, its dense layers drawn as images for the length of the render.
+function _vector_bytes(x)
+    dense = _dense_layers(x)
     try
-        bytes = Base.invokelatest(_mime_bytes, MIME(_EXPORT_VEC_MIME), x)
-        isempty(bytes) || push!(chunks, (_EXPORT_VEC_MIME, bytes))
+        for (p, _) in dense; Base.invokelatest(setproperty!, p, :rasterize, 2); end
+        return Base.invokelatest(_mime_bytes, MIME(_EXPORT_VEC_MIME), x)
+    finally
+        for (p, r) in dense; try; Base.invokelatest(setproperty!, p, :rasterize, r); catch; end; end
+    end
+end
+
+"""
+    figure_vector(cellid) -> Union{Vector{UInt8},Nothing}
+
+The PDF of the figure cell `cellid` last showed, rendered now. `nothing` when no figure is held for
+it or the figure has no PDF form. `show` is called directly rather than gated on `showable`:
+CairoMakie answers `showable` for its active output type only (png by default), yet renders a PDF.
+"""
+function figure_vector(cellid::AbstractString)
+    x = _figure_held(cellid)
+    x === nothing && return nothing
+    bytes = try; _vector_bytes(x); catch; return nothing; end
+    return isempty(bytes) ? nothing : bytes
+end
+
+# A value shown as HTML, LaTeX or a Slate display MIME (`slate_render`) that can also show itself as
+# markdown (a table of formulas, a derivation with notes) is captured in that form too. Typst can't
+# typeset HTML, and LaTeX built for KaTeX can lean on commands mitex lacks; markdown with `$…$` math
+# goes through cmarker and mitex like a markdown cell, so it prints as text and formulas rather than
+# a screenshot. The chunk follows the form it restates, which is how `_render_chunks` knows to leave
+# it out.
+const _EXPORT_MD_MIME = "text/markdown"
+function _capture_export_markdown!(chunks::Vector{Tuple{String,Vector{UInt8}}}, x)
+    any(c -> c[1] == _EXPORT_MD_MIME, chunks) && return
+    try
+        Base.invokelatest(showable, MIME(_EXPORT_MD_MIME), x) || return
+        bytes = Base.invokelatest(_mime_bytes, MIME(_EXPORT_MD_MIME), x)
+        isempty(bytes) || push!(chunks, (_EXPORT_MD_MIME, bytes))
     catch
     end
     return
@@ -1028,6 +1117,7 @@ function run_capture(mod::Module, source::AbstractString, filename::AbstractStri
     # (a Bonito `Session`, a subscription) so a re-run doesn't leak them. Cleared in the `finally`.
     cid = replace(filename, r"^cell:" => "")
     task_local_storage(:slate_cell, cid)
+    _figure_forget!(cid)            # this run's first figure replaces the last run's
     _ns_defined(mod, :__slate_cleanups) && _run_cell_cleanups!(_ns_read(mod, :__slate_cleanups), cid)
     # Clear this cell's `@replay` marks, so that this run registers the full set again (see `_do_replay`).
     _ns_defined(mod, :__slate_replay_forget) && _ns_read(mod, :__slate_replay_forget)(cid)

@@ -16,6 +16,7 @@ using HTTP, JSON, FileWatching, CodecZlib, CodecZstd
 import Base64
 import Serialization                          # a worker's cluster-operation results, back over the gate
 import Sockets                                # claim the hub's port before HTTP's accept loop does
+import SHA                                    # vendored assets: the hashes their lock records
 import SlateExtensionsBase                    # the dtype table the page's decoders are generated from
 import Dates                                  # publish dates for the multi-doc site manifest
 import Logging                                # standalone serve: route hub log detail to a file
@@ -33,6 +34,7 @@ import ..SshAuth                              # ssh prompts a cluster asks for, 
 
 include("history.jl")   # module SlateHistory — durable content-addressed time machine
 include("parsched.jl")  # ParCell / par_blockers / run_scheduled — the parallel dataflow scheduler
+include("peer_owner.jl")  # module PeerOwner — which local account opened a loopback connection
 
 export serve_notebook, start_server, stop_server, LiveNotebook
 export export_app, app_defaults          # deploy a notebook as an application (server_app.jl / server_export.jl)
@@ -2018,6 +2020,24 @@ function _refresh_extensions!(nb::LiveNotebook)
         end && (changed = true))
         return changed
     end
+end
+
+# Pull the manifest before serving a page its full state, so a page load sees the front-end as the worker
+# has it now. A file-backed script (`@pkg_asset`) is re-read by the worker when its file changes, so an
+# edited extension `.js` reaches the page on a reload with no run and no worker restart. Pushes no version:
+# the state being served already carries the result. Skipped while the notebook opens, for the reason
+# `_pull_ext_assets!` gives, and when the kernel has no namespace to ask. Best-effort. Call it off `nb.lock`.
+function _refresh_extensions_for_page!(nb::LiveNotebook)
+    k = nb.kernel
+    (k isa ReportEngine.GateKernel || (k isa ReportEngine.InProcessKernel && nb.report.mod !== nothing)) ||
+        return nothing
+    _ext_assets_opening(nb) && return nothing
+    try
+        _refresh_extensions!(nb)
+    catch e
+        @debug "slate: page-load manifest pull failed" notebook = nb.id exception = e
+    end
+    return nothing
 end
 
 # The longest time that the `/ext-assets/` route holds a request for a package that is not declared yet:
@@ -6018,6 +6038,7 @@ include("echarts_docs.jl")     # curated ECharts option reference, mapped to the
 include("server_export.jl")
 include("publish_targets.jl")  # PublishTarget adapters (github-pages, generic-upload) + multi-target fan-out
 include("publish_zenodo.jl")   # Zenodo archival target — versioned citable DOI
+include("server_vendor.jl")    # third-party front-end assets: pinned, hash-checked, cached
 include("server_hub.jl")
 # After server_hub.jl: its signatures dispatch on `Hub`, which is defined there.
 include("server_app.jl")       # app mode (served-as-an-application posture) + the /status page

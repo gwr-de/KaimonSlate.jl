@@ -42,25 +42,11 @@ const LABEL = {
   unknown:     { text: 'not checked',    cls: 'ssdim' },
 };
 
-// The prompts arrive while the request below is open. The dialog is the same one a notebook uses
-// for a prompt raised by a cell (sshauth.js) — there is only one way to answer a host.
-function watchPrompts(stop) {
-  let shown = null;
-  const tick = () => {
-    if (stop.done) return;
-    fetch('/api/sshauth').then(r => r.json()).then(d => {
-      const p = ((d && d.pending) || [])[0];
-      if (p && p.id !== shown) { shown = p.id; window.onSshAuth && window.onSshAuth(p); }
-    }).catch(() => {}).then(() => { if (!stop.done) setTimeout(tick, 400); });
-  };
-  tick();
-}
-
+// The prompts arrive while the request below is open, as facts the dialog in sshauth.js watches —
+// the same dialog a notebook uses for a prompt raised by a cell. There is one way to answer a host.
 function signIn(host, out) {
   busy.value = host;
   note.value = { text: out ? `closing the session on ${host}…` : `answer the prompts for ${host}…` };
-  const stop = { done: false };
-  if (!out) watchPrompts(stop);
   fetch('/api/host-session', { method: 'POST', headers: { 'Content-Type': 'application/json' },
                                body: JSON.stringify({ host, logout: !!out }) })
     .then(r => r.json()).then(d => {
@@ -72,7 +58,7 @@ function signIn(host, out) {
       if (!out && window.onSshAuthResult) window.onSshAuthResult({ host, ok, error: (d && d.error) || '' });
     })
     .catch(() => { note.value = { text: 'request failed', err: true }; })
-    .then(() => { stop.done = true; busy.value = ''; });
+    .then(() => { busy.value = ''; });
 }
 
 // Ask the host what it wants, without authenticating.

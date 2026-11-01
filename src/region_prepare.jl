@@ -29,6 +29,8 @@ echo "cudamods=$(type module >/dev/null 2>&1 && for m in $(module -t list 2>&1 |
 """))
 
 # What the probe reads. One line per fact, `key=value`, so a site that lacks one tool loses one fact.
+# Scratch is set by a site's login profile, which the shell running a command over ssh need not read
+# (zsh's does not), so when the variable is missing the user's login shell is asked for it.
 const _PROBE_SCRIPT = replace(raw"""
 echo "arch=$(uname -m)"
 echo "cpu=$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^ *//')"
@@ -42,7 +44,7 @@ CUDAMODS_LINE
 echo "julia=$(PATH="$HOME/.juliaup/bin:$PATH" julia --version 2>/dev/null)"
 echo "gpus=$(nvidia-smi -L 2>/dev/null | wc -l | tr -d ' ')"
 echo "gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
-echo "scratch=${SCRATCH:-${PSCRATCH:-}}"
+s="${SCRATCH:-${PSCRATCH:-}}"; [ -n "$s" ] || s=$("${SHELL:-sh}" -lc 'printf "\n%s" "${SCRATCH:-${PSCRATCH:-}}"' </dev/null 2>/dev/null | tail -n 1); echo "scratch=$s"
 """, "MODULES_LINE" => _MODULES_LINE, "CUDALOCAL_LINE" => _CUDALOCAL_LINE,
     "CUDAMODS_LINE" => _CUDAMODS_LINE,
     "CPU_KEY_LINE" => _SYSIMAGE_CPU_SH * "; echo \"cpukey=\$CPU\"")

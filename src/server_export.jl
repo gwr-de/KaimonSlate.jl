@@ -967,13 +967,16 @@ const _LOCAL_MD_IMG_RE  = r"(!\[[^\]]*\]\(\s*)([^)\s]+)"
 const _LOCAL_TAG_SRC_RE = r"(<(?:img|video|audio|source)\b[^>]*?\bsrc=)([\"'])([^\"']+)\2"i
 _is_relative_ref(u::AbstractString) =
     !isempty(u) && !startswith(u, "/") && !startswith(u, "#") && !occursin(r"^[A-Za-z][A-Za-z0-9+.-]*:", u)
-function _local_media(src::AbstractString, nbid::AbstractString, assetbase::AbstractString)
+# `dir`: the project folder relative paths are written from ("" = the project root, as for a notebook's
+# markdown); a markdown FILE's links are relative to the folder it sits in.
+function _local_media(src::AbstractString, nbid::AbstractString, assetbase::AbstractString; dir::AbstractString = "")
     s = String(src)
     (isempty(nbid) || isempty(assetbase)) && return s
     (occursin("![", s) || occursin(r"<(?:img|video|audio|source)\b"i, s)) || return s
     route(u) = begin
         _is_relative_ref(u) || return nothing
         rel = HTTP.URIs.unescapeuri(startswith(u, "./") ? u[3:end] : u)
+        isempty(dir) || (rel = replace(normpath(joinpath(dir, rel)), '\\' => '/'))
         _asset_abspath(assetbase, rel) === nothing && return nothing
         "/n/" * nbid * "/asset/" * join((HTTP.URIs.escapeuri(x) for x in split(rel, '/')), "/")
     end
@@ -2486,7 +2489,14 @@ function _lib_script(pkg, sub, offline::Bool; defer::Bool = false)
         js === nothing || return string("<script>", replace(js, r"</script"i => "<\\/script"), "</script>")
     end
     url === nothing && return ""
-    return string("<script", defer ? " defer" : "", " src=\"", url, "\"></script>")
+    return string("<script", defer ? " defer" : "", " src=\"", url, "\"", _integrity_attrs(pkg, sub), "></script>")
+end
+
+# `integrity` (the hash vendor.lock.json records) and `crossorigin` for a CDN tag, so a browser loading an
+# exported page refuses a file that isn't the one this version of Slate was built against.
+function _integrity_attrs(pkg, sub)
+    sri = _vendor_locked_sri(pkg, sub)
+    sri === nothing ? "" : string(" integrity=\"", sri, "\" crossorigin=\"anonymous\"")
 end
 
 # KaTeX's stylesheet points at its fonts with relative `url(fonts/…)`, which is dead in a standalone file.
@@ -2570,7 +2580,7 @@ function _katex_css_tag(offline::Bool)
         css === nothing || return string("<style>", css, "</style>")
     end
     url = _vendor_url("katex", "katex.min.css")
-    url === nothing ? "" : string("<link rel=\"stylesheet\" href=\"", url, "\"/>")
+    url === nothing ? "" : string("<link rel=\"stylesheet\" href=\"", url, "\"", _integrity_attrs("katex", "katex.min.css"), "/>")
 end
 
 # The full third-party `<head>` block for an export, in whichever mode.

@@ -545,6 +545,32 @@ window.onWorkerReset = function (gen) {
   fns.forEach(fn => { try { fn(); } catch (e) { console.error('slateOnWorkerReset handler failed:', e); } });
 };
 
+// Cell patches from the server are applied once per frame. A run of many cells (a worker restart
+// re-runs the notebook) streams one `celldone:` per cell, and each patch re-renders the page and
+// forces a layout of the whole document; applied one by one they block the page for seconds.
+// Queued, a burst costs one render. The latest payload for a cell wins (`patchCells` also drops
+// stale revisions), and each `celldone:` still reports its cell's status, after the patch lands.
+const _patchQueue = new Map();
+const _doneQueue = [];
+let _patchPending = false;
+function _queuePatch(cells, done) {
+  (cells || []).forEach(c => _patchQueue.set(c.id, c));
+  if (done) _doneQueue.push(done);
+  if (_patchPending) return;
+  _patchPending = true;
+  // a hidden tab gets no animation frames
+  if (document.hidden) setTimeout(_flushPatches, 50);
+  else requestAnimationFrame(_flushPatches);
+}
+function _flushPatches() {
+  _patchPending = false;
+  const cells = [..._patchQueue.values()];
+  _patchQueue.clear();
+  const done = _doneQueue.splice(0);
+  try { patchCells(cells); } catch (_) {}
+  done.forEach(c => { try { window.onCellDone && window.onCellDone(c); } catch (_) {} });
+}
+
 // Instant push: the server streams the version over SSE and bumps it only on
 // external (file) changes, so the browser's own edits never trigger a re-render.
 function connectLive() {
@@ -555,11 +581,11 @@ function connectLive() {
   es.onmessage = async (e) => {
     if (e.data.startsWith('closed:')) { _notebookClosed(); return; }   // deliberate close — overlay, no auto-reopen
     if (e.data.startsWith('agent:')) { try { agentEvent(JSON.parse(e.data.slice(6))); } catch (_) {} return; }
-    if (e.data.startsWith('refresh:')) { try { patchCells(JSON.parse(e.data.slice(8)).cells); } catch (_) {} return; }   // targeted: only the changed cells, inline
+    if (e.data.startsWith('refresh:')) { try { _queuePatch(JSON.parse(e.data.slice(8)).cells); } catch (_) {} return; }   // targeted: only the changed cells, inline
     if (e.data.startsWith('runbatch:')) { const _rb = e.data.slice(9).split(':'); window.onRunBatch && window.onRunBatch(parseInt(_rb[0], 10) || 0, _rb[1] === '1'); return; }   // N cells about to run (+ whether it STARTS a run) → stable k/N
     if (e.data.startsWith('cellpre:')) { try { const r = JSON.parse(e.data.slice(8)); window.onCellPre && window.onCellPre(r.index, r.cell); } catch (_) {} return; }   // agent add/edit: show the (stale) cell BEFORE its eval finishes
     if (e.data.startsWith('cellrun:')) { try { const r = JSON.parse(e.data.slice(8)); window.onCellRun && window.onCellRun(r); } catch (_) {} return; }   // {id,rev} — a cell started running (live status)
-    if (e.data.startsWith('celldone:')) { try { const c = JSON.parse(e.data.slice(9)); patchCells([c]); window.onCellDone && window.onCellDone(c); } catch (_) {} return; }   // a cell finished — patch + status
+    if (e.data.startsWith('celldone:')) { try { const c = JSON.parse(e.data.slice(9)); _queuePatch([c], c); } catch (_) {} return; }   // a cell finished — patch + status
     if (e.data.startsWith('cellprog:')) { try { const p = JSON.parse(e.data.slice(9)); window.onCellProgress && window.onCellProgress(p); } catch (_) {} return; }   // {cid,frac,msg,id,done} — one bar per (cell, id)
     if (e.data.startsWith('cellout:')) { try { const p = JSON.parse(e.data.slice(8)); window.onCellOutput && window.onCellOutput(p); } catch (_) {} return; }   // {cid,out,err} — a RUNNING cell's output so far (cooked text)
     if (e.data.startsWith('cellstream:')) { try { const p = JSON.parse(e.data.slice(11)); window.onCellStream && window.onCellStream(p.channel, p.data); } catch (_) {} return; }   // slate_emit(channel,data) → a cell's custom JS renderer
@@ -572,9 +598,7 @@ function connectLive() {
     if (e.data.startsWith('inspect:')) { try { const r = JSON.parse(e.data.slice(8)); window._slateInspect && window._slateInspect(r.reqid, r.cell); } catch (_) {} return; }   // slate.inspect: capture this cell for the agent
     if (e.data.startsWith('inspectmany:')) { try { const r = JSON.parse(e.data.slice(12)); window._slateInspectMany && window._slateInspectMany(r.reqid, r.cells, r.theme); } catch (_) {} return; }   // PDF export: every HTML-output cell, one round-trip
     if (e.data.startsWith('js:')) { try { const r = JSON.parse(e.data.slice(3)); window._slateEvalJs && window._slateEvalJs(r.reqid, r.code); } catch (_) {} return; }   // slate.eval_js: run agent JS in this tab
-    if (e.data.startsWith('sshauth:')) { try { const r = JSON.parse(e.data.slice(8)); window.onSshAuth && window.onSshAuth(r); } catch (_) {} return; }   // a cluster wants a password / second factor
-    if (e.data.startsWith('sshauth-done:')) { window.onSshAuthDone && window.onSshAuthDone(e.data.slice(13)); return; }   // …and is no longer waiting
-    if (e.data.startsWith('sshauth-result:')) { try { window.onSshAuthResult && window.onSshAuthResult(JSON.parse(e.data.slice(15))); } catch (_) {} return; }   // …and here is whether it worked
+    if (e.data.startsWith('sshauth-result:')) { try { window.onSshAuthResult && window.onSshAuthResult(JSON.parse(e.data.slice(15))); } catch (_) {} return; }   // a login ended, and whether it worked (its prompts arrive as facts)
     if (e.data.startsWith('compfig:')) { try { const r = JSON.parse(e.data.slice(8)); window._slateComponentFig && window._slateComponentFig(r.reqid, r.cell, r.slot, r.theme); } catch (_) {} return; }   // PDF export: capture a mounted component as a figure
     if (e.data.startsWith('exportprog:')) { try { window.onExportProgress && window.onExportProgress(JSON.parse(e.data.slice(11)).cell); } catch (_) {} return; }   // a chart is being rendered live for PDF/Typst export
     if (e.data.startsWith('mesh-consent:')) { try { window.onMeshConsent && window.onMeshConsent(JSON.parse(e.data.slice(13))); } catch (_) {} return; }   // §5.1: a new cross-host pair needs a consented SSH mesh

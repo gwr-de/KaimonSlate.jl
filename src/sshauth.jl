@@ -54,6 +54,14 @@ const _REPORTER = Ref{Any}(nothing)
 "Route login outcomes to `f(host, ok::Bool, error::String)` — a worker relays them, a hub shows them."
 set_reporter!(f) = (_REPORTER[] = f; nothing)
 
+# Something that shows what is waiting: told whenever a prompt is raised or stops waiting.
+const _ON_CHANGE = Ref{Any}(nothing)
+
+"Call `f()` whenever the set of pending prompts changes."
+set_on_change!(f) = (_ON_CHANGE[] = f; nothing)
+
+_changed() = (f = _ON_CHANGE[]; f === nothing || try; f(); catch; end; nothing)
+
 "Say how a login ended. Best-effort: nobody watching is not an error."
 function report!(host::AbstractString, ok::Bool, err::AbstractString = "")
     f = _REPORTER[]
@@ -81,6 +89,7 @@ function ask(host::AbstractString, prompt::AbstractString, echo::Bool = false; t
         _PENDING[p.id] = p
         p
     end
+    _changed()
     timer = Timer(_ -> (isopen(p.reply) && put!(p.reply, nothing)), timeout)
     try
         return take!(p.reply)
@@ -89,6 +98,7 @@ function ask(host::AbstractString, prompt::AbstractString, echo::Bool = false; t
     finally
         close(timer)
         lock(_LOCK) do; delete!(_PENDING, p.id); end
+        _changed()
     end
 end
 

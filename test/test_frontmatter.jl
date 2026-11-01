@@ -742,6 +742,11 @@ x = 1
         @test sj isa AbstractVector && length(sj) == 3
         @test sj[1]["id"] == "widget:Pkg.Stars" && sj[1]["js"] == "REG_STARS_V2"
         @test sj[1]["esm"] == true && sj[1]["kind"] == "Pkg.Stars"
+
+        # The page-load pull asks nothing of a kernel that has no namespace yet, and leaves the registry
+        # as it is.
+        @test NS._refresh_extensions_for_page!(nb) === nothing
+        @test length(NS._frontend_scripts(nb)) == 3
     end
 
     # The module specifiers those scripts import ride the SAME push. A package declares its imports

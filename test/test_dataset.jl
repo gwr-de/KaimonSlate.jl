@@ -639,6 +639,22 @@ const MS = RE.MemoStore
             end
         end
 
+        # Pages learn what is waiting from the facts, so a prompt being raised and a prompt going
+        # away (answered, cancelled, timed out) are each announced.
+        let changes = Ref(0)
+            S.SshAuth.set_on_change!(() -> changes[] += 1)
+            try
+                t = @async S.SshAuth.ask("h", "Password: ", false; timeout = 5.0)
+                @test timedwait(() -> !isempty(S.SshAuth.pending()), 5.0) === :ok
+                @test changes[] == 1
+                @test S.SshAuth.answer!(only(S.SshAuth.pending()).id, "pw")
+                @test fetch(t) == "pw"
+                @test changes[] == 2 && isempty(S.SshAuth.pending())
+            finally
+                S.SshAuth.set_on_change!(nothing)
+            end
+        end
+
         # A target with a host plans against the mirror, but its BLOBS stay on the far side, read by
         # range at the path the host uses.
         mktempdir() do root

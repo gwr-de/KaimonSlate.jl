@@ -8,6 +8,7 @@ using Random: Xoshiro                        # deterministic incompressible byte
 import JSON                                  # hand the @replay control fixture to node
 const ReportEngine = KaimonSlate.ReportEngine
 const NS = KaimonSlate.NotebookServer
+const HTTP = NS.HTTP                         # vendor responses are HTTP.Responses
 
 # A minimal manifest doc entry.
 _doc(slug, date; series = nothing) = begin
@@ -16,6 +17,58 @@ _doc(slug, date; series = nothing) = begin
     d
 end
 _pos(needle, hay) = first(findfirst(needle, hay))
+
+@testset "vendor URLs carry the pinned version" begin
+    kv, sv, cv = NS._vendor_version("katex"), NS._vendor_version("signals"), NS._vendor_version("signals-core")
+    @test !isempty(kv) && NS._vendor_version("no-such-package") == ""
+    page = """<script src="/assets/vendor/katex/katex.min.js"></script>
+              "@preact/signals": "/assets/vendor/signals/dist/signals.module.js",
+              "@preact/signals-core": "/assets/vendor/signals-core/dist/signals-core.module.js" """
+    out = NS._vendor_versioned(page)
+    @test occursin("/assets/vendor/katex@$kv/katex.min.js", out)
+    # a package whose name starts another's is rewritten on its own
+    @test occursin("/assets/vendor/signals@$sv/dist/", out) && occursin("/assets/vendor/signals-core@$cv/dist/", out)
+    @test NS._vendor_versioned("<p>no vendor assets</p>") == "<p>no vendor assets</p>"
+end
+
+@testset "the vendor lock matches vendor.json" begin
+    man, lk = NS._vendor_manifest(), NS._vendor_lockfile()
+    pkgs = NS._vendor_packages(man)
+    @test !isempty(pkgs) && sort(collect(keys(lk))) == pkgs     # regenerate with update_vendor_lock()
+    for pkg in pkgs
+        @test lk[pkg]["version"] == NS._vendor_version(pkg, man)
+        globs = NS._vendor_glob.(man[pkg]["files"])
+        for (sub, sri) in lk[pkg]["files"]
+            @test any(g -> occursin(g, sub), globs) && startswith(sri, "sha384-")
+        end
+    end
+    @test NS._vendor_locked_sri("katex", "no-such-file.js") === nothing
+    @test NS._vendor_locked_sri("katex", "katex.min.js", "0.0.1") === nothing     # another version
+end
+
+@testset "vendor globs" begin
+    g = NS._vendor_glob
+    @test occursin(g("fonts/*.woff2"), "fonts/KaTeX_Main-Regular.woff2")
+    @test !occursin(g("fonts/*.woff2"), "fonts/sub/x.woff2") && !occursin(g("fonts/*.woff2"), "fonts/x.woff")
+    @test occursin(g("dist/preact.module.js*"), "dist/preact.module.js.map")
+    @test occursin(g("**/*.js"), "a/b/c.js") && !occursin(g("katex.min.js"), "katexXmin.js")
+end
+
+@testset "vendor responses" begin
+    # needs the file cached or the network; skipped otherwise, like the export test below
+    if NS._vendor_file("katex", "katex.min.js") !== nothing
+        ver = NS._vendor_version("katex")
+        r = NS._vendor_response(HTTP.Request("GET", "/"), "katex", ver, "katex.min.js")
+        @test r.status == 200 && occursin("immutable", HTTP.header(r, "Cache-Control"))
+        etag = HTTP.header(r, "ETag")
+        @test startswith(etag, "\"sha384-")
+        r = NS._vendor_response(HTTP.Request("GET", "/"), "katex", "", "katex.min.js")   # a bare path
+        @test HTTP.header(r, "Cache-Control") == "no-cache"
+        r = NS._vendor_response(HTTP.Request("GET", "/", ["If-None-Match" => etag]), "katex", "", "katex.min.js")
+        @test r.status == 304 && isempty(r.body)
+    end
+    @test NS._vendor_response(HTTP.Request("GET", "/"), "katex", "", "not-in-the-lock.js").status == 404
+end
 
 @testset "web-cell export importmap (Preact/htm/signals)" begin
     ui = NS._slate_ui_imports()
@@ -518,6 +571,22 @@ end
     @test occursin("src=\"data:image/png;base64,", standalone) && !occursin("figures/logo.png", standalone)
     @test occursin("src=\"figures/logo.png\"", NS.export_html(nb; inline_assets = false))
     @test haskey(NS._embedded_asset_files(rep.cells, root), "figures/logo.png")
+end
+
+@testset "a markdown file in the project renders for the Files tab" begin
+    root = mktempdir(); mkpath(joinpath(root, "docs", "img"))
+    write(joinpath(root, "docs", "img", "x.png"), UInt8[0x89, 0x50, 0x4e, 0x47])
+    write(joinpath(root, "docs", "guide.md"), "# Guide\n\n![x](img/x.png)\n\nSee \$a^2\$ and [the readme](../README.md).\n")
+    rep = _RE.parse_report("#%% code id=a\nx = 1\n"); rep.meta["assetbase"] = root
+    nb = NS.LiveNotebook("mdf", joinpath(root, "nb.jl"), rep, _RE.InProcessKernel(), 1, String[], String[],
+        ReentrantLock(), Channel{String}[], ReentrantLock(), "", false, Dict{String,String}())
+    code, html = NS._md_file_html(nb, "docs/guide.md")
+    @test code == 200 && occursin("<h1", html)
+    # An image path is relative to the file's own folder, as it is wherever else the file is read.
+    @test occursin("src=\"/n/mdf/asset/docs/img/x.png\"", html)
+    @test occursin("../README.md", html)                      # a link is left for the page to follow
+    @test NS._md_file_html(nb, "docs/missing.md")[1] == 404
+    @test NS._md_file_html(nb, "../../etc/passwd")[1] == 400
 end
 
 # A dropped clip lands in a markdown cell as `<video src="/n/<id>/asset/…">`. A standalone page has no
@@ -1770,6 +1839,52 @@ end
     # Reached through the real entry point, not just the helper.
     c = _RE.Cell("m", _RE.MARKDOWN, raw"energy \(E = mc^2\) here")
     @test occursin(raw"$E = mc^2$", NS._md_for_typst(c))
+end
+
+# ── PDF export: math and markdown outputs typeset natively ──────────────────────────────────────────
+# A `text/latex` output, or the markdown form of an HTML output, prints as text and formulas rather
+# than a screenshot. LaTeX written for KaTeX loses the layout commands mitex lacks.
+@testset "typst export typesets math outputs" begin
+    p = NS._portable_tex
+    @test p(raw"\begin{bmatrix}\rule[-1.4em]{0pt}{3.3em}\dfrac{a}{b} \\ \rule[-1.4em]{0pt}{3.3em}c\end{bmatrix}") ==
+          raw"\begin{bmatrix}\dfrac{a}{b} \\ c\end{bmatrix}"
+    @test p(raw"\left[\hspace{-5pt}\begin{array}{r}1\end{array}\hspace{-5pt}\right]") == raw"\left[\begin{array}{r}1\end{array}\right]"
+    @test p(raw"\hphantom{\begin{matrix}x \\ y\end{matrix}}\mathllap{x} &= 1") == raw"{x} &= 1"
+    @test p(raw"a \\[8pt] b") == raw"a \\ b"
+    @test p(raw"a \\ \\[-0.9em] b") == raw"a \\ b"               # an emptied spacer row collapses
+    @test p(raw"a \\ \dfrac{1}{2}") == raw"a \\ \dfrac{1}{2}"     # a row break before a command stays put
+    @test NS._strip_math_delims(raw"$$x^2$$") == "x^2" && NS._strip_math_delims(raw"$θ$") == "θ"
+
+    # Typst is asked before the export commits to native math: an unknown command falls back.
+    @test NS._typst_typesets(:tex, raw"\begin{bmatrix}\dfrac{a}{b} & 1\end{bmatrix}")
+    @test !NS._typst_typesets(:tex, raw"\mathllap{x}")
+    @test NS._typst_typesets(:md, "| code | result |\n|:--|:--|\n| `x` | \$\$x^2\$\$ |\n")
+end
+
+# A value shown as HTML that can also show itself as markdown carries that form, export-only.
+struct _MdCard end
+Base.show(io::IO, ::MIME"text/html", ::_MdCard) = print(io, "<b>card</b>")
+Base.show(io::IO, ::MIME"text/markdown", ::_MdCard) = print(io, "**card**")
+@testset "an HTML output keeps its markdown form for export" begin
+    chunks = Tuple{String, Vector{UInt8}}[]
+    @test _RE._capture_rich!(chunks, _MdCard())
+    @test first.(chunks) == ["text/html", "text/markdown"]
+    @test String(chunks[2][2]) == "**card**"
+    # the browser renders the HTML and ignores the markdown
+    @test KaimonSlate.ReportRender._render_chunks([(mime = m, data = copy(d)) for (m, d) in chunks]) == "<div class=\"disp html\"><b>card</b></div>"
+end
+
+# The same for a value an extension renders (`slate_render`): the export prints its markdown form.
+struct _MdRendered end
+NS.SlateExtensionsBase.slate_render(::_MdRendered) = NS.SlateExtensionsBase.html_fragment("<b>card</b>")
+Base.show(io::IO, ::MIME"text/markdown", ::_MdRendered) = print(io, "**card**")
+@testset "a slate_render output keeps its markdown form for export" begin
+    chunks = Tuple{String, Vector{UInt8}}[]
+    @test _RE._capture_rich!(chunks, _MdRendered())
+    @test first.(chunks) == ["application/vnd.kaimonslate.html+html", "text/markdown"]
+    # On screen the markdown is left out, as it is after HTML.
+    html = KaimonSlate.ReportRender._render_chunks([(mime = m, data = copy(d)) for (m, d) in chunks])
+    @test !occursin("**card**", html) && !occursin("<strong>card</strong>", html)
 end
 
 # The SCREEN half of the same story. KaTeX is configured for the bracket spellings, but CommonMark

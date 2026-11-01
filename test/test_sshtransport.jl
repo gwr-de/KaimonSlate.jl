@@ -5,6 +5,7 @@
 # transport remembers about a host's login and when it rewrites it. That bookkeeping decides how
 # many second-factor codes a person is asked for.
 using ReTest
+import Base64
 include(joinpath(@__DIR__, "..", "src", "sshtransport.jl"))
 
 const T = SshTransport
@@ -124,13 +125,62 @@ end
     end
 end
 
+@testset "a key's certificate is offered before its plain public key" begin
+    mktempdir() do d
+        priv = joinpath(d, "id")
+        write(priv, "")
+        @test T._pubkey_candidates(priv) == [nothing]
+        write(priv * ".pub", "")
+        @test T._pubkey_candidates(priv) == [priv * ".pub"]
+        write(priv * "-cert.pub", "")
+        @test T._pubkey_candidates(priv) == [priv * "-cert.pub", priv * ".pub"]
+    end
+end
+
+@testset "ssh-agent keys" begin
+    # Blobs are runs of length-prefixed fields; a key's first field is its type.
+    field(x) = (v = Vector{UInt8}(x); vcat(reinterpret(UInt8, [hton(UInt32(length(v)))]), v))
+    b64(v) = String(Base64.base64encode(v))
+    e, n = UInt8[1, 0, 1], UInt8[9, 8, 7]
+    plain = vcat(field("ssh-rsa"), field(e), field(n))
+    cert = vcat(field("ssh-rsa-cert-v01@openssh.com"), field("nonce"), field(e), field(n), field(UInt8[0, 0, 0, 1]))
+    stale = vcat(field("ssh-rsa"), field(e), field(UInt8[5, 5]))
+    other = vcat(field("ssh-ed25519"), field(UInt8[6]))
+
+    @test T._b64decode(b64(cert)) == cert
+    @test T._blob_type(cert) == "ssh-rsa-cert-v01@openssh.com"
+    @test T._blob_type(UInt8[0, 0]) == ""
+    @test T._certified_key(cert) == plain
+    @test T._certified_key(plain) === nothing
+
+    withenv("SSH_AUTH_SOCK" => "/run/agent.sock", "OTHER_SOCK" => "/run/other.sock") do
+        @test T._agent_socket("") == "/run/agent.sock"
+        @test T._agent_socket("SSH_AUTH_SOCK") == "/run/agent.sock"
+        @test T._agent_socket("\$OTHER_SOCK") == "/run/other.sock"
+        @test T._agent_socket("none") == ""
+        @test T._agent_socket("~/a.sock") == joinpath(homedir(), "a.sock")
+    end
+
+    mktempdir() do d
+        priv = joinpath(d, "id")
+        write(priv * ".pub", "ssh-rsa $(b64(plain)) me\n")
+        write(priv * "-cert.pub", "ssh-rsa-cert-v01@openssh.com $(b64(cert)) me\n")
+        blobs = [other, stale, plain, cert]
+        # The certificate, then the key it certifies, then the rest in the agent's order.
+        @test T._agent_order(blobs, [priv], false) == [4, 3, 1, 2]
+        # With IdentitiesOnly, only the keys that belong to the host's identity files.
+        @test T._agent_order(blobs, [priv], true) == [4, 3]
+        @test T._agent_order(blobs, String[], true) == Int[]
+    end
+end
+
 @testset "a server refusing channels with none of ours open ends the session" begin
     # A server that counts sessions this side has already let go refuses every command from then on, while
     # the forwards on the connection keep working. A minute of that, with no channel of ours open, ends the
     # session so the next command connects afresh. No server is needed: the rule reads only what this side
     # holds.
     host = "refusal-test"
-    ep = T.Endpoint(host, host, 22, "u", String[], "")
+    ep = T.Endpoint(host, host, 22, "u", String[], "", false, "")
     fresh() = T.Session(ep, Cint(-1), C_NULL, Channel{Any}(1), nothing, T.Prompter(host), true, "", T.Fwd[])
     clear!() = lock(() -> (empty!(T._IDLE_REFUSAL_SINCE); filter!(kv -> last(kv)[1].ep.alias != host, T._OPEN_CMDS)), T._OPEN_CMDS_LOCK)
     clear!()

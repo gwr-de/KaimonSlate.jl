@@ -18,6 +18,8 @@ const RE = KaimonSlate.ReportEngine
         end
 
         @testset "a region takes its host and scheduler from its machine" begin
+            # Its own machine, since a filtered run may skip the testset above.
+            RE.cluster_set!(Dict("name" => "pm", "host" => "perlmutter", "kind" => "slurm", "account" => "m1"))
             r = RE.region_set!("gpu"; machine = "pm", partition = "gpu", gpus = "4")
             @test r.host == "perlmutter" && r.scheduler === :slurm && r.account == "m1"
             @test RE.region_machine(r).name == "pm"

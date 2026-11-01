@@ -1103,13 +1103,7 @@ function _make_router(h::Hub)
     end)
     # ── Answering an ssh prompt ──────────────────────────────────────────────────────────────
     # Hub-level, not per notebook: a connection belongs to a HOST, and one prompt may be what
-    # several notebooks are waiting on. `id` came from the `sshauth:` push that raised the dialog.
-    # What is waiting to be answered. Notebook pages are PUSHED their prompts over the page socket;
-    # the home page has no such socket, so the sign-in panel there watches this while its request
-    # is in flight.
-    HTTP.register!(router, "GET", "/api/sshauth", _ -> _json(Dict("pending" =>
-        [Dict("id" => p.id, "host" => p.host, "prompt" => p.prompt, "secret" => !p.echo)
-         for p in SshAuth.pending()])))
+    # several notebooks are waiting on. `id` is the prompt's, from its `sshauth/<id>` fact.
     HTTP.register!(router, "POST", "/api/sshauth", req -> begin
         b = try; JSON.parse(String(req.body)); catch; nothing; end
         b isa AbstractDict || return _json(Dict("ok" => false, "error" => "bad request"))
@@ -1129,16 +1123,14 @@ function _make_router(h::Hub)
     HTTP.register!(router, "GET", "/assets/ansi.css",
                    _ -> _asset(read(_ANSI_CSS_ASSET, String), "text/css; charset=utf-8"))
     HTTP.register!(router, "GET", "/assets/shared.css", _ -> _asset(read(_SHARED_CSS, String), "text/css; charset=utf-8"))
-    # Vendored third-party assets (offline cache, pinned in vendor.json). Greedy `**` so
-    # nested paths work (CodeMirror modes/addons, KaTeX fonts). First hit fetches+caches.
+    # Vendored third-party assets (server_vendor.jl). Greedy `**` so nested paths work (KaTeX fonts).
     HTTP.register!(router, "GET", "/assets/vendor/**", req -> begin
         rel = replace(HTTP.URI(req.target).path, r"^/assets/vendor/" => "")
         parts = split(rel, '/'; limit = 2)
         (length(parts) == 2 && !isempty(parts[2])) || return HTTP.Response(404)
-        f = _vendor_file(String(parts[1]), String(parts[2]))
-        f === nothing && return HTTP.Response(404, "vendor asset unavailable (offline & uncached?)")
-        HTTP.Response(200, ["Content-Type" => _vendor_ctype(parts[2]),
-                            "Cache-Control" => "public, max-age=31536000, immutable"], read(f))
+        # `<pkg>@<version>` (see `_vendor_versioned`) or a bare `<pkg>`; either serves the pinned version
+        pkg, ver = occursin('@', parts[1]) ? split(parts[1], '@'; limit = 2) : (parts[1], "")
+        _vendor_response(req, String(pkg), String(ver), String(parts[2]))
     end)
     HTTP.register!(router, "GET", "/assets/js/{file}", req -> begin
         f = HTTP.getparam(req, "file")
@@ -1862,8 +1854,9 @@ function _make_router(h::Hub)
         # answer them. Off the request task would mean answering a dialog whose result nothing reads.
         ok = try; ReportEngine.Sweep.connect!(host; interactive = true)
         catch e; return _json(Dict("ok" => false, "error" => first(sprint(showerror, e), 200))); end
+        why = ok ? "" : ReportEngine.Sweep.last_connect_failure(host)
         _json(Dict("ok" => ok, "connected" => ReportEngine.Sweep.connected(host),
-                   "error" => ok ? "" : "could not authenticate to $host"))
+                   "error" => ok ? "" : isempty(why) ? "could not authenticate to $host" : why))
     end)
 
     # What scheduler(s) a host has, so the region form knows whether to ask for a walltime and a
@@ -2174,7 +2167,7 @@ function _make_router(h::Hub)
         all = lock(nb.lock) do; get(nb.report.meta, "jobopts", Dict{String,Dict{String,String}}()); end
         _json(Dict("ok" => true, "options" => isempty(cid) ? all : get(all, cid, Dict{String,String}())))
     end))
-    HTTP.register!(router, "GET", "/api/{id}/state", req -> _withnb(h, req, nb -> (sync_from_file!(nb); _json(state_json(nb)))))
+    HTTP.register!(router, "GET", "/api/{id}/state", req -> _withnb(h, req, nb -> (sync_from_file!(nb); _refresh_extensions_for_page!(nb); _json(state_json(nb)))))
     # A worker's log tail + status for the topbar worker/region status popup. `?side=` selects the
     # worker (""=main, else a region); local reads the log file, remote ssh-tails it. Polled while open.
     HTTP.register!(router, "POST", "/api/{id}/worker-log-io", req -> _withnb(h, req, nb -> begin
@@ -2917,6 +2910,13 @@ function _make_router(h::Hub)
         _json(Dict("path" => rel, "kind" => "text", "content" => String(bytes), "bytes" => sz,
                    "mtime" => mtime(ap)))
     end))
+    # A markdown file rendered the way a markdown cell is, for the Files tab's preview. Its relative image
+    # and media paths resolve against the folder the file sits in, as they do wherever else it is read.
+    HTTP.register!(router, "GET", "/api/{id}/file-md", req -> _withnb(h, req, nb -> begin
+        code, body = _md_file_html(nb, String(get(HTTP.queryparams(HTTP.URI(req.target)), "path", "")))
+        code == 200 || return HTTP.Response(code, body)
+        HTTP.Response(200, ["Content-Type" => "text/html; charset=utf-8", "Cache-Control" => "no-store"], body)
+    end))
     HTTP.register!(router, "POST", "/api/{id}/file", req -> _withnb(h, req, nb -> begin
         body = try; JSON.parse(String(req.body)); catch; Dict{String,Any}(); end
         rel = String(get(body, "path", "")); content = String(get(body, "content", ""))
@@ -3508,10 +3508,10 @@ function _hostonly(hp::AbstractString)
     return s
 end
 
-# Allow the request iff its Host is loopback/allowlisted AND its Origin (when present)
-# resolves to an allowlisted host. Returns false to reject with 403.
-function _request_allowed(h::Hub, msg)::Bool
-    allowed = _allowed_hosts(h)
+# Allow the request iff its Host is loopback/allowlisted, its Origin (when present) resolves to an
+# allowlisted host, and the browser does not say another site sent it. Returns false to reject with 403.
+_request_allowed(h::Hub, msg) = _request_allowed(_allowed_hosts(h), msg)
+function _request_allowed(allowed::AbstractSet{String}, msg)::Bool
     host = _hostonly(HTTP.header(msg, "Host", ""))
     (isempty(host) || host in allowed) || return false
     origin = strip(HTTP.header(msg, "Origin", ""))
@@ -3519,7 +3519,73 @@ function _request_allowed(h::Hub, msg)::Bool
         ohost = try; _hostonly(HTTP.URI(origin).host); catch; ""; end
         (ohost in allowed) || return false
     end
+    # A browser marks every request with where it came from, including the ones that carry no
+    # Origin: a GET from an <img>, a <script> or a link. So a page elsewhere cannot reach a route by
+    # avoiding the Origin check. Another site may still link here: following a link is a GET that
+    # shows a page.
+    if lowercase(strip(HTTP.header(msg, "Sec-Fetch-Site", ""))) == "cross-site"
+        (msg.method == "GET" && lowercase(strip(HTTP.header(msg, "Sec-Fetch-Mode", ""))) == "navigate") ||
+            return false
+    end
     return true
+end
+
+# ── Other accounts on the same machine ────────────────────────────────────────
+# The Host/Origin checks above stop a web page from driving the hub; they do nothing about another
+# account on a shared machine (a cluster login node), which can open 127.0.0.1 directly and send any
+# headers it likes. On Linux the kernel says who owns the far end of a loopback connection (see
+# peer_owner.jl), so a loopback request is served only when that is the account running the hub.
+# SSH forwards and VS Code's port forwarding connect as the logged-in user and pass.
+#
+# Elsewhere the check is skipped: macOS and Windows have no equivalent lookup, and are rarely shared
+# between accounts. A non-loopback peer is not a local account; the bind address governs those. An
+# app-mode hub is public by design and is not checked. `KAIMONSLATE_ALLOW_OTHER_USERS=1` turns the
+# check off.
+
+_other_users_allowed() = lowercase(strip(get(ENV, "KAIMONSLATE_ALLOW_OTHER_USERS", ""))) in ("1", "true", "yes", "on")
+
+const _PEER_CHECK_FAILED = Threads.Atomic{Bool}(false)   # log a broken lookup once, not per request
+
+# The answer per connection: its owner cannot change, a browser sends a page's requests over a few
+# kept-alive connections, and the lookup can cost tens of milliseconds (see peer_owner.jl). Keyed by
+# HTTP's per-connection server record, weakly, so an entry goes with its connection.
+const _PEER_SEEN = WeakKeyDict{Any,Bool}()
+const _PEER_SEEN_LOCK = ReentrantLock()
+
+_addr_bytes(a) = collect(UInt8, a.ip)
+
+"""
+    _peer_is_owner(stream) -> Bool
+
+Whether the account at the far end of this request's connection is the one running the hub. True
+for non-loopback peers and off Linux; false when the owner cannot be established, since a check that
+cannot answer must not let the request through.
+"""
+function _peer_is_owner(stream)::Bool
+    Sys.islinux() || return true
+    _other_users_allowed() && return true
+    peer = HTTP.peeraddr(stream)
+    peer === nothing && return false
+    PeerOwner.is_loopback(_addr_bytes(peer)) || return true
+    try
+        # The far end's socket is named by both addresses. HTTP has no public accessor for this
+        # connection's own address, so it is read from the tracked transport.
+        tracked = stream.tracked
+        known = lock(() -> get(_PEER_SEEN, tracked, nothing), _PEER_SEEN_LOCK)
+        known === nothing || return known
+        here = HTTP.TCP.local_addr(tracked.conn)
+        uid = PeerOwner.owner_uid(_addr_bytes(peer), peer.port, _addr_bytes(here), here.port)
+        ok = uid !== nothing && uid == PeerOwner.my_uid()
+        lock(() -> (_PEER_SEEN[tracked] = ok), _PEER_SEEN_LOCK)
+        return ok
+    catch e
+        if !_PEER_CHECK_FAILED[]
+            _PEER_CHECK_FAILED[] = true
+            @error "Kaimon Slate: cannot tell which account opened a loopback connection, so the hub " *
+                   "refuses them. Set KAIMONSLATE_ALLOW_OTHER_USERS=1 to serve every local account." exception = (e, catch_backtrace())
+        end
+        return false
+    end
 end
 
 """
@@ -4063,14 +4129,10 @@ function _install_worker_push!(h)
 end
 
 # ── ssh wants an answer ──────────────────────────────────────────────────────────────────────
-# A cluster that refuses keys asks for a password and a second factor. The ssh client hands each
-# prompt to a helper (`SshAuth`), which parks it in a file and waits; this is what notices and puts
-# it on screen. Polling, because the producer is a `/bin/sh` script with no way to signal us — and
-# a prompt is a human-scale event, so 300 ms is not a compromise.
-#
-# Broadcast to EVERY open notebook rather than one: the connection belongs to a host, not to a
-# notebook, and answering once clears it for all of them.
-const _SSHAUTH_SEEN = Set{String}()
+# A cluster that refuses keys asks for a password and a second factor. The ssh session hands each
+# prompt to `SshAuth`, which parks it until a page answers. Waiting prompts are facts
+# (`sshauth/<id>`), so every page — the home page and each notebook, including one opened after the
+# prompt was raised — shows the dialog, and answering it anywhere clears it everywhere.
 
 # What each host's login asks for, kept between runs. Learning it again costs a login that fails on
 # purpose, and a cluster that issues its second factor with the prompt rather than on the answer
@@ -4126,32 +4188,7 @@ function _install_sshauth_watch!(h)
         for nb in nbs; try; facts_changed!(); catch; end; end   # pills leave "disconnected" at once
         return nothing
     end
-    errormonitor(@async while true
-        try
-            live = Set{String}()
-            for p in SshAuth.pending()
-                push!(live, p.id)
-                p.id in _SSHAUTH_SEEN && continue
-                push!(_SSHAUTH_SEEN, p.id)
-                msg = "sshauth:" * JSON.json(Dict("id" => p.id, "host" => p.host,
-                                                  "prompt" => p.prompt,
-                                                  "secret" => !p.echo))
-                for nb in lock(h.lock) do; collect(values(h.notebooks)); end
-                    try; _broadcast(nb, msg); catch; end
-                end
-            end
-            # A prompt that is gone — answered here, cancelled, or timed out — takes its dialog with
-            # it. Without this the page keeps showing one nothing is waiting on.
-            for id in setdiff(_SSHAUTH_SEEN, live)
-                for nb in lock(h.lock) do; collect(values(h.notebooks)); end
-                    try; _broadcast(nb, "sshauth-done:" * id); catch; end
-                end
-            end
-            intersect!(_SSHAUTH_SEEN, live)
-        catch
-        end
-        sleep(0.3)
-    end)
+    SshAuth.set_on_change!(facts_changed!)
     return nothing
 end
 
@@ -4282,7 +4319,9 @@ shuts it down. This is the layer the `slate` app itself runs on — reach for it
 Slate in your own script rather than opening a single notebook with [`serve_notebook`](@ref).
 
 `host` defaults to loopback, so the hub is reachable only from this machine; bind `"0.0.0.0"` to
-serve a network. **There is no authentication at any bind address** — whatever can reach the port can
+serve a network. On Linux a loopback connection is served only when it comes from the account
+running the hub (see `_peer_is_owner`), which keeps other users of a shared machine out. **There is
+no authentication for network peers** — on a non-loopback bind, whatever can reach the port can
 drive every notebook on it.
 
 `app = true` serves in application mode: prose, results, figures and live controls, with the
@@ -4345,6 +4384,8 @@ function start_hub(; host = "127.0.0.1", port = 8765, app::Bool = false,
     # A forked env behind its project is re-resolved before a worker starts in it (see `_refresh_fork_env!`).
     ReportEngine.FORK_REFRESH[] = (k, report) ->
         _refresh_fork_env!(k.envdir, k.parent, get(report.meta, "env", Dict{String,Any}[]))
+    # Every vendored file of the pinned versions, fetched and checked in the background (server_vendor.jl)
+    Threads.@spawn try; _vendor_warm!(); catch e; @debug "vendor warm failed" exception = e; end
     routed = _make_router(h)
     # Instrumentation sits on the request path permanently and costs a `Ref` read when off. Wrapping
     # the ROUTER rather than the dispatcher below on purpose: the raw-stream handlers (SSE, the
@@ -4370,7 +4411,16 @@ function start_hub(; host = "127.0.0.1", port = 8765, app::Bool = false,
         end
     end)
     server = HTTP.listen!(host, port) do stream::HTTP.Stream
-        # Reject cross-origin / rebinding requests before ANY handler (router or SSE) runs.
+        # Reject another account's connection, and cross-origin / rebinding requests, before ANY
+        # handler (router, SSE, WebSocket) runs. An app is served to whoever visits; its own
+        # lockdown below is what protects it.
+        if !h.app && !_peer_is_owner(stream)
+            HTTP.setstatus(stream, 403)
+            HTTP.setheader(stream, "Content-Type" => "text/plain; charset=utf-8")
+            HTTP.startwrite(stream)
+            write(stream, "This Slate hub belongs to another account on this machine.\n")
+            return
+        end
         if !_request_allowed(h, stream.message)
             HTTP.setstatus(stream, 403); HTTP.startwrite(stream); return
         end
@@ -4514,6 +4564,19 @@ function _fetch_overflow!(h::Hub, id::AbstractString, name::AbstractString)
     try; write(local_path, bytes); catch; return nothing; end
     _outfile_put!(id, name, local_path)
     return local_path
+end
+
+# A project markdown file as HTML, `(status, body)`. Rendered like a markdown cell, with relative image and
+# media paths resolved against the folder the file sits in.
+function _md_file_html(nb::LiveNotebook, rel::AbstractString)
+    ap = _safe_proj_path(_proj_root(nb), rel)
+    isempty(ap) && return (400, "bad or out-of-project path")
+    isfile(ap) || return (404, "no such file")
+    filesize(ap) > _TREE_TEXT_MAX && return (413, "file too large to preview")
+    bytes = read(ap)
+    isvalid(String, bytes) || return (415, "not a text file (invalid UTF-8)")
+    dir = dirname(replace(String(rel), '\\' => '/'))
+    return (200, markdown_html(_local_media(String(bytes), nb.id, _proj_root(nb); dir = dir)))
 end
 
 "Remove a notebook from the hub: drain its SSE connections and drop it."
